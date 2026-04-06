@@ -1,0 +1,23 @@
+[package]
+name = "arb-revm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Extracted Arbitrum storage and layout primitives for revm extensions"
+
+[dependencies]
+eyre.workspace = true
+hex.workspace = true
+revm.workspace = true
+revm-database.workspace = true
+alloy-provider.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+alloy-consensus = "1.4.3"
+alloy-eips = "1.4.3"
+alloy-core = "1.4.3"
+sequencer_client = { path = "../../../sequencer_client/crates/sequencer_client" }
+arb-sequencer-consensus = { path = "../../../sequencer_client/crates/types/consensus" }
+arb-sequencer-network = { path = "../../../sequencer_client/crates/types/network" }
