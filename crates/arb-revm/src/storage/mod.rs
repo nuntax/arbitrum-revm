@@ -3,15 +3,22 @@ mod address_table;
 mod arbos_state;
 mod batch_poster_table;
 mod block_hashes;
+mod bytes;
+mod chain_config;
+mod features;
 mod l1_pricing;
 mod l2_pricing;
 mod offsets;
+mod programs;
+mod queue;
+mod retryables;
+mod send_merkle;
 mod slot;
 
 use revm::{
-    context_interface::{JournalTr, context::SStoreResult, journaled_state::StateLoad},
+    context_interface::{context::SStoreResult, journaled_state::StateLoad, JournalTr},
     database_interface::Database,
-    primitives::{Address, Bytes, FixedBytes, StorageValue, U256, keccak256},
+    primitives::{keccak256, Address, Bytes, FixedBytes, StorageValue, U256},
 };
 
 use crate::constants::ARBOS_STATE_ADDRESS;
@@ -21,9 +28,18 @@ pub use address_table::AddressTable;
 pub use arbos_state::ArbosState;
 pub use batch_poster_table::{BatchPosterState, BatchPosterTable};
 pub use block_hashes::BlockHashes;
+pub use bytes::StorageBytes;
+pub use chain_config::ChainConfig;
+pub use features::{ArbFeatures, FEATURE_INCREASED_CALLDATA_PRICE};
 pub use l1_pricing::L1Pricing;
 pub use l2_pricing::L2Pricing;
 pub use offsets::{ArbosMetadataOffset, L1PricingOffset, L2PricingOffset, Subspace};
+pub use programs::{ArbosPrograms, ProgramDataPricer};
+pub use queue::StorageQueue;
+pub use retryables::{
+    RetryableRecord, Retryables, RETRYABLE_LIFETIME_SECONDS, RETRYABLE_REAP_PRICE,
+};
+pub use send_merkle::SendMerkle;
 pub use slot::{StorageBacked, StorageSlot};
 
 /// ArbOS storage namespace rooted at a specific account and subspace key.

@@ -36,13 +36,20 @@ impl AddressSet {
         }
 
         let address_value = address_to_u256(address);
-        let mut size = self.backing.get_u256(U256::ZERO, journal)?.data;
-        size += U256::ONE;
+        let mut size = self.size.get(journal)?;
+        size = size.saturating_add(1);
 
-        self.by_address
-            .set(FixedBytes::from(address_value.to_be_bytes()), size, journal)?;
-        self.backing
-            .set(FixedBytes::from(size.to_be_bytes()), address_value, journal)?;
+        self.by_address.set(
+            FixedBytes::from(address_value.to_be_bytes()),
+            U256::from(size),
+            journal,
+        )?;
+        self.backing.set(
+            FixedBytes::from(U256::from(size).to_be_bytes()),
+            address_value,
+            journal,
+        )?;
+        self.size.set(size, journal)?;
 
         Ok(())
     }
@@ -58,9 +65,9 @@ impl AddressSet {
             return Ok(());
         }
 
-        let mut size = self.backing.get_u256(U256::ZERO, journal)?.data;
-        if position != size {
-            let last_address = self.backing.get_u256(size, journal)?.data;
+        let mut size = self.size.get(journal)?;
+        if position != U256::from(size) {
+            let last_address = self.backing.get_u256(U256::from(size), journal)?.data;
             self.by_address.set(
                 FixedBytes::from(last_address.to_be_bytes()),
                 position,
@@ -78,11 +85,13 @@ impl AddressSet {
             U256::ZERO,
             journal,
         )?;
-        self.backing
-            .set(FixedBytes::from(size.to_be_bytes()), U256::ZERO, journal)?;
-        size -= U256::ONE;
-        self.backing
-            .set(FixedBytes::from(U256::ZERO.to_be_bytes()), size, journal)?;
+        self.backing.set(
+            FixedBytes::from(U256::from(size).to_be_bytes()),
+            U256::ZERO,
+            journal,
+        )?;
+        size = size.saturating_sub(1);
+        self.size.set(size, journal)?;
 
         Ok(())
     }

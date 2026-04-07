@@ -2,8 +2,8 @@ use core::marker::PhantomData;
 
 use eyre::{Result, WrapErr};
 use revm::{
-    context_interface::{JournalTr, context::SStoreResult, journaled_state::StateLoad},
-    primitives::{Address, FixedBytes, I256, StorageValue, U256},
+    context_interface::{context::SStoreResult, journaled_state::StateLoad, JournalTr},
+    primitives::{Address, FixedBytes, StorageValue, I256, U256},
 };
 
 use crate::util::{i256_to_u256_twos_complement, u256_twos_complement_to_i256};
@@ -111,6 +111,20 @@ impl StorageBacked<u64> {
     pub fn set<J: JournalTr>(
         &self,
         value: u64,
+        journal: &mut J,
+    ) -> Result<StateLoad<SStoreResult>> {
+        self.slot.set_inner(U256::from(value), journal)
+    }
+}
+
+impl StorageBacked<u32> {
+    pub fn get<J: JournalTr>(&self, journal: &mut J) -> Result<u32> {
+        Ok((*self.slot.get_inner(journal)?).try_into()?)
+    }
+
+    pub fn set<J: JournalTr>(
+        &self,
+        value: u32,
         journal: &mut J,
     ) -> Result<StateLoad<SStoreResult>> {
         self.slot.set_inner(U256::from(value), journal)

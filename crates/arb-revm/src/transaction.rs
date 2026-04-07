@@ -1,15 +1,15 @@
 use alloy_consensus::transaction::Transaction as AlloyTransaction;
 use alloy_eips::eip2718::Typed2718;
-use arb_sequencer_consensus::transactions::{ArbTxEnvelope, internal::ArbitrumInternalTx};
+use arb_sequencer_consensus::transactions::{internal::ArbitrumInternalTx, ArbTxEnvelope};
 use revm::context_interface::{either::Either, transaction::AccessList};
 use revm::{
     context::{
-        TxEnv,
         tx::{TxEnvBuildError, TxEnvBuilder},
+        TxEnv,
     },
     context_interface::Transaction,
     handler::SystemCallTx,
-    primitives::{Address, B256, Bytes, TxKind, U256},
+    primitives::{Address, Bytes, TxKind, B256, U256},
 };
 
 use crate::constants::{ARBITRUM_INTERNAL_TX_TYPE, ARBOS_ACTS_ADDRESS};

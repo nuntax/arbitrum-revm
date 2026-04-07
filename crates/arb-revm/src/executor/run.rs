@@ -1,6 +1,5 @@
 use crate::{
-    ArbBuilder, ArbChainContext, ArbContext, ArbTransaction, DefaultArb,
-    constants::ARBITRUM_INTERNAL_TX_TYPE,
+    constants::{ARBITRUM_INTERNAL_TX_TYPE, HISTORY_STORAGE_ADDRESS},
     executor::contract::{
         ArbExecCfg, ArbExecOutcome, ArbExecutionInput, ArbTxExecution, ArbWriteEffect,
         ArbWriteStage, ArbWriteTarget,
@@ -9,11 +8,14 @@ use crate::{
         ArbExecutionHooks, ArbStartBlockDerived, ArbSystemCall, DefaultArbExecutionHooks,
     },
     transaction::arb_envelope_to_tx_env,
+    ArbBuilder, ArbChainContext, ArbContext, ArbTransaction, DefaultArb,
 };
 use revm::{
-    Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm,
     context::{BlockEnv, CfgEnv, TxEnv},
-    primitives::{TxKind, U256},
+    context_interface::{ContextTr, JournalTr},
+    handler::{SystemCallCommitEvm, SystemCallEvm, SYSTEM_ADDRESS},
+    primitives::{Bytes, TxKind, U256},
+    Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm,
 };
 
 /// Error type for stateless message execution.
@@ -109,12 +111,57 @@ where
         ..ArbExecOutcome::default()
     };
 
+    // Nitro calls ProcessParentBlockHash for ArbOS v40+ before StartBlock.
+    //
+    // We execute the same system call here. On pre-v40 chains where the history
+    // storage contract is not installed, this is a no-op state transition.
+    if commits_state {
+        let prev_hash = if l2_block_number == 0 {
+            revm::primitives::B256::ZERO
+        } else {
+            evm.0
+                .ctx
+                .journal_mut()
+                .db_mut()
+                .block_hash(l2_block_number - 1)?
+        };
+        let parent_hash_result = evm.system_call_with_caller_commit(
+            SYSTEM_ADDRESS,
+            HISTORY_STORAGE_ADDRESS,
+            Bytes::copy_from_slice(prev_hash.as_slice()),
+        )?;
+        if parent_hash_result.is_success() {
+            out.writes.push(ArbWriteEffect {
+                stage: ArbWriteStage::StartBlockParentHash,
+                tx_index: None,
+                target: ArbWriteTarget::StateDatabase,
+            });
+        }
+    } else {
+        let prev_hash = if l2_block_number == 0 {
+            revm::primitives::B256::ZERO
+        } else {
+            evm.0
+                .ctx
+                .journal_mut()
+                .db_mut()
+                .block_hash(l2_block_number - 1)?
+        };
+        let _ = evm.system_call_with_caller(
+            SYSTEM_ADDRESS,
+            HISTORY_STORAGE_ADDRESS,
+            Bytes::copy_from_slice(prev_hash.as_slice()),
+        )?;
+    }
+
     // Nitro prepends InternalTxStartBlock before all user txs.
     // We model that prelude as a typed internal tx (0x6a) under ArbOS actor identity.
     //
-    // TODO(parity): complete full Nitro StartBlock parity:
-    // 1. Implement ArbOSActs.startBlock state transitions against ArbOS storage layout.
-    // 2. Hook header finalization extras (send_root/send_count/l1_block_number/arbos_version)
+    // StartBlock prelude semantics are wired for local execution.
+    //
+    // TODO(parity): remaining Nitro parity items:
+    // 1. Handle retryable reaping and scheduled ArbOS upgrades from the StartBlock path.
+    // 2. Include header finalization extras (send_root/send_count/l1_block_number/arbos_version)
     //    so produced block/header hashes can match Nitro.
     if let Some(start_block_call) = hooks.start_block_prelude(
         input,

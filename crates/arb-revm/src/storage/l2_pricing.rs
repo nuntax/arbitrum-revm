@@ -9,6 +9,7 @@ const ONE_IN_BIPS: i64 = 10_000;
 pub struct L2Pricing {
     pub speed_limit_per_second: StorageBacked<u64>,
     pub per_block_gas_limit: StorageBacked<u64>,
+    pub per_tx_gas_limit: StorageBacked<u64>,
     pub base_fee_wei: StorageBacked<U256>,
     pub min_base_fee_wei: StorageBacked<U256>,
     pub gas_backlog: StorageBacked<u64>,
@@ -22,6 +23,7 @@ impl L2Pricing {
             speed_limit_per_second: storage
                 .storage_backed(L2PricingOffset::SpeedLimitPerSecond as u8),
             per_block_gas_limit: storage.storage_backed(L2PricingOffset::PerBlockGasLimit as u8),
+            per_tx_gas_limit: storage.storage_backed(L2PricingOffset::PerTxGasLimit as u8),
             base_fee_wei: storage.storage_backed(L2PricingOffset::BaseFeeWei as u8),
             min_base_fee_wei: storage.storage_backed(L2PricingOffset::MinBaseFeeWei as u8),
             gas_backlog: storage.storage_backed(L2PricingOffset::GasBacklog as u8),

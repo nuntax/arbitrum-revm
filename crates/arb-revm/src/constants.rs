@@ -1,4 +1,4 @@
-use revm::primitives::{Address, address};
+use revm::primitives::{address, Address};
 
 /// ArbOS system actor address used for internal calls in Nitro.
 pub const ARBOS_ACTS_ADDRESS: Address = address!("0x00000000000000000000000000000000000A4B05");
@@ -12,6 +12,12 @@ pub const BATCH_POSTER_ADDRESS: Address = address!("0xA4B00000000000000000007365
 /// ArbOS L1 pricer funds pool account (Nitro `types.L1PricerFundsPoolAddress`).
 pub const L1_PRICER_FUNDS_POOL_ADDRESS: Address =
     address!("0xA4B00000000000000000000000000000000000f6");
+
+/// EIP-2935 history storage contract address.
+pub const HISTORY_STORAGE_ADDRESS: Address = address!("0x0000F90827F1C53a10cb7A02335B175320002935");
+
+/// ArbOS version that enables EIP-2935 parent hash processing in StartBlock.
+pub const ARBOS_VERSION_EIP2935: u64 = 40;
 
 /// Address aliasing offset applied to retryable/L1-originated senders.
 pub const ADDRESS_ALIAS_OFFSET_HEX: &str = "1111000000000000000000000000000000001111";

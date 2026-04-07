@@ -115,6 +115,8 @@ pub struct ArbTxExecution {
 /// Durable write stage in the execution pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArbWriteStage {
+    /// Parent-hash system call write for EIP-2935 history storage.
+    StartBlockParentHash,
     /// Start-of-block prelude write (Nitro `StartBlock` equivalent).
     StartBlockPrelude,
     /// User transaction state write.

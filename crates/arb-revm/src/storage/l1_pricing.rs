@@ -1,9 +1,9 @@
-use eyre::{Result, eyre};
+use eyre::{eyre, Result};
 use revm::{
     context_interface::{
-        JournalTr,
         context::SStoreResult,
         journaled_state::{StateLoad, TransferError},
+        JournalTr,
     },
     primitives::{Address, I256, U256},
 };
@@ -16,6 +16,14 @@ const ARBOS_VERSION_WITH_LAST_SURPLUS: u64 = 2;
 const ARBOS_VERSION_WITH_AMORTIZED_COST_CAP: u64 = 3;
 const ARBOS_VERSION_WITH_L1_FEES_AVAILABLE: u64 = 10;
 const ARBOS_VERSION_WITH_SIGNED_LAST_SURPLUS: u64 = 7;
+const ARBOS_VERSION_BATCH_REPORT_V2_FLOOR_GAS: u64 = 50;
+const FLOOR_GAS_ADDITIONAL_TOKENS: u64 = 172;
+const TX_DATA_ZERO_GAS: u64 = 4;
+const TX_DATA_NON_ZERO_GAS_EIP2028: u64 = 16;
+const KECCAK256_GAS: u64 = 30;
+const KECCAK256_WORD_GAS: u64 = 6;
+const SSTORE_SET_GAS_EIP2200: u64 = 20_000;
+const TX_GAS: u64 = 21_000;
 
 /// ArbOS L1 pricing storage wrapper.
 #[derive(Debug)]
@@ -281,6 +289,77 @@ impl L1Pricing {
 
         Ok(())
     }
+
+    pub fn apply_batch_posting_report<J: JournalTr>(
+        &self,
+        arbos_version: u64,
+        batch_timestamp: u64,
+        current_time: u64,
+        batch_poster: Address,
+        batch_data_gas: u64,
+        l1_base_fee: U256,
+        journal: &mut J,
+    ) -> Result<()> {
+        let per_batch_gas = self.per_batch_gas_cost.get(journal)?;
+        let gas_spent = signed_i64_to_u64_floor_zero(per_batch_gas).saturating_add(batch_data_gas);
+        let wei_spent = l1_base_fee
+            .checked_mul(U256::from(gas_spent))
+            .unwrap_or(U256::MAX);
+        self.update_for_batch_poster_spending(
+            arbos_version,
+            batch_timestamp,
+            current_time,
+            batch_poster,
+            wei_spent,
+            l1_base_fee,
+            journal,
+        )
+    }
+
+    pub fn apply_batch_posting_report_v2<J: JournalTr>(
+        &self,
+        arbos_version: u64,
+        batch_timestamp: u64,
+        current_time: u64,
+        batch_poster: Address,
+        batch_calldata_length: u64,
+        batch_calldata_non_zeros: u64,
+        batch_extra_gas: u64,
+        l1_base_fee: U256,
+        journal: &mut J,
+    ) -> Result<()> {
+        let per_batch_gas = self.per_batch_gas_cost.get(journal)?;
+        let mut gas_spent =
+            legacy_batch_cost_for_stats(batch_calldata_length, batch_calldata_non_zeros)
+                .saturating_add(batch_extra_gas)
+                .saturating_add(signed_i64_to_u64_floor_zero(per_batch_gas));
+
+        if arbos_version >= ARBOS_VERSION_BATCH_REPORT_V2_FLOOR_GAS {
+            let gas_floor_per_token = self.gas_floor_per_token.get(journal)?;
+            let floor_tokens = batch_calldata_length
+                .saturating_add(batch_calldata_non_zeros.saturating_mul(3))
+                .saturating_add(FLOOR_GAS_ADDITIONAL_TOKENS);
+            let floor_gas_spent = gas_floor_per_token
+                .saturating_mul(floor_tokens)
+                .saturating_add(TX_GAS);
+            if floor_gas_spent > gas_spent {
+                gas_spent = floor_gas_spent;
+            }
+        }
+
+        let wei_spent = l1_base_fee
+            .checked_mul(U256::from(gas_spent))
+            .unwrap_or(U256::MAX);
+        self.update_for_batch_poster_spending(
+            arbos_version,
+            batch_timestamp,
+            current_time,
+            batch_poster,
+            wei_spent,
+            l1_base_fee,
+            journal,
+        )
+    }
 }
 
 fn pool_balance<J: JournalTr>(journal: &mut J) -> Result<U256> {
@@ -349,6 +428,30 @@ fn i256_nonnegative_to_u256(value: I256) -> U256 {
 fn add_i256_u256_saturating(lhs: I256, rhs: U256) -> I256 {
     lhs.checked_add(u256_to_i256_saturating(rhs))
         .unwrap_or_else(i256_max)
+}
+
+fn words_for_bytes(byte_len: u64) -> u64 {
+    byte_len.saturating_add(31) / 32
+}
+
+fn signed_i64_to_u64_floor_zero(value: i64) -> u64 {
+    if value <= 0 {
+        0
+    } else {
+        value as u64
+    }
+}
+
+fn legacy_batch_cost_for_stats(length: u64, non_zeros: u64) -> u64 {
+    let zeros = length.saturating_sub(non_zeros);
+    let calldata_gas = TX_DATA_ZERO_GAS
+        .saturating_mul(zeros)
+        .saturating_add(TX_DATA_NON_ZERO_GAS_EIP2028.saturating_mul(non_zeros));
+    let keccak_words = words_for_bytes(length);
+    calldata_gas
+        .saturating_add(KECCAK256_GAS)
+        .saturating_add(keccak_words.saturating_mul(KECCAK256_WORD_GAS))
+        .saturating_add(2_u64.saturating_mul(SSTORE_SET_GAS_EIP2200))
 }
 
 fn i256_max() -> I256 {

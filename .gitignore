@@ -1,2 +1,4 @@
 /target
+/testdata
 Cargo.lock
+*.pyc

@@ -13,6 +13,9 @@ pub enum ArbosMetadataOffset {
     InfraFeeAccount = 0x06,
     BrotliCompressionLevel = 0x07,
     NativeTokenEnabledFromTimestamp = 0x08,
+    TransactionFilteringEnabledFromTimestamp = 0x09,
+    FilteredFundsRecipient = 0x0a,
+    CollectTips = 0x0b,
 }
 
 /// Top-level ArbOS subspaces.
@@ -30,6 +33,7 @@ pub enum Subspace {
     Programs = 8,
     Features = 9,
     NativeTokenOwners = 10,
+    TransactionFilterers = 11,
 }
 
 impl Subspace {
@@ -68,4 +72,5 @@ pub enum L2PricingOffset {
     GasBacklog = 4,
     PricingInertia = 5,
     BacklogTolerance = 6,
+    PerTxGasLimit = 7,
 }
