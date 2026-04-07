@@ -1,8 +1,8 @@
 use crate::{api::exec::ArbContextTr, storage::ArbosState};
 use revm::{
-    Database as _,
     context_interface::{Block, ContextTr, JournalTr, Transaction},
-    primitives::{Address, B256, Bytes, U256, keccak256},
+    primitives::{keccak256, Address, Bytes, B256, U256},
+    Database as _,
 };
 
 const START_BLOCK_SELECTOR_TEXT: &[u8] = b"startBlock(uint256,uint64,uint64,uint64)";
@@ -17,16 +17,6 @@ const BATCH_POSTING_REPORT_V2_CALLDATA_WORDS: usize = 7;
 
 const ABI_WORD_SIZE: usize = 32;
 const SELECTOR_SIZE: usize = 4;
-
-const ARBOS_VERSION_BATCH_REPORT_V2_FLOOR_GAS: u64 = 50;
-const FLOOR_GAS_ADDITIONAL_TOKENS: u64 = 172;
-
-const TX_DATA_ZERO_GAS: u64 = 4;
-const TX_DATA_NON_ZERO_GAS_EIP2028: u64 = 16;
-const KECCAK256_GAS: u64 = 30;
-const KECCAK256_WORD_GAS: u64 = 6;
-const SSTORE_SET_GAS_EIP2200: u64 = 20_000;
-const TX_GAS: u64 = 21_000;
 
 pub(crate) fn start_block_selector() -> [u8; 4] {
     let hash = keccak256(START_BLOCK_SELECTOR_TEXT);
@@ -150,24 +140,14 @@ fn apply_batch_posting_report<CTX: ArbContextTr>(
         .get(journal)
         .map_err(|err| format!("[ARBITRUM] failed to read ArbOS version: {err}"))?;
 
-    let per_batch_gas = arbos_state
-        .l1_pricing
-        .per_batch_gas_cost
-        .get(journal)
-        .map_err(|err| format!("[ARBITRUM] failed to read ArbOS perBatchGasCost: {err}"))?;
-    let gas_spent = signed_i64_to_u64_floor_zero(per_batch_gas).saturating_add(batch_data_gas);
-    let wei_spent = l1_base_fee_wei
-        .checked_mul(U256::from(gas_spent))
-        .unwrap_or(U256::MAX);
-
     arbos_state
         .l1_pricing
-        .update_for_batch_poster_spending(
+        .apply_batch_posting_report(
             arbos_version,
             batch_timestamp,
             current_time,
             batch_poster_address,
-            wei_spent,
+            batch_data_gas,
             l1_base_fee_wei,
             journal,
         )
@@ -205,45 +185,16 @@ fn apply_batch_posting_report_v2<CTX: ArbContextTr>(
         .get(journal)
         .map_err(|err| format!("[ARBITRUM] failed to read ArbOS version: {err}"))?;
 
-    let per_batch_gas = arbos_state
-        .l1_pricing
-        .per_batch_gas_cost
-        .get(journal)
-        .map_err(|err| format!("[ARBITRUM] failed to read ArbOS perBatchGasCost: {err}"))?;
-
-    let mut gas_spent =
-        legacy_batch_cost_for_stats(batch_calldata_length, batch_calldata_non_zeros)
-            .saturating_add(batch_extra_gas)
-            .saturating_add(signed_i64_to_u64_floor_zero(per_batch_gas));
-
-    if arbos_version >= ARBOS_VERSION_BATCH_REPORT_V2_FLOOR_GAS {
-        let gas_floor_per_token = arbos_state
-            .l1_pricing
-            .gas_floor_per_token
-            .get(journal)
-            .map_err(|err| format!("[ARBITRUM] failed to read ArbOS gasFloorPerToken: {err}"))?;
-        let floor_tokens = batch_calldata_length
-            .saturating_add(batch_calldata_non_zeros.saturating_mul(3))
-            .saturating_add(FLOOR_GAS_ADDITIONAL_TOKENS);
-        let floor_gas_spent = gas_floor_per_token
-            .saturating_mul(floor_tokens)
-            .saturating_add(TX_GAS);
-        if floor_gas_spent > gas_spent {
-            gas_spent = floor_gas_spent;
-        }
-    }
-
-    let wei_spent = l1_base_fee_wei
-        .checked_mul(U256::from(gas_spent))
-        .unwrap_or(U256::MAX);
     arbos_state
         .l1_pricing
-        .update_for_batch_poster_spending(
+        .apply_batch_posting_report_v2(
             arbos_version,
             batch_timestamp,
             current_time,
             batch_poster_address,
-            wei_spent,
+            batch_calldata_length,
+            batch_calldata_non_zeros,
+            batch_extra_gas,
             l1_base_fee_wei,
             journal,
         )
@@ -346,26 +297,6 @@ fn word_to_u64(word: &[u8]) -> u64 {
     let tail: [u8; 8] = <[u8; 8]>::try_from(&word[ABI_WORD_SIZE - 8..ABI_WORD_SIZE])
         .expect("ABI word tail is always 8 bytes");
     u64::from_be_bytes(tail)
-}
-
-fn legacy_batch_cost_for_stats(length: u64, non_zeros: u64) -> u64 {
-    let zeros = length.saturating_sub(non_zeros);
-    let calldata_gas = TX_DATA_ZERO_GAS
-        .saturating_mul(zeros)
-        .saturating_add(TX_DATA_NON_ZERO_GAS_EIP2028.saturating_mul(non_zeros));
-    let keccak_words = words_for_bytes(length);
-    calldata_gas
-        .saturating_add(KECCAK256_GAS)
-        .saturating_add(keccak_words.saturating_mul(KECCAK256_WORD_GAS))
-        .saturating_add(2_u64.saturating_mul(SSTORE_SET_GAS_EIP2200))
-}
-
-fn words_for_bytes(byte_len: u64) -> u64 {
-    byte_len.saturating_add(31) / 32
-}
-
-fn signed_i64_to_u64_floor_zero(value: i64) -> u64 {
-    if value <= 0 { 0 } else { value as u64 }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

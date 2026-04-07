@@ -1,6 +1,6 @@
 use crate::executor::{
-    ArbExecError, ArbExecOutcome, ArbExecutionHooks, ArbExecutionInput, DefaultArbExecutionHooks,
-    execute_message_with_hooks,
+    execute_message_with_hooks, ArbExecError, ArbExecOutcome, ArbExecutionHooks, ArbExecutionInput,
+    DefaultArbExecutionHooks,
 };
 use revm::{Database, DatabaseCommit};
 use std::sync::{Arc, Mutex};

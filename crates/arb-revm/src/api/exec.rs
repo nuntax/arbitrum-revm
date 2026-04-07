@@ -1,43 +1,44 @@
 use crate::{
-    ArbSpecId, chain::ArbChainContext, evm::ArbEvm, handler::ArbHandler, transaction::ArbTxTr,
+    chain::ArbChainContext, evm::ArbEvm, handler::ArbHandler, transaction::ArbTxTr, ArbSpecId,
 };
 use revm::{
-    DatabaseCommit, ExecuteCommitEvm, ExecuteEvm,
-    context::{ContextSetters, result::ExecResultAndState},
+    context::{result::ExecResultAndState, ContextSetters},
     context_interface::{
-        Cfg, ContextTr, Database, JournalTr,
         result::{EVMError, ExecutionResult, InvalidTransaction},
+        Cfg, ContextTr, Database, JournalTr,
     },
     handler::{
-        EthFrame, Handler, PrecompileProvider, SystemCallTx, instructions::EthInstructions,
-        system_call::SystemCallEvm,
+        instructions::EthInstructions,
+        system_call::{SystemCallCommitEvm, SystemCallEvm},
+        EthFrame, Handler, PrecompileProvider, SystemCallTx,
     },
     inspector::{
         InspectCommitEvm, InspectEvm, InspectSystemCallEvm, Inspector, InspectorHandler, JournalExt,
     },
-    interpreter::{InterpreterResult, interpreter::EthInterpreter},
+    interpreter::{interpreter::EthInterpreter, InterpreterResult},
     primitives::{Address, Bytes},
     state::EvmState,
+    DatabaseCommit, ExecuteCommitEvm, ExecuteEvm,
 };
 
 /// Context trait bound used by Arbitrum execution APIs.
 pub trait ArbContextTr:
     ContextTr<
-        Journal: JournalTr<State = EvmState>,
-        Tx: ArbTxTr,
-        Cfg: Cfg<Spec = ArbSpecId>,
-        Chain = ArbChainContext,
-    >
+    Journal: JournalTr<State = EvmState>,
+    Tx: ArbTxTr,
+    Cfg: Cfg<Spec = ArbSpecId>,
+    Chain = ArbChainContext,
+>
 {
 }
 
 impl<T> ArbContextTr for T where
     T: ContextTr<
-            Journal: JournalTr<State = EvmState>,
-            Tx: ArbTxTr,
-            Cfg: Cfg<Spec = ArbSpecId>,
-            Chain = ArbChainContext,
-        >
+        Journal: JournalTr<State = EvmState>,
+        Tx: ArbTxTr,
+        Cfg: Cfg<Spec = ArbSpecId>,
+        Chain = ArbChainContext,
+    >
 {
 }
 
@@ -163,5 +164,25 @@ where
         ));
         let mut h = ArbHandler::<_, _, EthFrame<EthInterpreter>>::new();
         h.inspect_run_system_call(self)
+    }
+}
+
+impl<CTX, INSP, PRECOMPILE> SystemCallCommitEvm
+    for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
+where
+    CTX: ArbContextTr<Db: DatabaseCommit, Tx: SystemCallTx> + ContextSetters,
+    PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
+{
+    fn system_call_with_caller_commit(
+        &mut self,
+        caller: Address,
+        system_contract_address: Address,
+        data: Bytes,
+    ) -> Result<Self::ExecutionResult, Self::Error> {
+        self.system_call_with_caller(caller, system_contract_address, data)
+            .map(|output| {
+                self.commit(output.state);
+                output.result
+            })
     }
 }

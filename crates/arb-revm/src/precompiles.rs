@@ -5,7 +5,7 @@ use revm::{
     handler::{EthPrecompiles, PrecompileProvider},
     interpreter::InterpreterResult,
     precompile::{PrecompileSpecId, Precompiles},
-    primitives::{Address, address},
+    primitives::{address, Address},
 };
 
 /// ArbSys precompile address.

@@ -11,8 +11,10 @@ eyre.workspace = true
 hex.workspace = true
 revm.workspace = true
 revm-database.workspace = true
-alloy-provider.workspace = true
+alloy-provider = { workspace = true, features = ["reqwest"] }
 serde_json.workspace = true
+serde = { version = "1.0.228", features = ["derive"] }
+reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
 tokio.workspace = true
 tracing.workspace = true
 alloy-consensus = "1.4.3"

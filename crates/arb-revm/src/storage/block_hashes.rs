@@ -1,7 +1,7 @@
 use eyre::Result;
 use revm::{
     context_interface::JournalTr,
-    primitives::{B256, FixedBytes, U256, keccak256},
+    primitives::{keccak256, FixedBytes, B256, U256},
 };
 
 use super::{StorageBacked, StorageSpace};

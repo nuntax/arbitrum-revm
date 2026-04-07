@@ -26,18 +26,20 @@ pub use api::{
 pub use chain::ArbChainContext;
 pub use evm::ArbEvm;
 pub use executor::{
-    ArbExecCfg, ArbExecOutcome, ArbExecutionHooks, ArbExecutionInput, ArbExecutionMode,
-    ArbMessageEnvelope, ArbParentHeader, ArbRunner, ArbRunnerError, ArbStartBlockDerived,
-    ArbSystemCall, ArbTxExecution, ArbWriteEffect, ArbWriteStage, ArbWriteTarget,
-    DefaultArbExecutionHooks, execute_message, execute_message_with_hooks,
+    execute_message, execute_message_with_hooks, ArbExecCfg, ArbExecOutcome, ArbExecutionHooks,
+    ArbExecutionInput, ArbExecutionMode, ArbMessageEnvelope, ArbParentHeader, ArbRunner,
+    ArbRunnerError, ArbStartBlockDerived, ArbSystemCall, ArbTxExecution, ArbWriteEffect,
+    ArbWriteStage, ArbWriteTarget, DefaultArbExecutionHooks,
 };
 pub use handler::ArbHandler;
 pub use precompiles::ArbPrecompiles;
 pub use revm;
 pub use spec::ArbSpecId;
 pub use storage::{
-    AddressSet, AddressTable, ArbosState, BatchPosterState, BatchPosterTable, BlockHashes,
-    L1Pricing, L2Pricing, StorageBacked, StorageSlot, StorageSpace,
+    AddressSet, AddressTable, ArbFeatures, ArbosPrograms, ArbosState, BatchPosterState,
+    BatchPosterTable, BlockHashes, ChainConfig, L1Pricing, L2Pricing, ProgramDataPricer,
+    RetryableRecord, Retryables, SendMerkle, StorageBacked, StorageBytes, StorageQueue,
+    StorageSlot, StorageSpace,
 };
 pub use transaction::{ArbTransaction, ArbTxTr};
 pub use util::{

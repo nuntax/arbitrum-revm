@@ -5,16 +5,16 @@ use crate::{
 };
 use revm::{
     context_interface::{
-        ContextTr, Transaction,
         result::{FromStringError, HaltReason, InvalidTransaction},
+        ContextTr, Transaction,
     },
     handler::{
-        EthFrame, EvmTr, FrameResult, Handler, MainnetHandler, evm::FrameTr, handler::EvmTrError,
+        evm::FrameTr, handler::EvmTrError, EthFrame, EvmTr, FrameResult, Handler, MainnetHandler,
     },
     inspector::{Inspector, InspectorEvmTr, InspectorHandler},
     interpreter::{
-        CallOutcome, Gas, InitialAndFloorGas, InstructionResult, InterpreterResult,
-        interpreter::EthInterpreter, interpreter_action::FrameInit,
+        interpreter::EthInterpreter, interpreter_action::FrameInit, CallOutcome, Gas,
+        InitialAndFloorGas, InstructionResult, InterpreterResult,
     },
     primitives::{Address, Bytes},
 };
@@ -208,10 +208,10 @@ fn internal_success_frame_result() -> FrameResult {
 impl<EVM, ERROR> InspectorHandler for ArbHandler<EVM, ERROR, EthFrame<EthInterpreter>>
 where
     EVM: InspectorEvmTr<
-            Context: ArbContextTr,
-            Frame = EthFrame<EthInterpreter>,
-            Inspector: Inspector<<<Self as Handler>::Evm as EvmTr>::Context, EthInterpreter>,
-        >,
+        Context: ArbContextTr,
+        Frame = EthFrame<EthInterpreter>,
+        Inspector: Inspector<<<Self as Handler>::Evm as EvmTr>::Context, EthInterpreter>,
+    >,
     ERROR: EvmTrError<EVM> + FromStringError,
 {
     type IT = EthInterpreter;
@@ -221,15 +221,15 @@ where
 mod tests {
     use super::{ARBITRUM_DEPOSIT_TX_TYPE, ARBITRUM_INTERNAL_TX_TYPE};
     use crate::{
-        ArbBuilder, ArbChainContext, ArbSpecId, ArbTransaction, constants::ARBOS_ACTS_ADDRESS,
-        internal_tx,
+        constants::ARBOS_ACTS_ADDRESS, internal_tx, ArbBuilder, ArbChainContext, ArbSpecId,
+        ArbTransaction,
     };
     use revm::{
-        Context, ExecuteEvm, MainContext,
         context::{CfgEnv, TxEnv},
         context_interface::result::{EVMError, InvalidTransaction},
         database::InMemoryDB,
         primitives::{Address, TxKind, U256},
+        Context, ExecuteEvm, MainContext,
     };
 
     fn make_evm(

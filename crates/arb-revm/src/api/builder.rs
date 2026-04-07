@@ -1,14 +1,14 @@
 use crate::{
-    ArbSpecId, chain::ArbChainContext, evm::ArbEvm, precompiles::ArbPrecompiles,
-    transaction::ArbTxTr,
+    chain::ArbChainContext, evm::ArbEvm, precompiles::ArbPrecompiles, transaction::ArbTxTr,
+    ArbSpecId,
 };
 use revm::{
-    Context, Database,
     context::Cfg,
     context_interface::{Block, JournalTr},
     handler::instructions::EthInstructions,
     interpreter::interpreter::EthInterpreter,
     state::EvmState,
+    Context, Database,
 };
 
 /// Default Arbitrum EVM type.

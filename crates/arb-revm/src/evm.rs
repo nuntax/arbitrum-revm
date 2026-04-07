@@ -1,15 +1,15 @@
-use crate::{ArbSpecId, precompiles::ArbPrecompiles};
+use crate::{precompiles::ArbPrecompiles, ArbSpecId};
 use revm::{
-    Database, Inspector,
     context::{Cfg, ContextError, ContextSetters, Evm, FrameStack},
     context_interface::ContextTr,
     handler::{
-        EthFrame, EvmTr, FrameInitOrResult, ItemOrResult, PrecompileProvider,
         evm::FrameTr,
         instructions::{EthInstructions, InstructionProvider},
+        EthFrame, EvmTr, FrameInitOrResult, ItemOrResult, PrecompileProvider,
     },
     inspector::{InspectorEvmTr, JournalExt},
-    interpreter::{InterpreterResult, interpreter::EthInterpreter},
+    interpreter::{interpreter::EthInterpreter, InterpreterResult},
+    Database, Inspector,
 };
 
 /// Arbitrum EVM wrapper over revm's generic [`Evm`] type.
