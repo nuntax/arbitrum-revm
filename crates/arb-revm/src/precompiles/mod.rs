@@ -35,7 +35,7 @@ mod arb_wasm;
 mod arb_wasm_cache;
 mod common;
 
-use self::common::{ok_result, revert_result};
+use self::common::{empty_active_result, gated_revert_result, ok_result, revert_result};
 pub(super) use crate::{ArbosState, storage::RETRYABLE_LIFETIME_SECONDS};
 pub(super) use alloy_core::sol_types::SolInterface;
 pub(super) use arb_alloy_precompiles::{
@@ -200,6 +200,73 @@ fn arbos_call_extra_gas(
     args_cost + result_cost + state_open
 }
 
+/// ArbOS version at which a whole precompile becomes active. Below it, calling the address
+/// behaves like calling an account with no code (empty success, no gas). Mirrors the per-precompile
+/// `arbosVersion` set in Nitro `precompiles/precompile.go` init().
+fn precompile_min_arbos_version(arb: ArbPrecompilesEnum) -> u64 {
+    match arb {
+        ArbPrecompilesEnum::ArbWasm | ArbPrecompilesEnum::ArbWasmCache => 30, // ArbosVersion_Stylus
+        ArbPrecompilesEnum::ArbNativeTokenManager => 41,
+        ArbPrecompilesEnum::ArbFilteredTransactionsManager => 60, // ArbosVersion_TransactionFiltering
+        _ => 0,
+    }
+}
+
+/// `(minArbosVersion, maxArbosVersion)` for a precompile method (max 0 = no upper bound). A call
+/// with `version < min` or `version > max>0` reverts (Nitro `precompile.go` Call, method gate).
+/// Only methods with a non-default bound that are also decodable by our sol interfaces need an
+/// entry — methods absent from the interface already revert via `abi_decode` failure. Covers the
+/// 40→51 gates (native-token v41, gas methods v50, and `cacheCodehash` removed after v30).
+fn method_arbos_bounds(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> (u64, u64) {
+    match arb {
+        ArbPrecompilesEnum::ArbGasInfo => {
+            if sel == ArbGasInfo::getMaxTxGasLimitCall::SELECTOR
+                || sel == ArbGasInfo::getMaxBlockGasLimitCall::SELECTOR
+            {
+                return (50, 0);
+            }
+            (0, 0)
+        }
+        ArbPrecompilesEnum::ArbOwner => {
+            if sel == ArbOwner::addNativeTokenOwnerCall::SELECTOR
+                || sel == ArbOwner::removeNativeTokenOwnerCall::SELECTOR
+                || sel == ArbOwner::setNativeTokenManagementFromCall::SELECTOR
+            {
+                return (41, 0);
+            }
+            if sel == ArbOwner::setGasBacklogCall::SELECTOR
+                || sel == ArbOwner::setMaxBlockGasLimitCall::SELECTOR
+                || sel == ArbOwner::setParentGasFloorPerTokenCall::SELECTOR
+            {
+                return (50, 0);
+            }
+            (0, 0)
+        }
+        ArbPrecompilesEnum::ArbOwnerPublic => {
+            if sel == ArbOwnerPublic::isNativeTokenOwnerCall::SELECTOR
+                || sel == ArbOwnerPublic::getAllNativeTokenOwnersCall::SELECTOR
+            {
+                return (41, 0);
+            }
+            if sel == ArbOwnerPublic::getParentGasFloorPerTokenCall::SELECTOR
+                || sel == ArbOwnerPublic::getNativeTokenManagementFromCall::SELECTOR
+            {
+                return (50, 0);
+            }
+            (0, 0)
+        }
+        ArbPrecompilesEnum::ArbWasmCache => {
+            // `cacheCodehash` (maxArbosVersion=30) was dropped from our interface entirely, so it
+            // already reverts via abi_decode failure. `cacheProgram` is v31 (StylusFixes).
+            if sel == ArbWasmCache::cacheProgramCall::SELECTOR {
+                return (31, 0);
+            }
+            (0, 0)
+        }
+        _ => (0, 0),
+    }
+}
+
 /// Eth precompile set for an ArbOS version, mirroring Nitro's `activePrecompiledContracts`
 /// (`gethhook/geth-hook.go`): ArbOS 30-49 = Cancun (0x01-0x0a, NO BLS) + the standalone
 /// secp256r1 P256VERIFY (RIP-7212, 0x100); ArbOS 50+ (`IsDia`) = Osaka (Prague + BLS + P256 +
@@ -270,10 +337,33 @@ where
         inputs: &revm::interpreter::CallInputs,
     ) -> Result<Option<Self::Output>, String> {
         if let Some(arb) = ArbPrecompilesEnum::from_address(&inputs.bytecode_address) {
+            let gas_limit = inputs.gas_limit;
+            // ArbOS version-gating (Nitro precompile.go Call). Read the version once; the dispatcher
+            // read is free (not part of the method's charged gas). Both gated paths return BEFORE
+            // arbos_call_extra_gas, matching Nitro which returns before makeContext.
+            let arbos_version = ArbosState::open()
+                .arbos_version
+                .get(context.journal_mut())
+                .unwrap_or(0);
+            // Precompile not yet active => behaves like an account with no code.
+            if arbos_version < precompile_min_arbos_version(arb) {
+                return Ok(Some(empty_active_result(gas_limit)));
+            }
             let raw = input_bytes(context, &inputs.input);
             let input_len = raw.len();
             let selector: Option<[u8; 4]> = raw.get(..4).map(|s| s.try_into().unwrap());
             drop(raw);
+            // Invalid selector, or method not active at this ArbOS version => revert (all gas).
+            let method_gated = match selector {
+                None => true,
+                Some(sel) => {
+                    let (min, max) = method_arbos_bounds(arb, sel);
+                    arbos_version < min || (max > 0 && arbos_version > max)
+                }
+            };
+            if method_gated {
+                return Ok(Some(gated_revert_result(gas_limit)));
+            }
             let mut result = arb.run(context, inputs);
             // Nitro charges per-call precompile gas (arg/result copy + ArbosState open)
             // that has no EVM-opcode representation; fold it into the returned gas so
@@ -298,5 +388,64 @@ where
 
     fn contains(&self, address: &Address) -> bool {
         ArbPrecompilesEnum::from_address(address).is_some() || self.inner.contains(address)
+    }
+}
+
+#[cfg(test)]
+mod gating_tests {
+    // Note: do NOT `use ArbPrecompilesEnum::*` here — the variant names (ArbGasInfo, ArbOwner, …)
+    // would shadow the sol-interface modules of the same name and break `Module::methodCall::SELECTOR`.
+    use super::{ArbPrecompilesEnum as E, method_arbos_bounds, precompile_min_arbos_version};
+    use super::{ArbGasInfo, ArbOwner, ArbOwnerPublic};
+    use alloy_core::sol_types::SolCall;
+
+    #[test]
+    fn precompile_level_gates() {
+        assert_eq!(precompile_min_arbos_version(E::ArbNativeTokenManager), 41);
+        assert_eq!(precompile_min_arbos_version(E::ArbFilteredTransactionsManager), 60);
+        assert_eq!(precompile_min_arbos_version(E::ArbWasm), 30);
+        assert_eq!(precompile_min_arbos_version(E::ArbWasmCache), 30);
+        assert_eq!(precompile_min_arbos_version(E::ArbGasInfo), 0);
+        assert_eq!(precompile_min_arbos_version(E::ArbSys), 0);
+    }
+
+    #[test]
+    fn method_level_gates() {
+        // v50 ArbGasInfo gas-limit getters
+        assert_eq!(
+            method_arbos_bounds(E::ArbGasInfo, ArbGasInfo::getMaxTxGasLimitCall::SELECTOR),
+            (50, 0)
+        );
+        assert_eq!(
+            method_arbos_bounds(E::ArbGasInfo, ArbGasInfo::getMaxBlockGasLimitCall::SELECTOR),
+            (50, 0)
+        );
+        // v41 native-token methods
+        assert_eq!(
+            method_arbos_bounds(E::ArbOwner, ArbOwner::addNativeTokenOwnerCall::SELECTOR),
+            (41, 0)
+        );
+        assert_eq!(
+            method_arbos_bounds(
+                E::ArbOwnerPublic,
+                ArbOwnerPublic::isNativeTokenOwnerCall::SELECTOR
+            ),
+            (41, 0)
+        );
+        // v50 ArbOwner setter
+        assert_eq!(
+            method_arbos_bounds(E::ArbOwner, ArbOwner::setGasBacklogCall::SELECTOR),
+            (50, 0)
+        );
+        // not gated
+        assert_eq!(
+            method_arbos_bounds(E::ArbGasInfo, ArbGasInfo::getPricesInWeiCall::SELECTOR),
+            (0, 0)
+        );
+        // a gated selector on the wrong precompile is not gated
+        assert_eq!(
+            method_arbos_bounds(E::ArbSys, ArbGasInfo::getMaxTxGasLimitCall::SELECTOR),
+            (0, 0)
+        );
     }
 }

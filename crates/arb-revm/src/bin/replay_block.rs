@@ -771,6 +771,12 @@ async fn main() -> Result<()> {
         .with_chain_id(chain_id)
         .with_disable_priority_fee_check(true);
     cfg_env.disable_balance_check = true;
+    // EIP-7623 calldata floor applies only when the ArbOS calldata_price_increase feature is on
+    // (mirrors run.rs / Nitro state_transition.go). Off => Arbitrum prices calldata via the L1
+    // poster fee instead, so the floor must be disabled.
+    cfg_env.disable_eip7623 = !arb_revm::ArbosState::open()
+        .features
+        .read_calldata_price_increase_db(&mut db);
 
     // --trace-tx <idx>: run with an opcode/call-frequency inspector and dump what the
     // engine does for tx[idx] (diagnosing gas-divergence). Earlier txs build up state.

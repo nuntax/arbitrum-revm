@@ -2,13 +2,33 @@ use super::*;
 use arb_alloy_consensus::transactions::TxRetry;
 use revm::{
     context_interface::{Block, Transaction},
-    interpreter::CallInputs,
+    interpreter::{CallInputs, Gas, InstructionResult, InterpreterResult},
     primitives::{Address, B256, Bytes, Log, TxKind, keccak256},
 };
 
 const REDEEM_SCHEDULED_EVENT_SIGNATURE: &[u8] =
     b"RedeemScheduled(bytes32,bytes32,uint64,uint64,address,uint256,uint256)";
 const RETRY_TX_GAS_MINIMUM: u64 = 21_000;
+const REDEEM_SCHEDULED_EVENT_GAS: u64 = 2_899; // LogGas(375)+4*LogTopicGas(375)+128*LogDataGas(8)
+const REDEEM_COPY_GAS: u64 = 3; // params.CopyGas (gasCostToReturnResult)
+const BACKLOG_UPDATE_COST_PRE_V50: u64 = 20_800; // StorageRead(800)+StorageWrite(20000)
+const BACKLOG_UPDATE_COST_V50: u64 = 21_600; // +StorageRead(800) for GasModelToUse
+// ArbOS flat storage gas (Nitro arbos/storage): every read = StorageReadCost, every write =
+// StorageWriteCost (SstoreSetGasEIP2200, flat — not EIP-2929). The retryable-size burn at
+// ArbRetryableTx.go:60 uses params.SloadGas (the *COPY* multiplier = 50), NOT StorageReadCost.
+const REDEEM_STORAGE_READ: u64 = 800; // StorageReadCost = SloadGasEIP2200
+const REDEEM_STORAGE_WRITE: u64 = 20_000; // StorageWriteCost = SstoreSetGasEIP2200
+const REDEEM_SIZE_SLOAD_GAS: u64 = 50; // params.SloadGas (COPY multiplier), ArbRetryableTx.go:60
+// ArbOS-storage gas Nitro burns for the retryable reads BEFORE reading GasLeft for the donation,
+// for a ZERO-calldata retryable (W=0). arb_revm's ArbosState reads are free, so we replicate it
+// to match the donated gas. Empirically calibrated against the testnode (ArbOS 40) redeem oracle:
+// ≈ 10 storage reads (8000) + numTries SstoreSet (20000) + RetryableSizeBytes burn 50*7 (350) + 3.
+// Calldata of W words adds REDEEM_SIZE_SLOAD_GAS*W (line-60 size burn) + 800*(W-1) (content reads).
+const REDEEM_READ_BURNS_BASE: u64 = 28_353;
+// The backlog SSTORE the redeem prepays for is reserved as an SstoreSet (20000), but the actual
+// ShrinkBacklog write is a reset (5000) of the already-non-zero backlog: 15000 is refunded. This
+// is what makes the redeem tx gasUsed independent of the donation amount.
+const REDEEM_BACKLOG_OVERRESERVE: u64 = REDEEM_STORAGE_WRITE - 5_000;
 
 pub(super) fn run_arb_retryable_tx<CTX>(
     ctx: &mut CTX,
@@ -125,6 +145,7 @@ where
             }
         }
         ArbRetryableTx::ArbRetryableTxCalls::redeem(c) => {
+            let redeem_input_len = input.len();
             let current_timestamp: u64 = match ctx.block().timestamp().try_into() {
                 Ok(ts) => ts,
                 Err(_) => {
@@ -172,13 +193,35 @@ where
                 Err(e) => return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}")),
             };
 
-            if gas_limit < RETRY_TX_GAS_MINIMUM {
+            // Donation, per Nitro ArbRetryableTx.Redeem: gasToDonate = GasLeft - futureGasCosts,
+            // where GasLeft is already reduced by the ArbOS-storage gas burned reading the retryable
+            // (RetryableSizeBytes, OpenRetryable x2, IncrementNumTries, MakeTx fields). arb_revm's
+            // ArbosState reads are free, so subtract the equivalent burns so the donated gas — hence
+            // the retry tx hash, the RedeemScheduled event, and the ShrinkBacklog below — matches.
+            // 40-49: legacy backlog cost (20800); 50-59: single-gas-constraints (+800 GasModelToUse).
+            let arbos_version = state.arbos_version.get(ctx.journal_mut()).unwrap_or(0);
+            let backlog_update_cost = if (50..60).contains(&arbos_version) {
+                BACKLOG_UPDATE_COST_V50
+            } else {
+                BACKLOG_UPDATE_COST_PRE_V50
+            };
+            let future_gas_costs =
+                REDEEM_SCHEDULED_EVENT_GAS + REDEEM_COPY_GAS + backlog_update_cost;
+            let calldata_words = words_for_bytes(input.len());
+            let read_burns = REDEEM_READ_BURNS_BASE
+                + REDEEM_SIZE_SLOAD_GAS * calldata_words
+                + REDEEM_STORAGE_READ * calldata_words.saturating_sub(1);
+            let reserved = future_gas_costs.saturating_add(read_burns);
+            if gas_limit < reserved {
+                return revert_result(gas_limit, "ArbRetryableTx: not enough gas for redeem");
+            }
+            let donated_gas = gas_limit - reserved;
+            if donated_gas < RETRY_TX_GAS_MINIMUM {
                 return revert_result(
                     gas_limit,
                     "ArbRetryableTx: not enough gas to run redeem attempt",
                 );
             }
-            let donated_gas = gas_limit;
 
             let chain_id = match ctx.tx().chain_id() {
                 Some(id) => U256::from(id),
@@ -225,10 +268,34 @@ where
                 ))),
             ));
 
-            ok_result(
-                gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(retry_tx_hash,)),
-            )
+            // Nitro shrinks the L2 gas backlog by the donated gas: it is not consumed by the redeem
+            // tx itself (the retry re-grows it). Without this the backlog slot — and thus the state
+            // root — is too high. Single-backlog (legacy / single-constraint) path; v40 testnode.
+            if let Err(e) = state
+                .l2_pricing
+                .shrink_backlog(donated_gas, ctx.journal_mut())
+            {
+                return revert_result(gas_limit, &format!("ArbRetryableTx: backlog error: {e}"));
+            }
+
+            // gasUsed is INDEPENDENT of the donation: Nitro charges read_burns + donation + post-run
+            // costs, and read_burns cancels against the donation reservation. What remains is the
+            // backlog SstoreSet over-reserve (15000) — refunded because the real ShrinkBacklog write
+            // is a reset, not a set. precompiles/mod.rs::run re-adds arbos_call_extra_gas (ArbosState
+            // open + arg/result copy) on top of our result, so subtract it to avoid double-charging.
+            let modrs_extra = ARBOS_STATE_OPEN_GAS
+                + COPY_GAS * words_for_bytes(redeem_input_len.saturating_sub(4))
+                + COPY_GAS * words_for_bytes(32); // output = ABI-encoded retry_tx_hash (32 bytes)
+            let consumed = gas_limit
+                .saturating_sub(REDEEM_BACKLOG_OVERRESERVE)
+                .saturating_sub(modrs_extra);
+            let mut gas = Gas::new(gas_limit);
+            let _ = gas.record_cost(consumed);
+            InterpreterResult {
+                result: InstructionResult::Return,
+                output: Bytes::from(alloy_core::sol_types::SolValue::abi_encode(&(retry_tx_hash,))),
+                gas,
+            }
         }
     }
 }

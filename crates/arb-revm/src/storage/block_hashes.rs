@@ -82,15 +82,17 @@ impl BlockHashes {
             next_number = number - 256;
         }
 
-        let mut rolling_hash = block_hash;
+        // Fill the gap between the last recorded L1 block and `number` with synthetic hashes,
+        // matching Nitro Blockhashes.RecordNewL1Block: each fill = keccak(blockHash ‖ LE(n)) using
+        // the ORIGINAL `block_hash` for every slot (NOT a rolling hash chaining prior results).
         while next_number.saturating_add(1) < number {
             next_number = next_number.saturating_add(1);
             let mut next_num_buf = [0_u8; 8];
             if arbos_version >= 8 {
                 next_num_buf = next_number.to_le_bytes();
             }
-            rolling_hash = keccak256(&[rolling_hash.as_slice(), &next_num_buf].concat());
-            self.set_block_hash(next_number, rolling_hash, journal)?;
+            let fill = keccak256(&[block_hash.as_slice(), &next_num_buf].concat());
+            self.set_block_hash(next_number, fill, journal)?;
         }
 
         self.set_block_hash(number, block_hash, journal)?;
