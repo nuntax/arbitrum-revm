@@ -43,6 +43,14 @@ impl StorageQueue {
         Ok(())
     }
 
+    pub fn next_put<J: JournalTr>(&self, journal: &mut J) -> Result<u64> {
+        self.next_put_offset.get(journal)
+    }
+
+    pub fn next_get<J: JournalTr>(&self, journal: &mut J) -> Result<u64> {
+        self.next_get_offset.get(journal)
+    }
+
     pub fn is_empty<J: JournalTr>(&self, journal: &mut J) -> Result<bool> {
         let put = self.next_put_offset.get(journal)?;
         let get = self.next_get_offset.get(journal)?;

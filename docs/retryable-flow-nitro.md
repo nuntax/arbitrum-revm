@@ -93,6 +93,7 @@ At retry end (`EndTxHook`):
 
 - `redeem(ticketId)`:
   - schedules a redeem attempt, donates caller gas, increments `numTries`, emits `RedeemScheduled`
+  - exact gas accounting + the arb-revm port: see [`manual-redeem-gas-parity.md`](./manual-redeem-gas-parity.md)
 - `keepalive(ticketId)`:
   - appends duplicate timeout-queue entry
   - increments `timeoutWindowsLeft`

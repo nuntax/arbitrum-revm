@@ -58,4 +58,15 @@ impl ArbFeatures {
     ) -> Result<bool> {
         self.is_feature_enabled(FEATURE_INCREASED_CALLDATA_PRICE, journal)
     }
+
+    /// Reads the calldata-price-increase (EIP-7623) feature flag directly from the database,
+    /// for configuring the EVM `CfgEnv` before the journal exists. Returns `false` (feature
+    /// off) when the slot is unreadable / uninitialized — matching Nitro, which only applies
+    /// the EIP-7623 floor when this ArbOS feature is explicitly enabled.
+    pub fn read_calldata_price_increase_db<DB: revm::Database>(&self, db: &mut DB) -> bool {
+        let (account, slot) = self.bits.account_and_key();
+        db.storage(account, U256::from_be_bytes(slot.0))
+            .map(|bits| bits.bit(FEATURE_INCREASED_CALLDATA_PRICE))
+            .unwrap_or(false)
+    }
 }

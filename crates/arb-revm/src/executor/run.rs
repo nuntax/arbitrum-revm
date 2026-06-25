@@ -224,6 +224,10 @@ where
         .with_chain_id(cfg.chain_id)
         .with_disable_priority_fee_check(cfg.disable_priority_fee_check);
     cfg_env.disable_balance_check = cfg.disable_balance_check;
+    // EIP-7623 calldata floor is applied only when the ArbOS `calldata_price_increase` feature
+    // is enabled (Nitro state_transition.go: `IsPrague && IsCalldataPricingIncreaseEnabled()`).
+    // Arbitrum otherwise prices calldata via its own L1 poster fee, so the floor must be off.
+    cfg_env.disable_eip7623 = !ArbosState::open().features.read_calldata_price_increase_db(db);
 
     let context: ArbContext<&mut DB> = ArbContext::arb_with_chain_context(chain)
         .with_db(db)
