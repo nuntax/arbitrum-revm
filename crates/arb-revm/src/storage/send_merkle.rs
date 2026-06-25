@@ -1,7 +1,7 @@
 use eyre::Result;
 use revm::{
     context_interface::JournalTr,
-    primitives::{FixedBytes, B256, U256},
+    primitives::{B256, FixedBytes, U256, keccak256},
 };
 
 use super::{StorageBacked, StorageSpace};
@@ -14,6 +14,13 @@ const PARTIALS_BASE_OFFSET: u64 = 2;
 pub struct SendMerkle {
     storage: StorageSpace,
     size: StorageBacked<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendMerkleUpdateEvent {
+    pub level: u64,
+    pub num_leaves: u64,
+    pub hash: B256,
 }
 
 impl SendMerkle {
@@ -59,10 +66,107 @@ impl SendMerkle {
     }
 
     pub fn partial_count_for_size(size: u64) -> u64 {
-        if size <= 1 {
+        if size == 0 {
             0
         } else {
-            (64 - (size - 1).leading_zeros()) as u64
+            (64 - size.leading_zeros()) as u64
         }
     }
+
+    /// Appends one send leaf hash to the Nitro-compatible accumulator.
+    pub fn append<J: JournalTr>(
+        &self,
+        item_hash: B256,
+        journal: &mut J,
+    ) -> Result<Vec<SendMerkleUpdateEvent>> {
+        let old_size = self.size(journal)?;
+        let new_size = old_size.saturating_add(1);
+        self.set_size(new_size, journal)?;
+
+        let mut events = Vec::new();
+        let mut level = 0_u64;
+        let mut so_far = keccak256(item_hash.as_slice());
+        let old_partial_count = Self::partial_count_for_size(old_size);
+
+        loop {
+            if level == old_partial_count {
+                self.set_partial(level, so_far, journal)?;
+                break;
+            }
+
+            let this_level = self.partial(level, journal)?;
+            if this_level == B256::ZERO {
+                self.set_partial(level, so_far, journal)?;
+                break;
+            }
+
+            so_far = keccak_concat(this_level.as_slice(), so_far.as_slice());
+            self.set_partial(level, B256::ZERO, journal)?;
+            level = level.saturating_add(1);
+            events.push(SendMerkleUpdateEvent {
+                level,
+                num_leaves: new_size.saturating_sub(1),
+                hash: so_far,
+            });
+        }
+
+        Ok(events)
+    }
+
+    /// Computes Nitro-compatible send accumulator root from stored partials.
+    pub fn root<J: JournalTr>(&self, journal: &mut J) -> Result<B256> {
+        let size = self.size(journal)?;
+        if size == 0 {
+            return Ok(B256::ZERO);
+        }
+
+        let num_partials = Self::partial_count_for_size(size);
+        let mut hash_so_far: Option<B256> = None;
+        let mut capacity_in_hash = 0_u64;
+        let mut capacity = 1_u64;
+
+        for level in 0..num_partials {
+            let partial = self.partial(level, journal)?;
+            if partial != B256::ZERO {
+                if let Some(mut current_hash) = hash_so_far {
+                    while capacity_in_hash < capacity {
+                        current_hash =
+                            keccak_concat(current_hash.as_slice(), B256::ZERO.as_slice());
+                        capacity_in_hash = capacity_in_hash.saturating_mul(2);
+                    }
+                    current_hash = keccak_concat(partial.as_slice(), current_hash.as_slice());
+                    hash_so_far = Some(current_hash);
+                    capacity_in_hash = capacity.saturating_mul(2);
+                } else {
+                    hash_so_far = Some(partial);
+                    capacity_in_hash = capacity;
+                }
+            }
+            capacity = capacity.saturating_mul(2);
+        }
+
+        Ok(hash_so_far.unwrap_or(B256::ZERO))
+    }
+
+    pub fn state_for_export<J: JournalTr>(
+        &self,
+        journal: &mut J,
+    ) -> Result<(u64, B256, Vec<B256>)> {
+        let size = self.size(journal)?;
+        let root = self.root(journal)?;
+        let partial_count = Self::partial_count_for_size(size);
+        let mut partials = Vec::with_capacity(partial_count as usize);
+        for level in 0..partial_count {
+            partials.push(self.partial(level, journal)?);
+        }
+        Ok((size, root, partials))
+    }
+}
+
+#[inline]
+fn keccak_concat(left: &[u8], right: &[u8]) -> B256 {
+    let mut preimage = Vec::with_capacity(left.len() + right.len());
+    preimage.extend_from_slice(left);
+    preimage.extend_from_slice(right);
+    keccak256(preimage)
 }

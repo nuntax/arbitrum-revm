@@ -13,9 +13,16 @@ pub mod evm;
 pub mod executor;
 pub mod handler;
 mod internal_tx;
+mod l1_cost;
 pub mod precompiles;
+pub mod replay;
+mod retry_tx;
 pub mod spec;
+pub mod state_trie;
 pub mod storage;
+#[cfg(feature = "stylus")]
+pub mod stylus;
+mod submit_retryable_tx;
 pub mod transaction;
 mod util;
 
@@ -26,10 +33,10 @@ pub use api::{
 pub use chain::ArbChainContext;
 pub use evm::ArbEvm;
 pub use executor::{
-    execute_message, execute_message_with_hooks, ArbExecCfg, ArbExecOutcome, ArbExecutionHooks,
-    ArbExecutionInput, ArbExecutionMode, ArbMessageEnvelope, ArbParentHeader, ArbRunner,
-    ArbRunnerError, ArbStartBlockDerived, ArbSystemCall, ArbTxExecution, ArbWriteEffect,
-    ArbWriteStage, ArbWriteTarget, DefaultArbExecutionHooks,
+    ArbExecCfg, ArbExecOutcome, ArbExecutionHooks, ArbExecutionInput, ArbExecutionMode,
+    ArbMessageEnvelope, ArbParentHeader, ArbRunner, ArbRunnerError, ArbStartBlockDerived,
+    ArbSystemCall, ArbTxExecution, ArbWriteEffect, ArbWriteStage, ArbWriteTarget,
+    DefaultArbExecutionHooks, execute_message, execute_message_with_hooks,
 };
 pub use handler::ArbHandler;
 pub use precompiles::ArbPrecompiles;
@@ -41,7 +48,10 @@ pub use storage::{
     RetryableRecord, Retryables, SendMerkle, StorageBacked, StorageBytes, StorageQueue,
     StorageSlot, StorageSpace,
 };
-pub use transaction::{ArbTransaction, ArbTxTr};
+pub use submit_retryable_tx::{
+    build_scheduled_retry_from_submit, submit_retryable_auto_redeem_scheduled,
+};
+pub use transaction::{ArbTransaction, ArbTxTr, TxConversionError};
 pub use util::{
     address_to_u256, i256_to_u256_twos_complement, inverse_remap_l1_address, remap_l1_address,
     u256_twos_complement_to_i256,

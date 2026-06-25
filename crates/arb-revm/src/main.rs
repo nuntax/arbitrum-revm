@@ -1,9 +1,10 @@
 use alloy_provider::{Provider, ProviderBuilder};
+use arb_alloy_consensus::transactions::{ArbTxEnvelope, TxRetry};
 use arb_revm::{
     ArbBuilder, ArbChainContext, ArbContext, ArbExecCfg, ArbExecOutcome, ArbExecutionHooks,
     ArbExecutionInput, ArbMessageEnvelope, ArbParentHeader, ArbRunner, ArbRunnerError,
-    ArbStartBlockDerived, ArbTransaction, DefaultArb, DefaultArbExecutionHooks,
-    constants::{ARBITRUM_INTERNAL_TX_TYPE, HISTORY_STORAGE_ADDRESS},
+    ArbStartBlockDerived, ArbTransaction, ArbosState, DefaultArb, DefaultArbExecutionHooks,
+    constants::{ARB_RETRYABLE_TX_ADDRESS, ARBITRUM_INTERNAL_TX_TYPE, HISTORY_STORAGE_ADDRESS},
     executor::ArbExecError,
     transaction::arb_envelope_to_tx_env,
 };
@@ -12,18 +13,18 @@ use eyre::{Result, eyre};
 use revm::{
     Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm,
     context::{BlockEnv, CfgEnv, TxEnv},
-    context_interface::{ContextTr, JournalTr},
+    context_interface::{Block, ContextTr, JournalTr},
     database::CacheDB,
     database_interface::WrapDatabaseAsync,
-    handler::{SYSTEM_ADDRESS, SystemCallCommitEvm, SystemCallEvm},
-    primitives::{Address, B256, Bytes, Log, TxKind, U256},
+    handler::{EvmTr, SYSTEM_ADDRESS, SystemCallCommitEvm, SystemCallEvm},
+    primitives::{Address, B256, Bytes, Log, TxKind, U256, keccak256},
     state::EvmState,
 };
 use revm_database::{AlloyDB, BlockId};
 use sequencer_client::reader::parse_message;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{env, fs, str::FromStr};
+use std::{collections::VecDeque, env, fs, str::FromStr};
 
 #[derive(Debug, Clone)]
 struct RpcParentHeader {
@@ -125,6 +126,14 @@ struct DumpArtifact {
     transactions: Vec<DumpExecution>,
 }
 
+#[derive(Clone)]
+struct QueuedTx {
+    tx: ArbTxEnvelope,
+    tx_index: Option<usize>,
+    stage: &'static str,
+    write_stage: arb_revm::ArbWriteStage,
+}
+
 #[derive(Debug, Clone)]
 struct CapturedExecution {
     outcome: ArbExecOutcome,
@@ -145,9 +154,7 @@ fn parse_usize_flag(args: &[String], flag: &str) -> Option<usize> {
 }
 
 fn parse_string_flag(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2)
-        .find(|w| w[0] == flag)
-        .map(|w| w[1].clone())
+    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
 }
 
 fn parse_feed_message(
@@ -201,8 +208,7 @@ fn hex_u256(input: &str) -> Result<U256> {
     if trimmed.is_empty() {
         return Ok(U256::ZERO);
     }
-    U256::from_str_radix(trimmed, 16)
-        .map_err(|e| eyre!("failed to parse U256 hex {input}: {e}"))
+    U256::from_str_radix(trimmed, 16).map_err(|e| eyre!("failed to parse U256 hex {input}: {e}"))
 }
 
 fn to_http_rpc_url(rpc_url: &str) -> String {
@@ -235,8 +241,8 @@ async fn fetch_parent_header(rpc_url: &str, block_number: u64) -> Result<RpcPare
         .text()
         .await
         .map_err(|e| eyre!("failed reading eth_getBlockByNumber response body: {e}"))?;
-    let envelope: JsonRpcEnvelope<RpcBlockHeaderResponse> =
-        serde_json::from_str(&response_text).map_err(|e| {
+    let envelope: JsonRpcEnvelope<RpcBlockHeaderResponse> = serde_json::from_str(&response_text)
+        .map_err(|e| {
             eyre!("failed to decode eth_getBlockByNumber response JSON: {e}; body={response_text}")
         })?;
 
@@ -254,14 +260,21 @@ async fn fetch_parent_header(rpc_url: &str, block_number: u64) -> Result<RpcPare
 
     let prevrandao_hex = block.prev_randao.or(block.mix_hash);
     let prevrandao = match prevrandao_hex {
-        Some(hex) => Some(B256::from_str(&hex).map_err(|e| eyre!("invalid prevrandao/mixHash {hex}: {e}"))?),
+        Some(hex) => {
+            Some(B256::from_str(&hex).map_err(|e| eyre!("invalid prevrandao/mixHash {hex}: {e}"))?)
+        }
         None => None,
     };
 
     Ok(RpcParentHeader {
         number: hex_u64(&block.number)?,
         timestamp: hex_u64(&block.timestamp)?,
-        basefee: block.base_fee_per_gas.as_deref().map(hex_u64).transpose()?.unwrap_or(0),
+        basefee: block
+            .base_fee_per_gas
+            .as_deref()
+            .map(hex_u64)
+            .transpose()?
+            .unwrap_or(0),
         gas_limit: hex_u64(&block.gas_limit)?,
         difficulty: hex_u256(&block.difficulty)?,
         prevrandao,
@@ -290,11 +303,16 @@ async fn fetch_chain_id(rpc_url: &str) -> Result<u64> {
         .text()
         .await
         .map_err(|e| eyre!("failed reading eth_chainId response body: {e}"))?;
-    let envelope: JsonRpcEnvelope<String> = serde_json::from_str(&response_text)
-        .map_err(|e| eyre!("failed to decode eth_chainId response JSON: {e}; body={response_text}"))?;
+    let envelope: JsonRpcEnvelope<String> = serde_json::from_str(&response_text).map_err(|e| {
+        eyre!("failed to decode eth_chainId response JSON: {e}; body={response_text}")
+    })?;
 
     if let Some(err) = envelope.error {
-        return Err(eyre!("eth_chainId returned error {}: {}", err.code, err.message));
+        return Err(eyre!(
+            "eth_chainId returned error {}: {}",
+            err.code,
+            err.message
+        ));
     }
 
     let chain_id_hex = envelope
@@ -303,7 +321,11 @@ async fn fetch_chain_id(rpc_url: &str) -> Result<u64> {
     hex_u64(&chain_id_hex)
 }
 
-fn build_block_env(parent: ArbParentHeader, cfg: ArbExecCfg, input: &ArbExecutionInput) -> BlockEnv {
+fn build_block_env(
+    parent: ArbParentHeader,
+    cfg: ArbExecCfg,
+    input: &ArbExecutionInput,
+) -> BlockEnv {
     let next_timestamp = input.message.l1_timestamp.max(parent.timestamp);
     let l2_block_number = parent.number.saturating_add(1);
 
@@ -329,6 +351,114 @@ fn start_block_internal_tx(call: arb_revm::ArbSystemCall, chain_id: u64) -> ArbT
     tx.nonce = 0;
     tx.chain_id = Some(chain_id);
     ArbTransaction::new(tx)
+}
+
+const REDEEM_SCHEDULED_EVENT_SIGNATURE: &[u8] =
+    b"RedeemScheduled(bytes32,bytes32,uint64,uint64,address,uint256,uint256)";
+const ABI_WORD_SIZE: usize = 32;
+
+fn scheduled_retries_from_redeem_logs<CTX>(
+    ctx: &mut CTX,
+    logs: &[Log],
+    chain_id: u64,
+) -> Vec<ArbTxEnvelope>
+where
+    CTX: ContextTr<Journal: JournalTr>,
+{
+    let mut scheduled = Vec::new();
+    let signature_hash = keccak256(REDEEM_SCHEDULED_EVENT_SIGNATURE);
+    let base_fee = U256::from(ctx.block().basefee());
+    let arbos_state = ArbosState::open();
+
+    for log in logs {
+        if log.address != ARB_RETRYABLE_TX_ADDRESS {
+            continue;
+        }
+        let topics = log.topics();
+        if topics.len() != 4 || topics[0] != signature_hash {
+            continue;
+        }
+
+        let data = log.data.data.as_ref();
+        if data.len() != ABI_WORD_SIZE * 4 {
+            continue;
+        }
+
+        let donated_gas = match u64::try_from(u256_word(&data[0..ABI_WORD_SIZE])) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if donated_gas == 0 {
+            continue;
+        }
+        let gas_donor = address_word(&data[ABI_WORD_SIZE..ABI_WORD_SIZE * 2]);
+        let max_refund = u256_word(&data[ABI_WORD_SIZE * 2..ABI_WORD_SIZE * 3]);
+        let submission_fee_refund = u256_word(&data[ABI_WORD_SIZE * 3..ABI_WORD_SIZE * 4]);
+        let sequence_num = match u64::try_from(U256::from_be_bytes(topics[3].0)) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let ticket_id = topics[1];
+
+        let journal = ctx.journal_mut();
+        let retryable = arbos_state.retryables.retryable(ticket_id);
+        let num_tries = match retryable.num_tries.get(journal) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if num_tries == 0 || num_tries.saturating_sub(1) != sequence_num {
+            continue;
+        }
+
+        let from = match retryable.from.get(journal) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let to = match retryable.to(journal) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let value = match retryable.callvalue.get(journal) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let input = match retryable.calldata.get(journal) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        scheduled.push(ArbTxEnvelope::from(TxRetry {
+            chain_id: U256::from(chain_id),
+            nonce: sequence_num,
+            from,
+            gas_fee_cap: base_fee,
+            gas_limit: donated_gas,
+            to: match to {
+                Some(dest) => TxKind::Call(dest),
+                None => TxKind::Create,
+            },
+            value,
+            input: Bytes::from(input),
+            ticket_id,
+            refund_to: gas_donor,
+            max_refund,
+            submission_fee_refund,
+        }));
+    }
+
+    scheduled
+}
+
+#[inline]
+fn u256_word(word: &[u8]) -> U256 {
+    let mut out = [0_u8; 32];
+    out.copy_from_slice(word);
+    U256::from_be_bytes(out)
+}
+
+#[inline]
+fn address_word(word: &[u8]) -> Address {
+    Address::from_slice(&word[12..32])
 }
 
 fn collect_state_diff(state: &EvmState) -> Vec<DumpAccountDiff> {
@@ -375,8 +505,7 @@ fn collect_state_diff(state: &EvmState) -> Vec<DumpAccountDiff> {
 }
 
 fn collect_logs(logs: &[Log]) -> Vec<DumpLog> {
-    logs
-        .iter()
+    logs.iter()
         .map(|log| DumpLog {
             address: format!("{:#x}", log.address),
             topics: log
@@ -462,7 +591,8 @@ where
     let prev_hash = if l2_block_number == 0 {
         B256::ZERO
     } else {
-        evm.0.ctx
+        evm.0
+            .ctx
             .journal_mut()
             .db_mut()
             .block_hash(l2_block_number - 1)?
@@ -523,8 +653,21 @@ where
     }
 
     let mut tx_dumps = Vec::new();
-    for (idx, tx) in message.txs.iter().enumerate() {
-        let tx_env = match arb_envelope_to_tx_env(tx) {
+    let mut queue: VecDeque<QueuedTx> = message
+        .txs
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(idx, tx)| QueuedTx {
+            tx,
+            tx_index: Some(idx),
+            stage: "user_tx",
+            write_stage: arb_revm::ArbWriteStage::UserTransaction,
+        })
+        .collect();
+
+    while let Some(queued) = queue.pop_front() {
+        let tx_env = match arb_envelope_to_tx_env(&queued.tx) {
             Ok(tx) => tx,
             Err(_) => {
                 outcome.skipped_unsupported = outcome.skipped_unsupported.saturating_add(1);
@@ -533,18 +676,18 @@ where
         };
 
         let tx_result = evm.transact(tx_env)?;
-        let tx_hash = format!("{:#x}", tx.hash());
+        let tx_hash = format!("{:#x}", queued.tx.hash());
 
         outcome.executed = outcome.executed.saturating_add(1);
         outcome.txs.push(arb_revm::ArbTxExecution {
-            tx_hash: tx.hash(),
+            tx_hash: queued.tx.hash(),
             gas_used: tx_result.result.gas_used(),
             success: tx_result.result.is_success(),
         });
 
         tx_dumps.push(dump_execution(
-            "user_tx",
-            Some(idx),
+            queued.stage,
+            queued.tx_index,
             Some(tx_hash),
             &tx_result.result,
             &tx_result.state,
@@ -553,10 +696,27 @@ where
         if commits_state {
             evm.commit(tx_result.state);
             outcome.writes.push(arb_revm::ArbWriteEffect {
-                stage: arb_revm::ArbWriteStage::UserTransaction,
-                tx_index: Some(idx),
+                stage: queued.write_stage,
+                tx_index: queued.tx_index,
                 target: arb_revm::ArbWriteTarget::StateDatabase,
             });
+            // Scheduled retries (including a submit-retryable's auto-redeem) are
+            // derived solely from the `RedeemScheduled` logs emitted by this tx, so
+            // the submit auto-redeem is not double-counted.
+            if tx_result.result.is_success() {
+                for retry_tx in scheduled_retries_from_redeem_logs(
+                    evm.ctx_mut(),
+                    tx_result.result.logs(),
+                    cfg.chain_id,
+                ) {
+                    queue.push_back(QueuedTx {
+                        tx: retry_tx,
+                        tx_index: None,
+                        stage: "scheduled_retry",
+                        write_stage: arb_revm::ArbWriteStage::ScheduledRetryTransaction,
+                    });
+                }
+            }
         }
     }
 
@@ -677,7 +837,10 @@ async fn main() -> Result<()> {
                 basefee: exec_input.parent.basefee,
                 gas_limit: exec_input.parent.gas_limit,
                 difficulty: format!("{:#x}", exec_input.parent.difficulty),
-                prevrandao: exec_input.parent.prevrandao.map(|value| format!("{value:#x}")),
+                prevrandao: exec_input
+                    .parent
+                    .prevrandao
+                    .map(|value| format!("{value:#x}")),
             },
             start_block: captured.start_block,
             transactions: captured.transactions,

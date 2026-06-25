@@ -1,0 +1,43 @@
+{
+  "schema": "arb-revm-replay-v1",
+  "chain_id": 412346,
+  "block": {
+    "number": 2,
+    "l1_block_number": 1,
+    "timestamp": 1700000000,
+    "basefee": 0,
+    "gas_limit": 1125899906842624,
+    "difficulty": "0x1",
+    "beneficiary": "0x00000000000000000000000000000000000000a0"
+  },
+  "prestate": {
+    "accounts": []
+  },
+  "transactions": [
+    {
+      "type": "0x64",
+      "chainId": "0x64aba",
+      "requestId": "0x0000000000000000000000000000000000000000000000000000000000000001",
+      "from": "0x0000000000000000000000000000000000000011",
+      "to": "0x0000000000000000000000000000000000000022",
+      "value": "0x38d7ea4c68000",
+      "hash": "0x4504203d1d92603cb356d4756a4cf82e205300c1b7a51163f3481b25a0034168",
+      "blockHash": null,
+      "blockNumber": null,
+      "transactionIndex": null
+    }
+  ],
+  "expected": [
+    {
+      "tx_hash": "0x4504203d1d92603cb356d4756a4cf82e205300c1b7a51163f3481b25a0034168",
+      "success": true,
+      "gas_used": 0
+    }
+  ],
+  "expected_state": [
+    {
+      "address": "0x0000000000000000000000000000000000000022",
+      "balance": "0x38d7ea4c68000"
+    }
+  ]
+}

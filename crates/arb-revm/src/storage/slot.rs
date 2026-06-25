@@ -2,8 +2,8 @@ use core::marker::PhantomData;
 
 use eyre::{Result, WrapErr};
 use revm::{
-    context_interface::{context::SStoreResult, journaled_state::StateLoad, JournalTr},
-    primitives::{Address, FixedBytes, StorageValue, I256, U256},
+    context_interface::{JournalTr, context::SStoreResult, journaled_state::StateLoad},
+    primitives::{Address, FixedBytes, I256, StorageValue, U256},
 };
 
 use crate::util::{i256_to_u256_twos_complement, u256_twos_complement_to_i256};
@@ -43,8 +43,17 @@ impl StorageSlot {
         journal: &mut J,
     ) -> Result<StateLoad<SStoreResult>> {
         journal
+            .load_account(self.account)
+            .wrap_err("failed to warm ArbOS storage account")?;
+        let result = journal
             .sstore(self.account, self.slot.into(), value)
-            .wrap_err("failed to write ArbOS storage slot")
+            .wrap_err("failed to write ArbOS storage slot")?;
+        // Mark the account as touched so the storage write survives commit.
+        // `sstore` records the slot change in the journal but does not touch the
+        // account; revm's `DatabaseCommit` (CacheDB/InMemoryDB) skips untouched
+        // accounts, which would silently discard every ArbOS storage write.
+        journal.touch_account(self.account);
+        Ok(result)
     }
 }
 

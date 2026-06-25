@@ -1,93 +1,160 @@
 use alloy_consensus::transaction::Transaction as AlloyTransaction;
-use alloy_eips::eip2718::Typed2718;
-use arb_sequencer_consensus::transactions::{internal::ArbitrumInternalTx, ArbTxEnvelope};
+use alloy_eips::eip2718::{Encodable2718, Typed2718};
+use arb_alloy_consensus::transactions::ArbTxEnvelope;
 use revm::context_interface::{either::Either, transaction::AccessList};
 use revm::{
     context::{
-        tx::{TxEnvBuildError, TxEnvBuilder},
         TxEnv,
+        tx::{TxEnvBuildError, TxEnvBuilder},
     },
     context_interface::Transaction,
     handler::SystemCallTx,
-    primitives::{Address, Bytes, TxKind, B256, U256},
+    primitives::{Address, B256, Bytes, TxKind, U256},
 };
 
-use crate::constants::{ARBITRUM_INTERNAL_TX_TYPE, ARBOS_ACTS_ADDRESS};
-
-/// Converts an Arbitrum consensus transaction envelope into a revm [`TxEnv`] wrapper.
-pub fn arb_envelope_to_tx_env(
-    tx: &arb_sequencer_consensus::transactions::ArbTxEnvelope,
-) -> eyre::Result<ArbTransaction<TxEnv>> {
-    if let ArbTxEnvelope::ArbitrumInternal(internal_tx) = tx {
-        return Ok(convert_internal_envelope(internal_tx));
-    }
-
-    let access_list = tx
-        .access_list()
-        .map(|items| AccessList(items.0.clone()))
-        .unwrap_or_default();
-    let blob_hashes = tx
-        .blob_versioned_hashes()
-        .map_or_else(Vec::new, |hashes| hashes.to_vec());
-    let authorization_list = tx
-        .authorization_list()
-        .map(|auths| auths.iter().cloned().map(Either::Left).collect())
-        .unwrap_or_default();
-
-    let base = TxEnv {
-        tx_type: tx.ty(),
-        caller: tx.sender()?,
-        gas_limit: tx.gas_limit(),
-        gas_price: tx.gas_price().unwrap_or(tx.max_fee_per_gas()),
-        kind: tx.kind(),
-        value: tx.value(),
-        data: tx.input().clone(),
-        nonce: tx.nonce(),
-        chain_id: tx.chain_id(),
-        access_list,
-        gas_priority_fee: tx.max_priority_fee_per_gas(),
-        blob_hashes,
-        max_fee_per_blob_gas: tx.max_fee_per_blob_gas().unwrap_or(0),
-        authorization_list,
-    };
-
-    Ok(ArbTransaction { base })
+/// Retry-transaction metadata that is not representable in revm's base `TxEnv`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetryTxMeta {
+    /// Retryable ticket id being redeemed.
+    pub ticket_id: B256,
+    /// Retry refund recipient.
+    pub refund_to: Address,
+    /// Maximum refundable amount.
+    pub max_refund: U256,
+    /// Submission-fee refund component.
+    pub submission_fee_refund: U256,
 }
 
-fn convert_internal_envelope(tx: &ArbitrumInternalTx) -> ArbTransaction<TxEnv> {
-    match tx {
-        ArbitrumInternalTx::BatchPostingReport(report) => {
-            // Internal reports are ArbOS protocol actions and execute under the ArbOS actor.
-            let mut base = TxEnv::default();
-            base.tx_type = ARBITRUM_INTERNAL_TX_TYPE;
-            base.caller = ARBOS_ACTS_ADDRESS;
-            base.kind = TxKind::Call(ARBOS_ACTS_ADDRESS);
-            base.data = report.data.clone().into();
-            base.gas_limit = 0;
-            base.gas_price = 0;
-            base.nonce = 0;
-            base.chain_id = Some(report.chain_id);
-            ArbTransaction { base }
-        }
+/// Error raised when an RPC/consensus transaction cannot be lowered into a revm
+/// [`TxEnv`]. The only fallible step is sender recovery, which fails for malformed
+/// signatures or envelopes that do not carry a recoverable sender.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxConversionError(String);
+
+impl TxConversionError {
+    fn sender(err: impl core::fmt::Display) -> Self {
+        Self(format!("failed to recover transaction sender: {err}"))
     }
+}
+
+impl core::fmt::Display for TxConversionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl core::error::Error for TxConversionError {}
+
+/// Lowers an Arbitrum consensus transaction envelope into the revm transaction
+/// wrapper. This is the canonical adapter from "a tx as received over RPC / decoded
+/// from a sequencer feed" to "a tx the EVM can execute".
+///
+/// `arb_alloy_rpc_types::ArbTransaction` and the sequencer feed envelopes all expose
+/// their inner [`ArbTxEnvelope`] via [`AsRef`], so callers can write
+/// `ArbTransaction::try_from(rpc_tx.as_ref())`.
+impl TryFrom<&ArbTxEnvelope> for ArbTransaction<TxEnv> {
+    type Error = TxConversionError;
+
+    fn try_from(tx: &ArbTxEnvelope) -> Result<Self, Self::Error> {
+        let access_list = tx
+            .access_list()
+            .map(|items| AccessList(items.0.clone()))
+            .unwrap_or_default();
+        let blob_hashes = tx
+            .blob_versioned_hashes()
+            .map_or_else(Vec::new, |hashes| hashes.to_vec());
+        let authorization_list = tx
+            .authorization_list()
+            .map(|auths| auths.iter().cloned().map(Either::Left).collect())
+            .unwrap_or_default();
+
+        let base = TxEnv {
+            tx_type: tx.ty(),
+            caller: tx.sender().map_err(TxConversionError::sender)?,
+            gas_limit: tx.gas_limit(),
+            gas_price: tx.gas_price().unwrap_or(tx.max_fee_per_gas()),
+            kind: tx.kind(),
+            value: tx.value(),
+            data: tx.input().clone(),
+            nonce: tx.nonce(),
+            chain_id: tx.chain_id(),
+            access_list,
+            gas_priority_fee: tx.max_priority_fee_per_gas(),
+            blob_hashes,
+            max_fee_per_blob_gas: tx.max_fee_per_blob_gas().unwrap_or(0),
+            authorization_list,
+        };
+
+        let retry_meta = match tx {
+            ArbTxEnvelope::Retry(retry) => Some(RetryTxMeta {
+                ticket_id: retry.ticket_id,
+                refund_to: retry.refund_to,
+                max_refund: retry.max_refund,
+                submission_fee_refund: retry.submission_fee_refund,
+            }),
+            _ => None,
+        };
+
+        Ok(ArbTransaction {
+            base,
+            retry_meta,
+            encoded_2718: Some(Bytes::from(tx.encoded_2718())),
+        })
+    }
+}
+
+/// Converts an Arbitrum consensus transaction envelope into a revm [`TxEnv`] wrapper.
+///
+/// Thin wrapper around the [`TryFrom`] adapter that preserves the historical
+/// `eyre::Result` signature for existing callers.
+pub fn arb_envelope_to_tx_env(tx: &ArbTxEnvelope) -> eyre::Result<ArbTransaction<TxEnv>> {
+    ArbTransaction::try_from(tx).map_err(|err| eyre::eyre!(err))
 }
 
 /// Arbitrum transaction trait.
-pub trait ArbTxTr: Transaction {}
+pub trait ArbTxTr: Transaction {
+    /// Returns retry metadata when the wrapped tx is `ArbitrumRetryTx`.
+    fn retry_meta(&self) -> Option<&RetryTxMeta> {
+        None
+    }
 
-impl<T: Transaction> ArbTxTr for T {}
+    /// Returns canonical EIP-2718 transaction bytes when available.
+    fn encoded_2718_bytes(&self) -> Option<&[u8]> {
+        None
+    }
+}
 
 /// Arbitrum transaction wrapper around a base transaction type.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArbTransaction<T: Transaction> {
     /// Base transaction fields.
     pub base: T,
+    /// Arbitrum transaction extensions that are not part of base `TxEnv`.
+    pub retry_meta: Option<RetryTxMeta>,
+    /// Canonical EIP-2718 envelope bytes for this tx, if known.
+    pub encoded_2718: Option<Bytes>,
 }
 
 impl<T: Transaction> ArbTransaction<T> {
     /// Creates a new wrapped transaction.
     pub fn new(base: T) -> Self {
-        Self { base }
+        Self {
+            base,
+            retry_meta: None,
+            encoded_2718: None,
+        }
+    }
+
+    /// Attaches retry metadata.
+    pub fn with_retry_meta(mut self, retry_meta: RetryTxMeta) -> Self {
+        self.retry_meta = Some(retry_meta);
+        self
+    }
+
+    /// Attaches canonical EIP-2718 envelope bytes.
+    pub fn with_encoded_2718(mut self, encoded_2718: Bytes) -> Self {
+        self.encoded_2718 = Some(encoded_2718);
+        self
     }
 }
 
@@ -108,6 +175,8 @@ impl Default for ArbTransaction<TxEnv> {
     fn default() -> Self {
         Self {
             base: TxEnv::default(),
+            retry_meta: None,
+            encoded_2718: None,
         }
     }
 }
@@ -120,7 +189,19 @@ impl<TX: Transaction + SystemCallTx> SystemCallTx for ArbTransaction<TX> {
     ) -> Self {
         Self {
             base: TX::new_system_tx_with_caller(caller, system_contract_address, data),
+            retry_meta: None,
+            encoded_2718: None,
         }
+    }
+}
+
+impl<T: Transaction> ArbTxTr for ArbTransaction<T> {
+    fn retry_meta(&self) -> Option<&RetryTxMeta> {
+        self.retry_meta.as_ref()
+    }
+
+    fn encoded_2718_bytes(&self) -> Option<&[u8]> {
+        self.encoded_2718.as_ref().map(|bytes| bytes.as_ref())
     }
 }
 
@@ -227,6 +308,8 @@ impl ArbTransactionBuilder {
     pub fn build_fill(self) -> ArbTransaction<TxEnv> {
         ArbTransaction {
             base: self.base.build_fill(),
+            retry_meta: None,
+            encoded_2718: None,
         }
     }
 
@@ -234,6 +317,8 @@ impl ArbTransactionBuilder {
     pub fn build(self) -> Result<ArbTransaction<TxEnv>, TxEnvBuildError> {
         Ok(ArbTransaction {
             base: self.base.build()?,
+            retry_meta: None,
+            encoded_2718: None,
         })
     }
 }

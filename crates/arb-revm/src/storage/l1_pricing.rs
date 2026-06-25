@@ -1,9 +1,9 @@
-use eyre::{eyre, Result};
+use eyre::{Result, eyre};
 use revm::{
     context_interface::{
+        JournalTr,
         context::SStoreResult,
         journaled_state::{StateLoad, TransferError},
-        JournalTr,
     },
     primitives::{Address, I256, U256},
 };
@@ -244,19 +244,17 @@ impl L1Pricing {
             return Ok(());
         }
 
-        let desired_derivative = (-surplus)
-            .checked_div(equilibration_units_i)
-            .unwrap_or(I256::ZERO);
+        let desired_derivative = div_i256_like_go_bigint(-surplus, equilibration_units_i);
         let actual_derivative = surplus
             .checked_sub(old_surplus)
-            .and_then(|delta| delta.checked_div(units_allocated_i))
+            .map(|delta| div_i256_like_go_bigint(delta, units_allocated_i))
             .unwrap_or(I256::ZERO);
         let change_derivative = desired_derivative
             .checked_sub(actual_derivative)
             .unwrap_or(I256::ZERO);
         let price_change = change_derivative
             .checked_mul(units_allocated_i)
-            .and_then(|v| v.checked_div(alloc_plus_inert_i))
+            .map(|v| div_i256_like_go_bigint(v, alloc_plus_inert_i))
             .unwrap_or(I256::ZERO);
 
         if arbos_version < ARBOS_VERSION_WITH_LAST_SURPLUS {
@@ -435,11 +433,7 @@ fn words_for_bytes(byte_len: u64) -> u64 {
 }
 
 fn signed_i64_to_u64_floor_zero(value: i64) -> u64 {
-    if value <= 0 {
-        0
-    } else {
-        value as u64
-    }
+    if value <= 0 { 0 } else { value as u64 }
 }
 
 fn legacy_batch_cost_for_stats(length: u64, non_zeros: u64) -> u64 {
@@ -456,4 +450,23 @@ fn legacy_batch_cost_for_stats(length: u64, non_zeros: u64) -> u64 {
 
 fn i256_max() -> I256 {
     I256::from((U256::ONE << 255) - U256::ONE)
+}
+
+/// Go's `big.Int.Div` performs Euclidean division, while Rust signed division truncates
+/// toward zero. Nitro uses `big.Int.Div`, so we mirror that behavior to avoid +/-1 drift
+/// in L1 price updates when numerators are negative.
+fn div_i256_like_go_bigint(dividend: I256, divisor: I256) -> I256 {
+    if divisor <= I256::ZERO {
+        return I256::ZERO;
+    }
+    let quotient = dividend.checked_div(divisor).unwrap_or(I256::ZERO);
+    let product = quotient.checked_mul(divisor).unwrap_or(I256::ZERO);
+    let remainder = dividend.checked_sub(product).unwrap_or(I256::ZERO);
+    if remainder < I256::ZERO {
+        quotient
+            .checked_sub(I256::from(U256::ONE))
+            .unwrap_or(quotient)
+    } else {
+        quotient
+    }
 }

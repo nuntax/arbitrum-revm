@@ -54,6 +54,18 @@ impl AddressSet {
         Ok(())
     }
 
+    /// Returns all members of the set in storage order (1-indexed).
+    pub fn all_members<J: JournalTr>(&self, journal: &mut J) -> Result<Vec<Address>> {
+        let size = self.size.get(journal)?;
+        let mut members = Vec::with_capacity(size as usize);
+        for i in 1..=size {
+            let raw = self.backing.get_u256(U256::from(i), journal)?.data;
+            let bytes = raw.to_be_bytes::<32>();
+            members.push(Address::from_slice(&bytes[12..]));
+        }
+        Ok(members)
+    }
+
     pub fn remove<J: JournalTr>(&self, address: Address, journal: &mut J) -> Result<()> {
         let address_value = address_to_u256(address);
         let position = self

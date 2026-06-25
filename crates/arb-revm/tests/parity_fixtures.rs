@@ -75,7 +75,7 @@ fn make_fixture(
     let cfg = ArbExecCfg::default();
     let input = ArbExecutionInput::new(parent, message, cfg).with_mode(mode);
 
-    let writes = if mode.commits_state() { 1 } else { 0 };
+    let writes = if mode.commits_state() { 2 } else { 0 };
     Fixture {
         name: match mode {
             ArbExecutionMode::Commit => "commit_mode_emits_start_block_write",

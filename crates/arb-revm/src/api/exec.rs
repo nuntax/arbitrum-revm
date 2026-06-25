@@ -1,44 +1,44 @@
 use crate::{
-    chain::ArbChainContext, evm::ArbEvm, handler::ArbHandler, transaction::ArbTxTr, ArbSpecId,
+    ArbSpecId, chain::ArbChainContext, evm::ArbEvm, handler::ArbHandler, transaction::ArbTxTr,
 };
 use revm::{
-    context::{result::ExecResultAndState, ContextSetters},
+    DatabaseCommit, ExecuteCommitEvm, ExecuteEvm,
+    context::{ContextSetters, result::ExecResultAndState},
     context_interface::{
-        result::{EVMError, ExecutionResult, InvalidTransaction},
         Cfg, ContextTr, Database, JournalTr,
+        result::{EVMError, ExecutionResult, InvalidTransaction},
     },
     handler::{
+        EthFrame, Handler, PrecompileProvider, SystemCallTx,
         instructions::EthInstructions,
         system_call::{SystemCallCommitEvm, SystemCallEvm},
-        EthFrame, Handler, PrecompileProvider, SystemCallTx,
     },
     inspector::{
         InspectCommitEvm, InspectEvm, InspectSystemCallEvm, Inspector, InspectorHandler, JournalExt,
     },
-    interpreter::{interpreter::EthInterpreter, InterpreterResult},
+    interpreter::{InterpreterResult, interpreter::EthInterpreter},
     primitives::{Address, Bytes},
     state::EvmState,
-    DatabaseCommit, ExecuteCommitEvm, ExecuteEvm,
 };
 
 /// Context trait bound used by Arbitrum execution APIs.
 pub trait ArbContextTr:
     ContextTr<
-    Journal: JournalTr<State = EvmState>,
-    Tx: ArbTxTr,
-    Cfg: Cfg<Spec = ArbSpecId>,
-    Chain = ArbChainContext,
->
-{
-}
-
-impl<T> ArbContextTr for T where
-    T: ContextTr<
         Journal: JournalTr<State = EvmState>,
         Tx: ArbTxTr,
         Cfg: Cfg<Spec = ArbSpecId>,
         Chain = ArbChainContext,
     >
+{
+}
+
+impl<T> ArbContextTr for T where
+    T: ContextTr<
+            Journal: JournalTr<State = EvmState>,
+            Tx: ArbTxTr,
+            Cfg: Cfg<Spec = ArbSpecId>,
+            Chain = ArbChainContext,
+        >
 {
 }
 

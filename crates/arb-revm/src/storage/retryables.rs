@@ -1,7 +1,7 @@
 use eyre::Result;
 use revm::{
-    context_interface::JournalTr,
-    primitives::{Address, Bytes, B256, U256},
+    context_interface::{JournalTr, journaled_state::TransferError},
+    primitives::{Address, B256, Bytes, U256, keccak256},
 };
 
 use super::{StorageBacked, StorageBytes, StorageQueue, StorageSpace};
@@ -17,6 +17,7 @@ const CALLVALUE_OFFSET: u8 = 3;
 const BENEFICIARY_OFFSET: u8 = 4;
 const TIMEOUT_OFFSET: u8 = 5;
 const TIMEOUT_WINDOWS_LEFT_OFFSET: u8 = 6;
+const RETRYABLE_ESCROW_TAG: &[u8] = b"retryable escrow";
 
 pub const RETRYABLE_LIFETIME_SECONDS: u64 = 7 * 24 * 60 * 60;
 pub const RETRYABLE_REAP_PRICE: u64 = 58_000;
@@ -41,11 +42,85 @@ impl Retryables {
         self.timeout_queue.initialize(journal)
     }
 
+    pub fn ensure_timeout_queue_initialized<J: JournalTr>(&self, journal: &mut J) -> Result<()> {
+        self.timeout_queue.ensure_initialized(journal)
+    }
+
     pub fn retryable(&self, id: B256) -> RetryableRecord {
         let subspace = self
             .root
             .open_subspace(Bytes::copy_from_slice(id.as_slice()));
         RetryableRecord::open(id, &subspace)
+    }
+
+    pub fn delete_retryable<J: JournalTr>(&self, id: B256, journal: &mut J) -> Result<bool> {
+        let retryable = self.retryable(id);
+        let timeout = retryable.timeout.get(journal)?;
+        if timeout == 0 {
+            return Ok(false);
+        }
+
+        let beneficiary = retryable.beneficiary.get(journal)?;
+        let escrow = retryable_escrow_address(id);
+        let escrow_balance = journal.load_account(escrow)?.info.balance;
+        if escrow_balance > U256::ZERO {
+            let transfer_error = journal.transfer(escrow, beneficiary, escrow_balance)?;
+            map_transfer_error(transfer_error, "retryable escrow release")?;
+        }
+
+        retryable.num_tries.set(0, journal)?;
+        retryable.from.set(Address::ZERO, journal)?;
+        retryable.to_raw.set(U256::ZERO, journal)?;
+        retryable.callvalue.set(U256::ZERO, journal)?;
+        retryable.beneficiary.set(Address::ZERO, journal)?;
+        retryable.timeout.set(0, journal)?;
+        retryable.timeout_windows_left.set(0, journal)?;
+        retryable.calldata.clear(journal)?;
+
+        Ok(true)
+    }
+
+    /// Attempts to reap one retryable from the timeout queue.
+    ///
+    /// Returns `Ok(true)` if an entry was consumed or modified, `Ok(false)` if no
+    /// work was needed.
+    pub fn try_to_reap_one<J: JournalTr>(
+        &self,
+        current_timestamp: u64,
+        journal: &mut J,
+    ) -> Result<bool> {
+        let Some(id) = self.timeout_queue.peek(journal)? else {
+            return Ok(false);
+        };
+
+        let retryable = self.retryable(id);
+        let timeout = retryable.timeout.get(journal)?;
+        if timeout == 0 {
+            // Already deleted; discard stale queue entry.
+            let _ = self.timeout_queue.get(journal)?;
+            return Ok(true);
+        }
+
+        let windows_left = retryable.timeout_windows_left.get(journal)?;
+        if timeout >= current_timestamp {
+            return Ok(false);
+        }
+
+        // Either expired or consumed one extension window.
+        let _ = self.timeout_queue.get(journal)?;
+
+        if windows_left == 0 {
+            let _ = self.delete_retryable(id, journal)?;
+            return Ok(true);
+        }
+
+        retryable
+            .timeout
+            .set(timeout.saturating_add(RETRYABLE_LIFETIME_SECONDS), journal)?;
+        retryable
+            .timeout_windows_left
+            .set(windows_left.saturating_sub(1), journal)?;
+        Ok(true)
     }
 }
 
@@ -112,4 +187,21 @@ impl RetryableRecord {
 
 fn nil_address_representation() -> U256 {
     U256::from(1_u8) << 255
+}
+
+fn retryable_escrow_address(ticket_id: B256) -> Address {
+    let mut preimage = Vec::with_capacity(RETRYABLE_ESCROW_TAG.len() + ticket_id.len());
+    preimage.extend_from_slice(RETRYABLE_ESCROW_TAG);
+    preimage.extend_from_slice(ticket_id.as_slice());
+    let hash = keccak256(preimage);
+    Address::from_slice(&hash[12..])
+}
+
+fn map_transfer_error(transfer_error: Option<TransferError>, label: &str) -> Result<()> {
+    match transfer_error {
+        None => Ok(()),
+        Some(TransferError::OutOfFunds) => eyre::bail!("{label} failed: out of funds"),
+        Some(TransferError::OverflowPayment) => eyre::bail!("{label} failed: overflow payment"),
+        Some(TransferError::CreateCollision) => eyre::bail!("{label} failed: create collision"),
+    }
 }

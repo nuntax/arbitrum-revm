@@ -9,16 +9,16 @@ mod features;
 mod l1_pricing;
 mod l2_pricing;
 mod offsets;
-mod programs;
+pub mod programs;
 mod queue;
 mod retryables;
 mod send_merkle;
 mod slot;
 
 use revm::{
-    context_interface::{context::SStoreResult, journaled_state::StateLoad, JournalTr},
+    context_interface::{JournalTr, context::SStoreResult, journaled_state::StateLoad},
     database_interface::Database,
-    primitives::{keccak256, Address, Bytes, FixedBytes, StorageValue, U256},
+    primitives::{Address, Bytes, FixedBytes, StorageValue, U256, keccak256},
 };
 
 use crate::constants::ARBOS_STATE_ADDRESS;
@@ -34,12 +34,12 @@ pub use features::{ArbFeatures, FEATURE_INCREASED_CALLDATA_PRICE};
 pub use l1_pricing::L1Pricing;
 pub use l2_pricing::L2Pricing;
 pub use offsets::{ArbosMetadataOffset, L1PricingOffset, L2PricingOffset, Subspace};
-pub use programs::{ArbosPrograms, ProgramDataPricer};
+pub use programs::{ArbosPrograms, ProgramDataPricer, pack_uint, stylus_param_layout, unpack_uint};
 pub use queue::StorageQueue;
 pub use retryables::{
-    RetryableRecord, Retryables, RETRYABLE_LIFETIME_SECONDS, RETRYABLE_REAP_PRICE,
+    RETRYABLE_LIFETIME_SECONDS, RETRYABLE_REAP_PRICE, RetryableRecord, Retryables,
 };
-pub use send_merkle::SendMerkle;
+pub use send_merkle::{SendMerkle, SendMerkleUpdateEvent};
 pub use slot::{StorageBacked, StorageSlot};
 
 /// ArbOS storage namespace rooted at a specific account and subspace key.
@@ -116,6 +116,7 @@ impl StorageSpace {
         hash: FixedBytes<32>,
         journal: &mut J,
     ) -> Result<StateLoad<StorageValue>, <J::Database as Database>::Error> {
+        journal.load_account(self.account)?;
         journal.sload(self.account, self.slot_for_hash(hash).into())
     }
 
@@ -135,7 +136,12 @@ impl StorageSpace {
         value: StorageValue,
         journal: &mut J,
     ) -> Result<StateLoad<SStoreResult>, <J::Database as Database>::Error> {
-        journal.sstore(self.account, self.slot_for_hash(hash).into(), value)
+        journal.load_account(self.account)?;
+        let result = journal.sstore(self.account, self.slot_for_hash(hash).into(), value)?;
+        // Touch the account so the write survives commit; revm's DatabaseCommit
+        // skips untouched accounts, which would discard storage-only changes.
+        journal.touch_account(self.account);
+        Ok(result)
     }
 
     /// Creates an untyped storage slot accessor.

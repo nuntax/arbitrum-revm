@@ -1,9 +1,43 @@
 use eyre::Result;
-use revm::{context_interface::JournalTr, primitives::U256};
+use revm::{
+    context_interface::JournalTr,
+    primitives::{Bytes, U256},
+};
 
 use super::{L2PricingOffset, StorageBacked, StorageSpace};
 
 const ONE_IN_BIPS: i64 = 10_000;
+const GAS_CONSTRAINTS_KEY: u8 = 0;
+const MULTI_GAS_CONSTRAINTS_KEY: u8 = 1;
+const SUB_STORAGE_VECTOR_LENGTH_OFFSET: u8 = 0;
+const GAS_CONSTRAINT_TARGET_OFFSET: u8 = 0;
+const GAS_CONSTRAINT_ADJUSTMENT_WINDOW_OFFSET: u8 = 1;
+const GAS_CONSTRAINT_BACKLOG_OFFSET: u8 = 2;
+const ARBOS_SINGLE_GAS_CONSTRAINTS_VERSION: u64 = 50;
+const ARBOS_MULTI_GAS_CONSTRAINTS_VERSION: u64 = 60;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GasModel {
+    Legacy,
+    SingleGasConstraints,
+    MultiGasConstraints,
+}
+
+struct GasConstraint {
+    target: StorageBacked<u64>,
+    adjustment_window: StorageBacked<u64>,
+    backlog: StorageBacked<u64>,
+}
+
+impl GasConstraint {
+    fn open(storage: &StorageSpace) -> Self {
+        Self {
+            target: storage.storage_backed(GAS_CONSTRAINT_TARGET_OFFSET),
+            adjustment_window: storage.storage_backed(GAS_CONSTRAINT_ADJUSTMENT_WINDOW_OFFSET),
+            backlog: storage.storage_backed(GAS_CONSTRAINT_BACKLOG_OFFSET),
+        }
+    }
+}
 
 /// ArbOS L2 pricing storage wrapper.
 pub struct L2Pricing {
@@ -15,10 +49,14 @@ pub struct L2Pricing {
     pub gas_backlog: StorageBacked<u64>,
     pub pricing_inertia: StorageBacked<u64>,
     pub backlog_tolerance: StorageBacked<u64>,
+    gas_constraints: StorageSpace,
+    multi_gas_constraints: StorageSpace,
 }
 
 impl L2Pricing {
     pub fn open(storage: &StorageSpace) -> Self {
+        let gas_constraints = storage.open_subspace_with_key(GAS_CONSTRAINTS_KEY);
+        let multi_gas_constraints = storage.open_subspace_with_key(MULTI_GAS_CONSTRAINTS_KEY);
         Self {
             speed_limit_per_second: storage
                 .storage_backed(L2PricingOffset::SpeedLimitPerSecond as u8),
@@ -29,14 +67,31 @@ impl L2Pricing {
             gas_backlog: storage.storage_backed(L2PricingOffset::GasBacklog as u8),
             pricing_inertia: storage.storage_backed(L2PricingOffset::PricingInertia as u8),
             backlog_tolerance: storage.storage_backed(L2PricingOffset::BacklogTolerance as u8),
+            gas_constraints,
+            multi_gas_constraints,
         }
     }
 
     pub fn update_pricing_model<J: JournalTr>(
         &self,
         time_passed: u64,
+        arbos_version: u64,
         journal: &mut J,
     ) -> Result<()> {
+        let model = self.gas_model(arbos_version, journal)?;
+        match model {
+            GasModel::Legacy => self.update_pricing_model_legacy(time_passed, journal),
+            GasModel::SingleGasConstraints => {
+                self.update_pricing_model_single_constraints(time_passed, journal)
+            }
+            GasModel::MultiGasConstraints => {
+                // TODO(parity): implement full multi-gas constraints pricing model.
+                Ok(())
+            }
+        }
+    }
+
+    fn update_pricing_model_legacy<J: JournalTr>(&self, time_passed: u64, journal: &mut J) -> Result<()> {
         let speed_limit = self.speed_limit_per_second.get(journal)?;
         let gas_to_shrink = time_passed.saturating_mul(speed_limit);
         let current_backlog = self.gas_backlog.get(journal)?;
@@ -68,17 +123,115 @@ impl L2Pricing {
         Ok(())
     }
 
-    pub fn grow_backlog<J: JournalTr>(&self, used_gas: u64, journal: &mut J) -> Result<()> {
-        let current = self.gas_backlog.get(journal)?;
-        self.gas_backlog
-            .set(current.saturating_add(used_gas), journal)?;
+    fn update_pricing_model_single_constraints<J: JournalTr>(
+        &self,
+        time_passed: u64,
+        journal: &mut J,
+    ) -> Result<()> {
+        let constraints_len = self.gas_constraints_len(journal)?;
+        let mut total_exponent_bips: i64 = 0;
+
+        for i in 0..constraints_len {
+            let constraint = self.open_gas_constraint(i);
+            let target = constraint.target.get(journal)?;
+            let gas_to_shrink = time_passed.saturating_mul(target);
+            let backlog = constraint.backlog.get(journal)?;
+            let backlog = backlog.saturating_sub(gas_to_shrink);
+            constraint.backlog.set(backlog, journal)?;
+
+            if backlog > 0 {
+                let inertia = constraint.adjustment_window.get(journal)?;
+                let divisor = inertia.saturating_mul(target);
+                if divisor > 0 {
+                    let dividend = (backlog as i128)
+                        .saturating_mul(ONE_IN_BIPS as i128)
+                        .min(i64::MAX as i128) as i64;
+                    let exponent = dividend / divisor as i64;
+                    total_exponent_bips = total_exponent_bips.saturating_add(exponent);
+                }
+            }
+        }
+
+        let min_base_fee = self.min_base_fee_wei.get(journal)?;
+        let next_base_fee = if total_exponent_bips > 0 {
+            big_mul_by_bips(min_base_fee, approx_exp_basis_points(total_exponent_bips, 4))
+        } else {
+            min_base_fee
+        };
+        self.base_fee_wei.set(next_base_fee, journal)?;
         Ok(())
+    }
+
+    pub fn grow_backlog<J: JournalTr>(
+        &self,
+        used_gas: u64,
+        arbos_version: u64,
+        journal: &mut J,
+    ) -> Result<()> {
+        let model = self.gas_model(arbos_version, journal)?;
+        match model {
+            GasModel::Legacy => {
+                let current = self.gas_backlog.get(journal)?;
+                self.gas_backlog
+                    .set(current.saturating_add(used_gas), journal)?;
+                Ok(())
+            }
+            GasModel::SingleGasConstraints => {
+                let constraints_len = self.gas_constraints_len(journal)?;
+                for i in 0..constraints_len {
+                    let constraint = self.open_gas_constraint(i);
+                    let backlog = constraint.backlog.get(journal)?;
+                    constraint
+                        .backlog
+                        .set(backlog.saturating_add(used_gas), journal)?;
+                }
+                Ok(())
+            }
+            GasModel::MultiGasConstraints => {
+                // TODO(parity): implement full multi-gas constraints backlog updates.
+                Ok(())
+            }
+        }
     }
 
     pub fn shrink_backlog<J: JournalTr>(&self, gas: u64, journal: &mut J) -> Result<()> {
         let current = self.gas_backlog.get(journal)?;
         self.gas_backlog.set(current.saturating_sub(gas), journal)?;
         Ok(())
+    }
+
+    fn gas_model<J: JournalTr>(&self, arbos_version: u64, journal: &mut J) -> Result<GasModel> {
+        if arbos_version >= ARBOS_MULTI_GAS_CONSTRAINTS_VERSION
+            && self.multi_gas_constraints_len(journal)? > 0
+        {
+            return Ok(GasModel::MultiGasConstraints);
+        }
+        if arbos_version >= ARBOS_SINGLE_GAS_CONSTRAINTS_VERSION
+            && self.gas_constraints_len(journal)? > 0
+        {
+            return Ok(GasModel::SingleGasConstraints);
+        }
+        Ok(GasModel::Legacy)
+    }
+
+    fn gas_constraints_len<J: JournalTr>(&self, journal: &mut J) -> Result<u64> {
+        self.gas_constraints
+            .storage_backed::<u64>(SUB_STORAGE_VECTOR_LENGTH_OFFSET)
+            .get(journal)
+    }
+
+    fn multi_gas_constraints_len<J: JournalTr>(&self, journal: &mut J) -> Result<u64> {
+        self.multi_gas_constraints
+            .storage_backed::<u64>(SUB_STORAGE_VECTOR_LENGTH_OFFSET)
+            .get(journal)
+    }
+
+    fn open_gas_constraint(&self, index: u64) -> GasConstraint {
+        let slot_id = index.to_be_bytes();
+        let storage = self
+            .gas_constraints
+            .open_subspace(Bytes::copy_from_slice(&slot_id));
+        GasConstraint::open(&storage)
     }
 }
 

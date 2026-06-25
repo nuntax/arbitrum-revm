@@ -84,4 +84,86 @@ impl ArbosState {
             root,
         }
     }
+
+    /// `(account, slot)` of the on-chain ArbOS version word.
+    pub fn version_slot() -> (Address, U256) {
+        let (account, slot) = Self::open().arbos_version.account_and_key();
+        (account, U256::from_be_bytes(slot.0))
+    }
+
+    /// Reads the on-chain ArbOS version directly from a state source.
+    ///
+    /// Used to select the execution spec ([`crate::ArbSpecId::from_arbos_version`])
+    /// before the EVM is built, since the version lives in state but the spec must be
+    /// fixed in `Cfg` up front. Returns 0 (treated as genesis) when unreadable.
+    pub fn read_version<DB: revm::DatabaseRef>(db: &DB) -> u64 {
+        let (account, slot) = Self::version_slot();
+        db.storage_ref(account, slot)
+            .ok()
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or(0)
+    }
+
+    /// [`Self::read_version`] for a mutable [`revm::Database`] (e.g. the message
+    /// execution path, which has `&mut DB: Database` rather than `DatabaseRef`).
+    pub fn read_version_db<DB: revm::Database>(db: &mut DB) -> u64 {
+        let (account, slot) = Self::version_slot();
+        db.storage(account, slot)
+            .ok()
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or(0)
+    }
+
+    /// The ArbOS version a block at `block_timestamp` will execute *under*, accounting
+    /// for a scheduled upgrade. Mirrors Nitro's `UpgradeArbosVersionIfNecessary`: if a
+    /// scheduled upgrade (`upgrade_version`) is past its flag-day (`upgrade_timestamp`),
+    /// the block runs under the new version (the start-block then bumps stored state).
+    /// Without this, an activation block would execute under the parent's hardfork.
+    pub fn read_effective_version<DB: revm::DatabaseRef>(db: &DB, block_timestamp: u64) -> u64 {
+        let state = Self::open();
+        let read = |backed: &StorageBacked<u64>| -> u64 {
+            let (account, slot) = backed.account_and_key();
+            db.storage_ref(account, U256::from_be_bytes(slot.0))
+                .ok()
+                .and_then(|value| u64::try_from(value).ok())
+                .unwrap_or(0)
+        };
+        Self::resolve_effective_version(
+            read(&state.arbos_version),
+            read(&state.upgrade_version),
+            read(&state.upgrade_timestamp),
+            block_timestamp,
+        )
+    }
+
+    /// [`Self::read_effective_version`] for a mutable [`revm::Database`].
+    pub fn read_effective_version_db<DB: revm::Database>(db: &mut DB, block_timestamp: u64) -> u64 {
+        let state = Self::open();
+        let read = |db: &mut DB, backed: &StorageBacked<u64>| -> u64 {
+            let (account, slot) = backed.account_and_key();
+            db.storage(account, U256::from_be_bytes(slot.0))
+                .ok()
+                .and_then(|value| u64::try_from(value).ok())
+                .unwrap_or(0)
+        };
+        Self::resolve_effective_version(
+            read(db, &state.arbos_version),
+            read(db, &state.upgrade_version),
+            read(db, &state.upgrade_timestamp),
+            block_timestamp,
+        )
+    }
+
+    fn resolve_effective_version(
+        current: u64,
+        upgrade_version: u64,
+        upgrade_timestamp: u64,
+        block_timestamp: u64,
+    ) -> u64 {
+        if upgrade_version > current && block_timestamp >= upgrade_timestamp {
+            upgrade_version
+        } else {
+            current
+        }
+    }
 }

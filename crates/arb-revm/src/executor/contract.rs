@@ -35,7 +35,7 @@ pub struct ArbMessageEnvelope {
     pub poster: Address,
     pub l1_base_fee_wei: U256,
     pub delayed_messages_read: u64,
-    pub txs: Vec<arb_sequencer_consensus::transactions::ArbTxEnvelope>,
+    pub txs: Vec<arb_alloy_consensus::transactions::ArbTxEnvelope>,
 }
 
 /// Static execution configuration.
@@ -121,6 +121,8 @@ pub enum ArbWriteStage {
     StartBlockPrelude,
     /// User transaction state write.
     UserTransaction,
+    /// Auto-scheduled retry transaction state write.
+    ScheduledRetryTransaction,
 }
 
 /// Durable write target category.

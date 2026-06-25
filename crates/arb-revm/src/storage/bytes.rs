@@ -74,6 +74,14 @@ impl StorageBytes {
 
     pub fn set<J: JournalTr>(&self, value: &[u8], journal: &mut J) -> Result<()> {
         self.clear(journal)?;
+        self.set_fresh(value, journal)
+    }
+
+    /// Writes bytes assuming the storage region is freshly initialized.
+    ///
+    /// This avoids an initial length read, which is useful for protocol paths
+    /// that create new objects in empty subspaces.
+    pub fn set_fresh<J: JournalTr>(&self, value: &[u8], journal: &mut J) -> Result<()> {
         self.storage.set(
             FixedBytes::from(U256::ZERO.to_be_bytes()),
             U256::from(value.len()),

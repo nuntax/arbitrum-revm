@@ -11,15 +11,44 @@ eyre.workspace = true
 hex.workspace = true
 revm.workspace = true
 revm-database.workspace = true
-alloy-provider = { workspace = true, features = ["reqwest"] }
+alloy-provider = { workspace = true, features = ["reqwest", "debug-api"] }
 serde_json.workspace = true
 serde = { version = "1.0.228", features = ["derive"] }
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
 tokio.workspace = true
 tracing.workspace = true
+alloy-rlp.workspace = true
+alloy-trie = "0.9.5"
 alloy-consensus = "1.4.3"
-alloy-eips = "1.4.3"
+alloy-eips = "1.8.3"
 alloy-core = "1.4.3"
+alloy-rpc-client = "1.8.3"
+alloy-transport = "1.8.3"
+alloy-rpc-types-eth = "1.8.3"
+alloy-rpc-types-trace = "1.8.3"
+alloy-network-primitives = "1.8.3"
+url = "2.5"
 sequencer_client = { path = "../../../sequencer_client/crates/sequencer_client" }
-arb-sequencer-consensus = { path = "../../../sequencer_client/crates/types/consensus" }
-arb-sequencer-network = { path = "../../../sequencer_client/crates/types/network" }
+arb_alloy_consensus = { package = "arb-alloy-consensus", path = "../../../arb-alloy/crates/consensus", features = ["k256"] }
+arb_sequencer_network = { package = "arb-sequencer-network", path = "../../../arb-alloy/crates/sequencer-network" }
+arb_alloy_precompiles = { package = "arb-alloy-precompiles", path = "../../../arb-alloy/crates/precompiles" }
+arb_alloy_rpc_types = { package = "arb-alloy-rpc-types", path = "../../../arb-alloy/crates/rpc-types" }
+arb_alloy_network = { package = "arb-alloy-network", path = "../../../arb-alloy/crates/network" }
+brotli = { path = "../../../nitro/crates/brotli", features = ["cc_brotli"] }
+
+# Stylus WASM execution. Feature-gated ("stylus"; pulls Nitro's forked wasmer — heavy
+# build). Uses the CANONICAL local Nitro crates (exact runtime the real chain runs = best
+# parity; fork-in-place if we ever need to change them). arbos-revm is the integration
+# blueprint, but the runtime is upstream Nitro (its arbutil exposes the same API).
+stylus = { path = "../../../nitro/crates/stylus", features = ["cc_brotli"], optional = true }
+arbutil = { path = "../../../nitro/crates/arbutil", optional = true }
+wasmer-types = { path = "../../../nitro/crates/tools/wasmer/lib/types", optional = true }
+wasm-encoder = { version = "0.244.0", optional = true }
+wasmparser = { version = "0.244.0", optional = true }
+wasmprinter = { version = "0.244.0", optional = true }
+lru = { version = "0.16.3", optional = true }
+lazy_static = { version = "1.5.0", optional = true }
+
+[features]
+stylus = ["dep:stylus", "dep:arbutil", "dep:wasmer-types", "dep:wasm-encoder", "dep:wasmparser", "dep:wasmprinter", "dep:lru", "dep:lazy_static"]

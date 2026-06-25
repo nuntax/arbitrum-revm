@@ -1,7 +1,7 @@
 use eyre::Result;
 use revm::{
     context_interface::JournalTr,
-    primitives::{FixedBytes, B256, U256},
+    primitives::{B256, FixedBytes, U256},
 };
 
 use super::{StorageBacked, StorageSpace};
@@ -30,6 +30,16 @@ impl StorageQueue {
     pub fn initialize<J: JournalTr>(&self, journal: &mut J) -> Result<()> {
         self.next_put_offset.set(QUEUE_INITIAL_OFFSET, journal)?;
         self.next_get_offset.set(QUEUE_INITIAL_OFFSET, journal)?;
+        Ok(())
+    }
+
+    /// Initializes queue pointers if the queue has never been initialized.
+    pub fn ensure_initialized<J: JournalTr>(&self, journal: &mut J) -> Result<()> {
+        let put = self.next_put_offset.get(journal)?;
+        let get = self.next_get_offset.get(journal)?;
+        if put == 0 && get == 0 {
+            self.initialize(journal)?;
+        }
         Ok(())
     }
 

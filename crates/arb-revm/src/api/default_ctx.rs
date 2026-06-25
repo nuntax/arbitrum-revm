@@ -1,8 +1,8 @@
 use crate::{ArbChainContext, ArbSpecId, ArbTransaction};
 use revm::{
+    Context, Journal, MainContext,
     context::{BlockEnv, CfgEnv, TxEnv},
     database_interface::EmptyDB,
-    Context, Journal, MainContext,
 };
 
 /// Default Arbitrum context type.

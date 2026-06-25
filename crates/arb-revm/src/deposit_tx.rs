@@ -1,6 +1,6 @@
 use crate::api::exec::ArbContextTr;
 use revm::{
-    context_interface::{journaled_state::TransferError, ContextTr, JournalTr, Transaction},
+    context_interface::{ContextTr, JournalTr, Transaction, journaled_state::TransferError},
     primitives::TxKind,
 };
 

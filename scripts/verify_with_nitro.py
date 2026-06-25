@@ -74,6 +74,16 @@ def resolve_hash_from_sequence_block(
     if sequence_number is None:
         return None, "artifact missing sequence_number for fallback lookup"
 
+    latest_block = rpc_call(rpc_url, "eth_blockNumber", [])
+    latest_number = hex_to_int(latest_block)
+    if latest_number is None:
+        return None, "failed to fetch current chain head for fallback lookup"
+    if sequence_number > latest_number:
+        return (
+            None,
+            f"sequence_number {sequence_number} exceeds current chain head {latest_number}; fixture is stale for this testnode",
+        )
+
     block = rpc_call(rpc_url, "eth_getBlockByNumber", [hex(sequence_number), True])
     if not isinstance(block, dict):
         return None, f"eth_getBlockByNumber({sequence_number}) returned non-object"
@@ -127,7 +137,10 @@ def resolve_hash_from_sequence_block(
     if len(by_type) > 1:
         return None, f"ambiguous fallback: {len(by_type)} type=0x64 txs in block {sequence_number}"
 
-    return None, f"no fallback tx candidate found in block {sequence_number}"
+    return (
+        None,
+        f"no fallback tx candidate found in block {sequence_number}; fixture likely captured from different chain state",
+    )
 
 
 def build_local_account_maps(accounts: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:

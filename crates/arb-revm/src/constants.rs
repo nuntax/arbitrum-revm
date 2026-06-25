@@ -1,4 +1,4 @@
-use revm::primitives::{address, Address};
+use revm::primitives::{Address, address};
 
 /// ArbOS system actor address used for internal calls in Nitro.
 pub const ARBOS_ACTS_ADDRESS: Address = address!("0x00000000000000000000000000000000000A4B05");
@@ -12,6 +12,10 @@ pub const BATCH_POSTER_ADDRESS: Address = address!("0xA4B00000000000000000007365
 /// ArbOS L1 pricer funds pool account (Nitro `types.L1PricerFundsPoolAddress`).
 pub const L1_PRICER_FUNDS_POOL_ADDRESS: Address =
     address!("0xA4B00000000000000000000000000000000000f6");
+
+/// ArbRetryableTx precompile address used for retryable submission/redeem flows.
+pub const ARB_RETRYABLE_TX_ADDRESS: Address =
+    address!("0x000000000000000000000000000000000000006e");
 
 /// EIP-2935 history storage contract address.
 pub const HISTORY_STORAGE_ADDRESS: Address = address!("0x0000F90827F1C53a10cb7A02335B175320002935");
@@ -27,3 +31,9 @@ pub const ARBITRUM_INTERNAL_TX_TYPE: u8 = 0x6a;
 
 /// Nitro typed transaction discriminator for L1->L2 ETH deposit transactions.
 pub const ARBITRUM_DEPOSIT_TX_TYPE: u8 = 0x64;
+
+/// Nitro typed transaction discriminator for submit-retryable transactions.
+pub const ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE: u8 = 0x69;
+
+/// Nitro typed transaction discriminator for retry (redeem) transactions.
+pub const ARBITRUM_RETRY_TX_TYPE: u8 = 0x68;
