@@ -2,13 +2,13 @@ use alloy_provider::{Provider, ProviderBuilder};
 use arb_alloy_consensus::transactions::{ArbTxEnvelope, TxRetry};
 use arb_revm::{
     ArbBuilder, ArbChainContext, ArbContext, ArbExecCfg, ArbExecOutcome, ArbExecutionHooks,
-    ArbExecutionInput, ArbMessageEnvelope, ArbParentHeader, ArbRunner, ArbRunnerError,
+    ArbExecutionInput, ArbParentHeader, ArbRunner, ArbRunnerError,
     ArbStartBlockDerived, ArbTransaction, ArbosState, DefaultArb, DefaultArbExecutionHooks,
     constants::{ARB_RETRYABLE_TX_ADDRESS, ARBITRUM_INTERNAL_TX_TYPE, HISTORY_STORAGE_ADDRESS},
-    executor::ArbExecError,
+    executor::{ArbExecError, digest_message_envelope},
     transaction::arb_envelope_to_tx_env,
 };
-use arb_sequencer_network::sequencer::feed::{BroadcastFeedMessage, L1Header, Root};
+use arb_sequencer_network::sequencer::feed::{BroadcastFeedMessage, Root};
 use eyre::{Result, eyre};
 use revm::{
     Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm,
@@ -21,7 +21,6 @@ use revm::{
     state::EvmState,
 };
 use revm_database::{AlloyDB, BlockId};
-use sequencer_client::reader::parse_message;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{collections::VecDeque, env, fs, str::FromStr};
@@ -774,14 +773,6 @@ async fn main() -> Result<()> {
 
     let parent_from_chain = fetch_parent_header(rpc_url, state_block_number).await?;
 
-    let l1_message = feed_msg.message_with_meta_data.l1_incoming_message.clone();
-    let l1_header = L1Header::from_header(
-        &l1_message.header,
-        feed_msg.message_with_meta_data.delayed_messages_read,
-    )
-    .map_err(|e| eyre!("invalid L1 header in sequencer message: {e}"))?;
-    let txs = parse_message(l1_message, chain_id, version)?;
-
     let provider = ProviderBuilder::new().connect(rpc_url).await?.erased();
     let alloy_db = AlloyDB::new(provider, BlockId::from(state_block_number));
     let wrapped = WrapDatabaseAsync::new(alloy_db).ok_or_else(|| {
@@ -789,22 +780,8 @@ async fn main() -> Result<()> {
     })?;
     let mut db = CacheDB::new(wrapped);
 
-    let poster = Address::from_str(&format!("{:#x}", l1_header.poster))
-        .map_err(|e| eyre!("failed to parse poster address: {e}"))?;
-    let l1_base_fee_wei = l1_header
-        .base_fee_l1
-        .map(|v| U256::from_limbs(*v.as_limbs()))
-        .unwrap_or(U256::ZERO);
-
-    let message = ArbMessageEnvelope {
-        sequence_number: Some(feed_msg.sequence_number),
-        l1_block_number: l1_header.block_number,
-        l1_timestamp: l1_header.timestamp,
-        poster,
-        l1_base_fee_wei,
-        delayed_messages_read: l1_header.delayed_messages_read,
-        txs,
-    };
+    // Decode the feed message into the executor's message envelope (see executor::digest).
+    let message = digest_message_envelope(&feed_msg, chain_id, version)?;
 
     let parent = ArbParentHeader {
         number: parent_number_flag.unwrap_or(parent_from_chain.number),
