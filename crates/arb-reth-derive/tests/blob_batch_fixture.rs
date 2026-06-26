@@ -52,7 +52,8 @@ fn decodes_real_delayed_free_blob_batch() {
     assert_eq!(hist.get(&segment_kind::DELAYED_MESSAGES), None, "expected delayed-free batch");
 
     // 3. full multiplexer pass -> complete message list (no DelayedUnsupported).
-    let msgs = extract_messages(&header, &segs, header.after_delayed_messages).expect("multiplex");
+    let msgs = extract_messages(&header, &segs, header.after_delayed_messages, &arb_reth_derive::delayed::NoDelayed)
+        .expect("multiplex");
     println!("L2 messages: {}", msgs.len());
     assert!(!msgs.is_empty());
 

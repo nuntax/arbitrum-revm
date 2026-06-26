@@ -15,6 +15,7 @@
 
 pub mod batch;
 pub mod blob;
+pub mod delayed;
 pub mod l2message;
 pub mod message;
 pub mod multiplexer;

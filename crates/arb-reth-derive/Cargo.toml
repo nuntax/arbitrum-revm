@@ -18,3 +18,6 @@ alloy-rlp = { workspace = true }
 # Same C brotli as Nitro (and arb-revm's L1 cost) — guarantees decompression parity.
 # `cc_brotli` builds the C brotli from source (matches arb-revm).
 brotli = { path = "../../../nitro/crates/brotli", features = ["cc_brotli"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
