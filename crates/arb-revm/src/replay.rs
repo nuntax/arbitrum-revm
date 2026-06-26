@@ -513,12 +513,12 @@ fn compare_tx(
             result.is_success()
         ));
     }
-    if result.gas_used() != expected.gas_used {
+    if result.tx_gas_used() != expected.gas_used {
         mismatches.push(format!(
             "tx[{idx}] {:#x}: gas_used mismatch: expected {}, got {}",
             expected.tx_hash,
             expected.gas_used,
-            result.gas_used()
+            result.tx_gas_used()
         ));
     }
     let actual_created = result.created_address();

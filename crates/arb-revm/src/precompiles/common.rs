@@ -12,7 +12,7 @@ const PRECOMPILE_BASE_GAS: u64 = 0;
 #[inline]
 pub(super) fn ok_result(gas_limit: u64, output: Vec<u8>) -> InterpreterResult {
     let mut gas = Gas::new(gas_limit);
-    let _ = gas.record_cost(PRECOMPILE_BASE_GAS);
+    let _ = gas.record_regular_cost(PRECOMPILE_BASE_GAS);
     InterpreterResult {
         result: InstructionResult::Return,
         gas,

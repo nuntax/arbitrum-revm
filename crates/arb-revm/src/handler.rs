@@ -570,7 +570,7 @@ where
             2
         };
         let nonrefundable = evm.ctx().chain().poster_gas;
-        let refundable_spent = gas.spent().saturating_sub(nonrefundable);
+        let refundable_spent = gas.total_gas_spent().saturating_sub(nonrefundable);
         let max_refund = refundable_spent / max_refund_quotient;
         let current_refund = gas.refunded().max(0) as u64;
         gas.set_refund(current_refund.min(max_refund) as i64);
