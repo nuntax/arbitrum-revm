@@ -16,12 +16,18 @@
 
 // Stage A's reth-primitives-traits surface (NodePrimitives/SignedTransaction/Receipt) is satisfied
 // inside arb-alloy's `reth` feature; force it into the graph so unification stays exercised.
-use arb_alloy_consensus as _;
-use reth_evm as _;
 use reth_primitives_traits as _;
+
+extern crate alloc;
 
 pub mod tx;
 pub use tx::ArbTx;
+
+pub mod block;
+pub use block::{
+    ArbBlockAssembler, ArbBlockExecutionCtx, ArbBlockExecutor, ArbBlockExecutorFactory,
+    ArbTxResult,
+};
 
 use alloy_evm::{Database, Evm, EvmEnv, EvmFactory, IntoTxEnv};
 use alloy_primitives::{Address, Bytes};
