@@ -23,23 +23,17 @@
 //! chain context (see `block.rs`). So an executor built through this config sees the real L1 block
 //! number and `NUMBER` reads it.
 //!
-//! ## STATUS: `impl ConfigureEvm` is BLOCKED on a Stage-B precompiles design fork
+//! ## `impl ConfigureEvm` (the precompiles fork is resolved)
 //!
 //! reth's [`ConfigureEvm`](reth_evm::ConfigureEvm) bounds the inner `EvmFactory` with
-//! `Precompiles = PrecompilesMap` and `Tx: TransactionEnvMut`. The `Tx` bound is satisfied (see the
-//! [`TransactionEnvMut`] impl for [`ArbTx`](crate::ArbTx) in `tx.rs`). The `Precompiles` bound is
-//! **not** satisfiable without an arb-revm change: `ArbEvmFactory`/`ArbEvm` execute through
-//! `arb_revm`'s [`ArbPrecompiles`] (a custom `PrecompileProvider` that runs ArbOS *stateful*
-//! precompiles — ArbSys/ArbGasInfo/ArbRetryableTx — over the full `ArbContext`), and alloy-evm's
-//! `EvmFactory` binds `Evm::Precompiles == EvmFactory::Precompiles`, so advertising `PrecompilesMap`
-//! would require the inner EVM to *execute* through `PrecompilesMap`. That is a re-homing of the
-//! ArbOS precompiles onto alloy-evm's `DynPrecompile`/`EvmInternals` model, which lives in arb-revm
-//! (out of this crate's scope) and is parity-sensitive. See the agent report for options.
-//!
-//! Until that fork is resolved, the header→spec mapping and the L1-block-number threading — the core
-//! of Stage D.1 and the deferred fix — are implemented here as **inherent methods** with the exact
-//! `ConfigureEvm` signatures, so they are real and fully tested. Wiring them into the trait is a
-//! drop-in once the precompiles seam exists.
+//! `Precompiles = PrecompilesMap` and `Tx: TransactionEnvMut`. Both now hold: `ArbTx` impls
+//! `TransactionEnvMut` (see `tx.rs`), and `ArbEvmFactory::Precompiles` is now `PrecompilesMap` —
+//! the ArbOS precompiles were re-homed onto alloy-evm's `DynPrecompile`/`EvmInternals` model
+//! (`arb_revm::arb_journal` + `crate::precompiles::arb_precompiles_map`), so the inner EVM executes
+//! through a `PrecompilesMap` while keeping `arb_revm`'s parity-validated precompile logic
+//! (`run_dispatch`). The [`ConfigureEvm`] impl is at the bottom of this file; the per-header logic
+//! lives in the inherent methods below (kept distinct so they stay directly unit-testable) and the
+//! trait methods delegate to them.
 
 use crate::block::{ArbBlockAssembler, ArbBlockExecutionCtx, ArbBlockExecutorFactory};
 use crate::ArbEvmFactory;
@@ -48,8 +42,11 @@ use alloy_eips::eip4895::Withdrawals;
 use alloy_evm::EvmEnv;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use arb_alloy_consensus::header::ArbHeaderInfo;
+use arb_alloy_consensus::reth::{ArbBlock, ArbPrimitives};
 use arb_revm::ArbSpecId;
 use core::convert::Infallible;
+use reth_evm::ConfigureEvm;
+use reth_primitives_traits::{SealedBlock, SealedHeader};
 use revm::context::{BlockEnv, CfgEnv};
 
 /// Arbitrum One mainnet chain id.
@@ -281,6 +278,63 @@ impl ArbEvmConfig {
         self.executor_factory.evm_factory_ref()
     }
 }
+
+/// reth's [`ConfigureEvm`] for Arbitrum — the entry point that lets reth drive ArbOS execution from
+/// a block header. Each method delegates to the equally-named inherent method above (inherent
+/// methods win method resolution, so `self.evm_env(header)` here is delegation, not recursion); the
+/// trait only adapts the surface (header→sealed-block, `Result` wrapping) and pins the associated
+/// types. `Error` is [`Infallible`] — header decoding falls back to defaults rather than erroring.
+impl ConfigureEvm for ArbEvmConfig {
+    type Primitives = ArbPrimitives;
+    type Error = ArbEvmConfigError;
+    type NextBlockEnvCtx = ArbNextBlockEnvAttributes;
+    type BlockExecutorFactory = ArbBlockExecutorFactory;
+    type BlockAssembler = ArbBlockAssembler;
+
+    fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {
+        &self.executor_factory
+    }
+
+    fn block_assembler(&self) -> &Self::BlockAssembler {
+        &self.block_assembler
+    }
+
+    fn evm_env(&self, header: &Header) -> Result<EvmEnv<ArbSpecId>, Self::Error> {
+        Ok(self.evm_env(header))
+    }
+
+    fn next_evm_env(
+        &self,
+        parent: &Header,
+        attributes: &ArbNextBlockEnvAttributes,
+    ) -> Result<EvmEnv<ArbSpecId>, Self::Error> {
+        Ok(self.next_evm_env(parent, attributes))
+    }
+
+    fn context_for_block<'a>(
+        &self,
+        block: &'a SealedBlock<ArbBlock>,
+    ) -> Result<ArbBlockExecutionCtx, Self::Error> {
+        Ok(self.context_for_block(block.header()))
+    }
+
+    fn context_for_next_block(
+        &self,
+        parent: &SealedHeader<Header>,
+        attributes: ArbNextBlockEnvAttributes,
+    ) -> Result<ArbBlockExecutionCtx, Self::Error> {
+        Ok(self.context_for_next_block(parent.header(), parent.hash(), attributes))
+    }
+}
+
+// Compile-time proof that `ArbEvmConfig` satisfies the full reth `ConfigureEvm` bound — including
+// the `EvmFactory<Precompiles = PrecompilesMap, Tx: TransactionEnvMut + FromRecoveredTx + …>`
+// constraint that the precompiles re-home (#36) unblocked. If this stops compiling, the node's EVM
+// configuration surface has regressed.
+const _: fn() = || {
+    fn assert_configure_evm<T: ConfigureEvm>() {}
+    assert_configure_evm::<ArbEvmConfig>();
+};
 
 #[cfg(test)]
 mod tests;

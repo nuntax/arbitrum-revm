@@ -37,10 +37,11 @@ pub use config::{
     ARB_ONE_CHAIN_ID, ArbEvmConfig, ArbEvmConfigError, ArbNextBlockEnvAttributes,
 };
 
+use alloy_evm::precompiles::PrecompilesMap;
 use alloy_evm::{Database, Evm, EvmEnv, EvmFactory, IntoTxEnv};
 use alloy_primitives::{Address, Bytes};
 use arb_revm::api::default_ctx::ArbContext;
-use arb_revm::{ArbBuilder, ArbChainContext, ArbPrecompiles, ArbTransaction};
+use arb_revm::{ArbBuilder, ArbChainContext, ArbTransaction};
 use core::fmt::Debug;
 use revm::context::result::{EVMError, HaltReason, InvalidTransaction, ResultAndState};
 use revm::context::{BlockEnv, Context, TxEnv};
@@ -54,7 +55,7 @@ use arb_revm::ArbSpecId;
 /// Concrete `arb_revm` EVM type the bridge owns: the ArbOS EVM (`arb_revm::ArbEvm`) over the
 /// default Arbitrum context [`ArbContext<DB>`] with the Arbitrum precompile set.
 type ArbRethEvm<DB, I> =
-    arb_revm::ArbEvm<ArbContext<DB>, I, EthInstructions<EthInterpreter, ArbContext<DB>>, ArbPrecompiles>;
+    arb_revm::ArbEvm<ArbContext<DB>, I, EthInstructions<EthInterpreter, ArbContext<DB>>, PrecompilesMap>;
 
 /// EVM error surfaced by the Arbitrum bridge. Matches `arb_revm`'s `ArbError`:
 /// `EVMError<DBError, InvalidTransaction>`.
@@ -105,7 +106,7 @@ where
     type HaltReason = HaltReason;
     type Spec = ArbSpecId;
     type BlockEnv = BlockEnv;
-    type Precompiles = ArbPrecompiles;
+    type Precompiles = PrecompilesMap;
     type Inspector = I;
 
     fn block(&self) -> &BlockEnv {
@@ -201,7 +202,7 @@ impl EvmFactory for ArbEvmFactory {
     type HaltReason = HaltReason;
     type Spec = ArbSpecId;
     type BlockEnv = BlockEnv;
-    type Precompiles = ArbPrecompiles;
+    type Precompiles = PrecompilesMap;
 
     fn create_evm<DB: Database>(
         &self,
@@ -209,8 +210,13 @@ impl EvmFactory for ArbEvmFactory {
         evm_env: EvmEnv<ArbSpecId>,
     ) -> Self::Evm<DB, NoOpInspector> {
         // `create_evm` must return `Evm<DB, NoOpInspector>`, so build with an explicit
-        // `NoOpInspector` (not the `()` default of `build_arb`).
-        let inner = Self::build_ctx(db, evm_env).build_arb_with_inspector(NoOpInspector {});
+        // `NoOpInspector` (not the `()` default of `build_arb`). Swap the default `ArbPrecompiles`
+        // provider for the reth-required `PrecompilesMap` (ArbOS precompiles re-homed onto
+        // `DynPrecompile`s, eth set selected for the spec) — `ConfigureEvm` requires it.
+        let spec = evm_env.cfg_env.spec;
+        let inner = Self::build_ctx(db, evm_env)
+            .build_arb_with_inspector(NoOpInspector {})
+            .with_precompiles(arb_precompiles_map(spec));
         ArbEvm::new(inner, false)
     }
 
@@ -220,7 +226,10 @@ impl EvmFactory for ArbEvmFactory {
         evm_env: EvmEnv<ArbSpecId>,
         inspector: I,
     ) -> Self::Evm<DB, I> {
-        let inner = Self::build_ctx(db, evm_env).build_arb_with_inspector(inspector);
+        let spec = evm_env.cfg_env.spec;
+        let inner = Self::build_ctx(db, evm_env)
+            .build_arb_with_inspector(inspector)
+            .with_precompiles(arb_precompiles_map(spec));
         ArbEvm::new(inner, true)
     }
 }
