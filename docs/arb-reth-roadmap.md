@@ -47,9 +47,12 @@ Everything lives in the `arb_revm` workspace `crates/` for now (single lockfile,
 
 ## Stages — from proven foundation to a syncing node
 
+> **Live status:** see [`arb-reth-progress.md`](./arb-reth-progress.md). As of 2026-06-26: Stage 0 ✅, Stage A ✅,
+> **Stage F milestones 1 & 2 ✅ (chain-validated on Arbitrum One)**; Stages B/C/D/E/G/H not started.
+
 Dependency order. Each stage has a concrete **exit** (a thing that compiles/passes), not a vibe.
 
-### Stage A — primitives: arb-alloy `reth` feature  *(Phase 1.3)*
+### Stage A — primitives: arb-alloy `reth` feature  *(Phase 1.3)* — ✅ DONE
 Add behind a new `reth` feature on arb-alloy (orphan rule forces reth-trait impls to live with the types):
 - `impl reth_primitives_traits::SignedTransaction for ArbTxEnvelope`
 - `impl` the reth `Receipt` trait for `ArbReceiptEnvelope`
@@ -90,7 +93,7 @@ node can drive our reth execution client** — strong parity milestone before ow
 
 **Exit:** feed the `L1IncomingMessage` for a known mainnet block → **byte-identical block** (hash + roots).
 
-### Stage F — L1 inbox derivation  *(Phase 3 — THE MOAT)*
+### Stage F — L1 inbox derivation  *(Phase 3 — THE MOAT)* — ✅ M1+M2 DONE (chain-validated)
 `arb-reth-derive`: read `SequencerInbox` `SequencerBatchDelivered` from L1 (via L1 reth/RPC) + `DelayedInbox`
 `MessageDelivered`; decode batch (5×u64 header + brotli + RLP segment list; segment kinds; DA flags AnyTrust
 `0x80`/Blob `0x50`/DACert `0x01`/Zeroheavy `0x20`); `inboxMultiplexer.Pop()` → `MessageWithMetadata` stream → Stage E.
