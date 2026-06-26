@@ -39,7 +39,9 @@ Foundation de-risked by real `cargo check`: revm unifies at **36**, alloy at **1
 - **A arb-alloy `reth` feature** — ✅ done + in-workspace compile + static assertion. `ArbPrimitives: NodePrimitives`.
   Commit `arb-alloy ed68382`. Two Stage-C landmines noted in `reth.rs` (InMemorySize heuristic; RlpDecodableReceipt
   Legacy-fallback w/ zeroed outer bloom).
-- **B EvmFactory/Evm (wrap arb_revm)** — ⬜ not started.
+- **B EvmFactory/Evm (wrap arb_revm)** — ✅ done + verified (commit `arb_revm dd73b77`). `ArbEvmFactory`/`ArbEvm`
+  mirror alloy-op-evm; one tx executes gas-exact vs arb_revm direct. Deferred to Stage D: `ArbChainContext.l1_block_number`
+  from `ArbHeaderInfo`. Stage C must re-home `handler.rs` per-tx hooks into `execute_transaction`.
 - **C BlockExecutor + assembler (ArbOS hooks)** — ⬜ not started. Re-homes `arb_revm::handler.rs`.
 - **D ConfigureEvm + node skeleton** — ⬜ not started.
 - **E message→block (`DigestMessage`)** — ⬜ not started. `l2message.rs` (parse_l2) already built as F groundwork.
@@ -70,10 +72,13 @@ Foundation de-risked by real `cargo check`: revm unifies at **36**, alloy at **1
 
 **Tests:** 20 unit + 2 chain-anchored integration, all green. Commits `arb_revm 06da168` (M1), `99afc0f` (M2).
 
+**Stage F — also done (commit `3a5bbff`):** `parse_sequencer_batch_delivered` (224-byte event → `BatchHeader`,
+validated both eras); **calldata path** (`dataLocation=0`) — pre-Dencun batch 497980 → 496 txs, first+last user txs
+confirmed on-chain (synthetic start-block tx correctly excluded).
+
 **Stage F remaining:** live `l1source` adapter (replace committed fixtures with real SequencerInbox/Bridge/Inbox
-reads); calldata batch path (`dataLocation=0`); `timeBounds`-from-event helper (parse `SequencerBatchDelivered`
-224-byte data: `delayedAcc, afterDelayedMessagesRead, timeBounds(4×u64), dataLocation`); full delayed-bearing-batch
-end-to-end (fetch delayed messages → `DelayedMap` → decode a 5-delayed batch).
+reads); full delayed-bearing-batch end-to-end (find a blob batch with `afterDelayed > prev`, fetch its
+`MessageDelivered` events → `DelayedMap` → decode). Then unify the binary message type into arb-sequencer-network.
 
 ## Reference constants (Arbitrum One)
 
