@@ -14,7 +14,7 @@ use revm::{
     handler::{EthPrecompiles, PrecompileProvider},
     interpreter::{InstructionResult, InterpreterResult},
     precompile::{Precompiles, secp256r1::P256VERIFY},
-    primitives::Address,
+    primitives::{Address, AddressSet},
 };
 use std::sync::OnceLock;
 
@@ -337,15 +337,29 @@ pub struct ArbPrecompiles {
     /// Whether `inner.precompiles` is the ArbOS 50+ (`IsDia`/Osaka) set. Tracked separately
     /// because the precompile-set boundary (ArbOS 50) does not coincide with an eth-spec change.
     is_dia: bool,
+    /// Combined warm-address set: eth precompile addresses ∪ arb precompile addresses.
+    /// Kept in sync with `inner` via `new_with_spec` and `set_spec`.
+    warm: AddressSet,
+}
+
+fn build_warm_set(inner: &EthPrecompiles) -> AddressSet {
+    let mut warm = AddressSet::default();
+    warm.clone_from(inner.warm_addresses());
+    for addr in ArbPrecompilesEnum::all_addresses() {
+        warm.insert(addr);
+    }
+    warm
 }
 
 impl ArbPrecompiles {
     pub fn new_with_spec(spec: ArbSpecId) -> Self {
         let mut inner = EthPrecompiles::new(spec.into());
         inner.precompiles = arb_eth_precompiles(spec);
+        let warm = build_warm_set(&inner);
         Self {
             inner,
             is_dia: spec.arbos_version() >= 50,
+            warm,
         }
     }
 }
@@ -373,6 +387,7 @@ where
         self.inner.precompiles = arb_eth_precompiles(spec);
         self.inner.spec = eth_spec;
         self.is_dia = is_dia;
+        self.warm = build_warm_set(&self.inner);
         true
     }
 
@@ -399,12 +414,8 @@ where
         self.inner.run(context, inputs)
     }
 
-    fn warm_addresses(&self) -> Box<impl Iterator<Item = Address>> {
-        Box::new(
-            self.inner
-                .warm_addresses()
-                .chain(ArbPrecompilesEnum::all_addresses()),
-        )
+    fn warm_addresses(&self) -> &AddressSet {
+        &self.warm
     }
 
     fn contains(&self, address: &Address) -> bool {

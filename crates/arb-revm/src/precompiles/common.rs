@@ -65,7 +65,7 @@ pub(super) fn empty_active_result(gas_limit: u64) -> InterpreterResult {
 pub(super) fn gated_revert_result(gas_limit: u64) -> InterpreterResult {
     InterpreterResult {
         result: InstructionResult::Revert,
-        gas: Gas::new_spent(gas_limit),
+        gas: Gas::new_spent_with_reservoir(gas_limit, 0),
         output: Bytes::new(),
     }
 }

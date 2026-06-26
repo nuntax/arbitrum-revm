@@ -130,15 +130,17 @@ where
                     ctx.tx(),
                     spec,
                     ctx.cfg().is_eip7623_disabled(),
+                    ctx.cfg().is_amsterdam_eip8037_enabled(),
+                    ctx.cfg().tx_gas_limit_cap(),
                 )?
             };
-            evm.ctx_mut().chain_mut().intrinsic_gas = init_and_floor.initial_gas;
+            evm.ctx_mut().chain_mut().intrinsic_gas = init_and_floor.initial_total_gas();
             return Ok(init_and_floor);
         }
         let result = self.mainnet.validate(evm)?;
         // Store intrinsic gas for use in pre_execution (gas limit enforcement)
         // and reward_beneficiary (reconstructing Nitro's computeGas).
-        evm.ctx_mut().chain_mut().intrinsic_gas = result.initial_gas;
+        evm.ctx_mut().chain_mut().intrinsic_gas = result.initial_total_gas();
         Ok(result)
     }
 
@@ -204,16 +206,20 @@ where
         self.mainnet.validate_env(evm)
     }
 
-    fn pre_execution(&self, evm: &mut Self::Evm) -> Result<u64, Self::Error> {
+    fn pre_execution(
+        &self,
+        evm: &mut Self::Evm,
+        init_and_floor_gas: &mut InitialAndFloorGas,
+    ) -> Result<u64, Self::Error> {
         if is_protocol_env_bypass_tx(evm) {
             return Ok(0);
         }
 
         // Run the standard pre-execution steps, but through this handler so our
         // overridden validate_against_state_and_deduct_caller logic is applied.
-        self.validate_against_state_and_deduct_caller(evm)?;
+        self.validate_against_state_and_deduct_caller(evm, init_and_floor_gas)?;
         self.load_accounts(evm)?;
-        let mainnet_cost = self.apply_eip7702_auth_list(evm)?;
+        let mainnet_cost = self.apply_eip7702_auth_list(evm, init_and_floor_gas)?;
 
         // --- GasChargingHook (Nitro: tx_processor.go GasChargingHook) ---
         // Two-phase approach to avoid simultaneous mutable+immutable borrows:
@@ -370,7 +376,7 @@ where
             )
         };
         let total_initial = init_and_floor_gas
-            .initial_gas
+            .initial_total_gas()
             .saturating_add(poster_gas)
             .saturating_add(hold_gas);
         if total_initial > tx_gas_limit {
@@ -383,9 +389,9 @@ where
 
         let first_frame_input = self
             .mainnet
-            .first_frame_input(evm, tx_gas_limit.saturating_sub(total_initial))?;
+            .first_frame_input(evm, tx_gas_limit.saturating_sub(total_initial), 0)?;
         let mut frame_result = self.mainnet.run_exec_loop(evm, first_frame_input)?;
-        self.mainnet.last_frame_result(evm, &mut frame_result)?;
+        self.mainnet.last_frame_result(evm, 0, &mut frame_result)?;
         // Return the withheld cap gas: it bounded compute but is not part of gasUsed.
         // (frame gas.spent() = intrinsic + poster + hold + compute; this removes hold.)
         frame_result.gas_mut().erase_cost(hold_gas);
@@ -395,6 +401,7 @@ where
     fn validate_against_state_and_deduct_caller(
         &self,
         evm: &mut Self::Evm,
+        _init_and_floor_gas: &mut InitialAndFloorGas,
     ) -> Result<(), Self::Error> {
         if is_protocol_env_bypass_tx(evm) {
             // Nitro internal/deposit/submit-retryable/retry txs are protocol actions,
@@ -490,6 +497,7 @@ where
     fn last_frame_result(
         &mut self,
         evm: &mut Self::Evm,
+        original_reservoir: u64,
         frame_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
     ) -> Result<(), Self::Error> {
         if is_protocol_short_circuit_tx(evm) {
@@ -508,7 +516,7 @@ where
             }
             return Ok(());
         }
-        self.mainnet.last_frame_result(evm, frame_result)
+        self.mainnet.last_frame_result(evm, original_reservoir, frame_result)
     }
 
     fn reimburse_caller(
@@ -885,7 +893,7 @@ fn submit_retryable_success_frame_result(gas_limit: u64) -> FrameResult {
         InterpreterResult::new(
             InstructionResult::Stop,
             Bytes::new(),
-            Gas::new_spent(gas_limit),
+            Gas::new_spent_with_reservoir(gas_limit, 0),
         ),
         0..0,
     ))

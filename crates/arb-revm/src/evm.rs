@@ -11,7 +11,8 @@ use revm::{
     },
     inspector::{InspectorEvmTr, JournalExt},
     interpreter::{
-        Host, Instruction, InstructionContext, InterpreterResult, interpreter::EthInterpreter,
+        Host, Instruction, InstructionContext, InstructionExecResult, InterpreterResult,
+        interpreter::EthInterpreter,
     },
     primitives::U256,
 };
@@ -21,14 +22,15 @@ use revm::{
 /// Mirrors Nitro's patched `opNumber` (`go-ethereum/core/vm/instructions.go`), which
 /// reads `ProcessingHook.L1BlockNumber` rather than `BlockContext.BlockNumber`. The
 /// value is carried block-scoped in [`ArbChainContext::l1_block_number`].
-fn arb_block_number<CTX>(ctx: InstructionContext<'_, CTX, EthInterpreter>)
+fn arb_block_number<CTX>(ctx: InstructionContext<'_, CTX, EthInterpreter>) -> InstructionExecResult
 where
     CTX: ContextTr<Chain = ArbChainContext> + Host,
 {
     let l1_block_number = ctx.host.chain().l1_block_number;
     if !ctx.interpreter.stack.push(U256::from(l1_block_number)) {
-        ctx.interpreter.halt_overflow();
+        return Err(revm::interpreter::InstructionResult::StackOverflow);
     }
+    Ok(())
 }
 
 /// Arbitrum EVM wrapper over revm's generic [`Evm`] type.
@@ -50,7 +52,7 @@ where
         let spec: ArbSpecId = ctx.cfg().spec().into();
         let mut instruction = EthInstructions::new_mainnet_with_spec(spec.into());
         // Arbitrum overrides only the NUMBER opcode to return the L1 block number.
-        instruction.insert_instruction(opcode::NUMBER, Instruction::new(arb_block_number::<CTX>, 2));
+        instruction.insert_instruction(opcode::NUMBER, Instruction::new(arb_block_number::<CTX>), 2);
         Self(Evm {
             ctx,
             inspector,

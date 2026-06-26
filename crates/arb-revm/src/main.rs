@@ -475,7 +475,7 @@ fn collect_state_diff(state: &EvmState) -> Vec<DumpAccountDiff> {
             .collect::<Vec<_>>();
         storage.sort_by(|a, b| a.slot.cmp(&b.slot));
 
-        let info_changed = account.info != *account.original_info;
+        let info_changed = account.info != account.original_info();
         if !info_changed
             && storage.is_empty()
             && !account.is_touched()
@@ -485,16 +485,17 @@ fn collect_state_diff(state: &EvmState) -> Vec<DumpAccountDiff> {
             continue;
         }
 
+        let original_info = account.original_info();
         accounts.push(DumpAccountDiff {
             address: format!("{address:#x}"),
             touched: account.is_touched(),
             created: account.is_created(),
             selfdestructed: account.is_selfdestructed(),
-            balance_pre: format!("{:#x}", account.original_info.balance),
+            balance_pre: format!("{:#x}", original_info.balance),
             balance_post: format!("{:#x}", account.info.balance),
-            nonce_pre: account.original_info.nonce,
+            nonce_pre: original_info.nonce,
             nonce_post: account.info.nonce,
-            code_hash_pre: format!("{:#x}", account.original_info.code_hash),
+            code_hash_pre: format!("{:#x}", original_info.code_hash),
             code_hash_post: format!("{:#x}", account.info.code_hash),
             storage,
         });

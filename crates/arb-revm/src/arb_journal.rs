@@ -119,7 +119,8 @@ where
     }
 
     fn debit_balance(&mut self, account: Address, amount: U256) -> Result<bool, Self::Error> {
-        let mut acct = self.load_account_mut_skip_cold_load(account, false)?;
+        let mut acct = self.load_account_mut_skip_cold_load(account, false)
+            .map_err(|e| e.unwrap_db_error())?;
         Ok(acct.data.decr_balance(amount))
     }
 
@@ -180,7 +181,8 @@ impl ArbJournal for ArbInternals<'_, '_> {
     }
 
     fn debit_balance(&mut self, account: Address, amount: U256) -> Result<bool, Self::Error> {
-        let mut acct = self.0.load_account_mut_skip_cold_load(account, false)?;
+        let mut acct = self.0.load_account_mut_skip_cold_load(account, false)
+            .map_err(|e| e.unwrap_db_error())?;
         Ok(acct.data.decr_balance(amount))
     }
 

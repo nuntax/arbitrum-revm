@@ -248,7 +248,7 @@ async fn fetch_trace_summary<P: Provider<Arbitrum>>(
 
 fn merge_state_writes(writes: &mut BTreeMap<Address, AccountWriteSet>, state: &EvmState) {
     for (address, account) in state {
-        let info_changed = account.info != *account.original_info
+        let info_changed = account.info != account.original_info()
             || account.is_created()
             || account.is_selfdestructed();
         let mut changed_slots = account.changed_storage_slots().peekable();
