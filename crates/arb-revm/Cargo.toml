@@ -24,14 +24,14 @@ tokio.workspace = true
 tracing.workspace = true
 alloy-rlp.workspace = true
 alloy-trie = "0.9.5"
-alloy-consensus = "1.4.3"
-alloy-eips = "1.8.3"
+alloy-consensus = "2.0"
+alloy-eips = "2.0"
 alloy-core = "1.4.3"
-alloy-rpc-client = "1.8.3"
-alloy-transport = "1.8.3"
-alloy-rpc-types-eth = "1.8.3"
-alloy-rpc-types-trace = "1.8.3"
-alloy-network-primitives = "1.8.3"
+alloy-rpc-client = "2.0"
+alloy-transport = "2.0"
+alloy-rpc-types-eth = "2.0"
+alloy-rpc-types-trace = "2.0"
+alloy-network-primitives = "2.0"
 url = "2.5"
 sequencer_client = { path = "../../../sequencer_client/crates/sequencer_client" }
 arb_alloy_consensus = { package = "arb-alloy-consensus", path = "../../../arb-alloy/crates/consensus", features = ["k256"] }
