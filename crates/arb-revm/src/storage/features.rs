@@ -1,7 +1,8 @@
 use eyre::Result;
-use revm::{context_interface::JournalTr, primitives::U256};
+use revm::primitives::U256;
 
 use super::{StorageBacked, StorageSpace};
+use crate::arb_journal::ArbJournal;
 
 /// Feature index in Nitro's `features` bitset.
 pub const FEATURE_INCREASED_CALLDATA_PRICE: usize = 0;
@@ -19,7 +20,7 @@ impl ArbFeatures {
         }
     }
 
-    pub fn set_feature<J: JournalTr>(
+    pub fn set_feature<J: ArbJournal>(
         &self,
         feature_index: usize,
         enabled: bool,
@@ -35,7 +36,7 @@ impl ArbFeatures {
         Ok(())
     }
 
-    pub fn is_feature_enabled<J: JournalTr>(
+    pub fn is_feature_enabled<J: ArbJournal>(
         &self,
         feature_index: usize,
         journal: &mut J,
@@ -44,7 +45,7 @@ impl ArbFeatures {
         Ok(bits.bit(feature_index))
     }
 
-    pub fn set_calldata_price_increase<J: JournalTr>(
+    pub fn set_calldata_price_increase<J: ArbJournal>(
         &self,
         enabled: bool,
         journal: &mut J,
@@ -52,7 +53,7 @@ impl ArbFeatures {
         self.set_feature(FEATURE_INCREASED_CALLDATA_PRICE, enabled, journal)
     }
 
-    pub fn is_calldata_price_increase_enabled<J: JournalTr>(
+    pub fn is_calldata_price_increase_enabled<J: ArbJournal>(
         &self,
         journal: &mut J,
     ) -> Result<bool> {

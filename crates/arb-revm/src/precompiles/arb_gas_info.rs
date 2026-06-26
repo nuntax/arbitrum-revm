@@ -1,5 +1,5 @@
 use super::*;
-use revm::context_interface::Block;
+use crate::arb_journal::ArbPrecompileCtx;
 
 const ASSUMED_SIMPLE_TX_SIZE: u64 = 140;
 const TX_DATA_NON_ZERO_GAS_EIP2028: u64 = 16;
@@ -11,7 +11,7 @@ pub(super) fn run_arb_gas_info<CTX>(
     gas_limit: u64,
 ) -> InterpreterResult
 where
-    CTX: ContextTr<Journal: JournalTr>,
+    CTX: ArbPrecompileCtx,
 {
     let call = match ArbGasInfo::ArbGasInfoCalls::abi_decode(input) {
         Ok(c) => c,
@@ -19,7 +19,7 @@ where
     };
 
     let state = ArbosState::open();
-    let l2_gas_price = U256::from(ctx.block().basefee());
+    let l2_gas_price = U256::from(ctx.block_basefee());
     let j = ctx.journal_mut();
 
     match call {

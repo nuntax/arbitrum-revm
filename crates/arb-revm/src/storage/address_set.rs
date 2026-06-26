@@ -1,9 +1,7 @@
 use eyre::Result;
-use revm::{
-    context_interface::JournalTr,
-    primitives::{Address, FixedBytes, U256},
-};
+use revm::primitives::{Address, FixedBytes, U256};
 
+use crate::arb_journal::ArbJournal;
 use crate::util::address_to_u256;
 
 use super::{StorageBacked, StorageSpace};
@@ -25,12 +23,12 @@ impl AddressSet {
         }
     }
 
-    pub fn is_member<J: JournalTr>(&self, address: Address, journal: &mut J) -> Result<bool> {
+    pub fn is_member<J: ArbJournal>(&self, address: Address, journal: &mut J) -> Result<bool> {
         let key = FixedBytes::from(address_to_u256(address).to_be_bytes());
         Ok(self.by_address.get(key, journal)?.data != U256::ZERO)
     }
 
-    pub fn add<J: JournalTr>(&self, address: Address, journal: &mut J) -> Result<()> {
+    pub fn add<J: ArbJournal>(&self, address: Address, journal: &mut J) -> Result<()> {
         if self.is_member(address, journal)? {
             return Ok(());
         }
@@ -55,7 +53,7 @@ impl AddressSet {
     }
 
     /// Returns all members of the set in storage order (1-indexed).
-    pub fn all_members<J: JournalTr>(&self, journal: &mut J) -> Result<Vec<Address>> {
+    pub fn all_members<J: ArbJournal>(&self, journal: &mut J) -> Result<Vec<Address>> {
         let size = self.size.get(journal)?;
         let mut members = Vec::with_capacity(size as usize);
         for i in 1..=size {
@@ -66,7 +64,7 @@ impl AddressSet {
         Ok(members)
     }
 
-    pub fn remove<J: JournalTr>(&self, address: Address, journal: &mut J) -> Result<()> {
+    pub fn remove<J: ArbJournal>(&self, address: Address, journal: &mut J) -> Result<()> {
         let address_value = address_to_u256(address);
         let position = self
             .by_address

@@ -1,10 +1,8 @@
 use eyre::Result;
-use revm::{
-    context_interface::JournalTr,
-    primitives::{Address, Bytes, U256},
-};
+use revm::primitives::{Address, Bytes, U256};
 
 use super::{AddressSet, StorageBacked, StorageSpace};
+use crate::arb_journal::ArbJournal;
 
 const POSTER_ADDR_SUBSPACE: u8 = 0;
 const POSTER_INFO_SUBSPACE: u8 = 1;
@@ -36,11 +34,11 @@ impl BatchPosterTable {
         }
     }
 
-    pub fn total_funds_due<J: JournalTr>(&self, journal: &mut J) -> Result<U256> {
+    pub fn total_funds_due<J: ArbJournal>(&self, journal: &mut J) -> Result<U256> {
         self.total_funds_due.get(journal)
     }
 
-    pub fn add_poster<'a, J: JournalTr>(
+    pub fn add_poster<'a, J: ArbJournal>(
         &'a self,
         poster: Address,
         pay_to: Address,
@@ -57,7 +55,7 @@ impl BatchPosterTable {
         Ok(state)
     }
 
-    pub fn open_poster_checked<'a, J: JournalTr>(
+    pub fn open_poster_checked<'a, J: ArbJournal>(
         &'a self,
         poster: Address,
         journal: &mut J,
@@ -85,20 +83,20 @@ impl BatchPosterTable {
 }
 
 impl BatchPosterState<'_> {
-    pub fn funds_due<J: JournalTr>(&self, journal: &mut J) -> Result<U256> {
+    pub fn funds_due<J: ArbJournal>(&self, journal: &mut J) -> Result<U256> {
         self.funds_due.get(journal)
     }
 
-    pub fn pay_to<J: JournalTr>(&self, journal: &mut J) -> Result<Address> {
+    pub fn pay_to<J: ArbJournal>(&self, journal: &mut J) -> Result<Address> {
         self.pay_to.get(journal)
     }
 
-    pub fn set_pay_to<J: JournalTr>(&self, pay_to: Address, journal: &mut J) -> Result<()> {
+    pub fn set_pay_to<J: ArbJournal>(&self, pay_to: Address, journal: &mut J) -> Result<()> {
         self.pay_to.set(pay_to, journal)?;
         Ok(())
     }
 
-    pub fn set_funds_due<J: JournalTr>(&self, funds_due: U256, journal: &mut J) -> Result<()> {
+    pub fn set_funds_due<J: ArbJournal>(&self, funds_due: U256, journal: &mut J) -> Result<()> {
         let prev_funds_due = self.funds_due.get(journal)?;
         let prev_total_funds_due = self.posters_table.total_funds_due.get(journal)?;
         let next_total_funds_due = prev_total_funds_due

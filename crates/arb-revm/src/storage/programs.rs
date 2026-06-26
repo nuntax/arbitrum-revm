@@ -1,10 +1,11 @@
 use eyre::Result;
 use revm::{
-    context_interface::{JournalTr, context::SStoreResult, journaled_state::StateLoad},
+    context_interface::{context::SStoreResult, journaled_state::StateLoad},
     primitives::{B256, U256},
 };
 
 use super::{AddressSet, StorageBacked, StorageSpace};
+use crate::arb_journal::ArbJournal;
 
 const PARAMS_KEY: u8 = 0;
 const PROGRAM_DATA_KEY: u8 = 1;
@@ -104,7 +105,7 @@ impl ArbosPrograms {
     /// 32-byte storage value at key-index 0 of the params subspace.  The
     /// returned array is laid out exactly as Nitro expects (big-endian bytes
     /// matching the `stylus_param_layout` constants).
-    pub fn read_params_word<J: JournalTr>(&self, journal: &mut J) -> Result<[u8; 32]> {
+    pub fn read_params_word<J: ArbJournal>(&self, journal: &mut J) -> Result<[u8; 32]> {
         let word = self
             .params
             .get_u256(U256::ZERO, journal)
@@ -116,7 +117,7 @@ impl ArbosPrograms {
     /// Reads the stored metadata for an activated Stylus program, keyed by `code_hash`
     /// (Nitro `getProgram`). The 32-byte word is laid out exactly as Nitro's `setProgram`
     /// packs it. `version == 0` means the program is not activated.
-    pub fn read_program<J: JournalTr>(
+    pub fn read_program<J: ArbJournal>(
         &self,
         code_hash: B256,
         journal: &mut J,
@@ -139,7 +140,7 @@ impl ArbosPrograms {
     }
 
     /// Writes a packed 32-byte Stylus params word back to storage index 0.
-    pub fn write_params_word<J: JournalTr>(
+    pub fn write_params_word<J: ArbJournal>(
         &self,
         word: [u8; 32],
         journal: &mut J,

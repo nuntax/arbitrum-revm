@@ -1,10 +1,8 @@
 use eyre::Result;
-use revm::{
-    context_interface::JournalTr,
-    primitives::{Bytes, U256},
-};
+use revm::primitives::{Bytes, U256};
 
 use super::{L2PricingOffset, StorageBacked, StorageSpace};
+use crate::arb_journal::ArbJournal;
 
 const ONE_IN_BIPS: i64 = 10_000;
 const GAS_CONSTRAINTS_KEY: u8 = 0;
@@ -72,7 +70,7 @@ impl L2Pricing {
         }
     }
 
-    pub fn update_pricing_model<J: JournalTr>(
+    pub fn update_pricing_model<J: ArbJournal>(
         &self,
         time_passed: u64,
         arbos_version: u64,
@@ -91,7 +89,7 @@ impl L2Pricing {
         }
     }
 
-    fn update_pricing_model_legacy<J: JournalTr>(&self, time_passed: u64, journal: &mut J) -> Result<()> {
+    fn update_pricing_model_legacy<J: ArbJournal>(&self, time_passed: u64, journal: &mut J) -> Result<()> {
         let speed_limit = self.speed_limit_per_second.get(journal)?;
         let gas_to_shrink = time_passed.saturating_mul(speed_limit);
         let current_backlog = self.gas_backlog.get(journal)?;
@@ -123,7 +121,7 @@ impl L2Pricing {
         Ok(())
     }
 
-    fn update_pricing_model_single_constraints<J: JournalTr>(
+    fn update_pricing_model_single_constraints<J: ArbJournal>(
         &self,
         time_passed: u64,
         journal: &mut J,
@@ -162,7 +160,7 @@ impl L2Pricing {
         Ok(())
     }
 
-    pub fn grow_backlog<J: JournalTr>(
+    pub fn grow_backlog<J: ArbJournal>(
         &self,
         used_gas: u64,
         arbos_version: u64,
@@ -194,13 +192,13 @@ impl L2Pricing {
         }
     }
 
-    pub fn shrink_backlog<J: JournalTr>(&self, gas: u64, journal: &mut J) -> Result<()> {
+    pub fn shrink_backlog<J: ArbJournal>(&self, gas: u64, journal: &mut J) -> Result<()> {
         let current = self.gas_backlog.get(journal)?;
         self.gas_backlog.set(current.saturating_sub(gas), journal)?;
         Ok(())
     }
 
-    fn gas_model<J: JournalTr>(&self, arbos_version: u64, journal: &mut J) -> Result<GasModel> {
+    fn gas_model<J: ArbJournal>(&self, arbos_version: u64, journal: &mut J) -> Result<GasModel> {
         if arbos_version >= ARBOS_MULTI_GAS_CONSTRAINTS_VERSION
             && self.multi_gas_constraints_len(journal)? > 0
         {
@@ -214,13 +212,13 @@ impl L2Pricing {
         Ok(GasModel::Legacy)
     }
 
-    fn gas_constraints_len<J: JournalTr>(&self, journal: &mut J) -> Result<u64> {
+    fn gas_constraints_len<J: ArbJournal>(&self, journal: &mut J) -> Result<u64> {
         self.gas_constraints
             .storage_backed::<u64>(SUB_STORAGE_VECTOR_LENGTH_OFFSET)
             .get(journal)
     }
 
-    fn multi_gas_constraints_len<J: JournalTr>(&self, journal: &mut J) -> Result<u64> {
+    fn multi_gas_constraints_len<J: ArbJournal>(&self, journal: &mut J) -> Result<u64> {
         self.multi_gas_constraints
             .storage_backed::<u64>(SUB_STORAGE_VECTOR_LENGTH_OFFSET)
             .get(journal)

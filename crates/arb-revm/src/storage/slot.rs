@@ -2,10 +2,11 @@ use core::marker::PhantomData;
 
 use eyre::{Result, WrapErr};
 use revm::{
-    context_interface::{JournalTr, context::SStoreResult, journaled_state::StateLoad},
+    context_interface::{context::SStoreResult, journaled_state::StateLoad},
     primitives::{Address, FixedBytes, I256, StorageValue, U256},
 };
 
+use crate::arb_journal::ArbJournal;
 use crate::util::{i256_to_u256_twos_complement, u256_twos_complement_to_i256};
 
 /// Concrete `(account, slot)` pointer into state.
@@ -28,32 +29,22 @@ impl StorageSlot {
         self.slot
     }
 
-    pub fn get_inner<J: JournalTr>(&self, journal: &mut J) -> Result<StateLoad<StorageValue>> {
+    pub fn get_inner<J: ArbJournal>(&self, journal: &mut J) -> Result<StateLoad<StorageValue>> {
         journal
-            .load_account(self.account)
-            .wrap_err("failed to warm ArbOS storage account")?;
-        journal
-            .sload(self.account, self.slot.into())
+            .read_slot(self.account, self.slot.into())
             .wrap_err("failed to read ArbOS storage slot")
     }
 
-    pub fn set_inner<J: JournalTr>(
+    pub fn set_inner<J: ArbJournal>(
         &self,
         value: U256,
         journal: &mut J,
     ) -> Result<StateLoad<SStoreResult>> {
+        // `write_slot` warms the account, stores the slot, and touches the account so the
+        // storage-only change survives commit (revm's `DatabaseCommit` skips untouched accounts).
         journal
-            .load_account(self.account)
-            .wrap_err("failed to warm ArbOS storage account")?;
-        let result = journal
-            .sstore(self.account, self.slot.into(), value)
-            .wrap_err("failed to write ArbOS storage slot")?;
-        // Mark the account as touched so the storage write survives commit.
-        // `sstore` records the slot change in the journal but does not touch the
-        // account; revm's `DatabaseCommit` (CacheDB/InMemoryDB) skips untouched
-        // accounts, which would silently discard every ArbOS storage write.
-        journal.touch_account(self.account);
-        Ok(result)
+            .write_slot(self.account, self.slot.into(), value)
+            .wrap_err("failed to write ArbOS storage slot")
     }
 }
 
@@ -82,11 +73,11 @@ impl<T> StorageBacked<T> {
 }
 
 impl StorageBacked<U256> {
-    pub fn get<J: JournalTr>(&self, journal: &mut J) -> Result<U256> {
+    pub fn get<J: ArbJournal>(&self, journal: &mut J) -> Result<U256> {
         Ok(*self.slot.get_inner(journal)?)
     }
 
-    pub fn set<J: JournalTr>(
+    pub fn set<J: ArbJournal>(
         &self,
         value: U256,
         journal: &mut J,
@@ -96,12 +87,12 @@ impl StorageBacked<U256> {
 }
 
 impl StorageBacked<Address> {
-    pub fn get<J: JournalTr>(&self, journal: &mut J) -> Result<Address> {
+    pub fn get<J: ArbJournal>(&self, journal: &mut J) -> Result<Address> {
         let bytes = self.slot.get_inner(journal)?.to_be_bytes::<32>();
         Ok(Address::from_slice(&bytes[12..]))
     }
 
-    pub fn set<J: JournalTr>(
+    pub fn set<J: ArbJournal>(
         &self,
         address: Address,
         journal: &mut J,
@@ -113,11 +104,11 @@ impl StorageBacked<Address> {
 }
 
 impl StorageBacked<u64> {
-    pub fn get<J: JournalTr>(&self, journal: &mut J) -> Result<u64> {
+    pub fn get<J: ArbJournal>(&self, journal: &mut J) -> Result<u64> {
         Ok((*self.slot.get_inner(journal)?).try_into()?)
     }
 
-    pub fn set<J: JournalTr>(
+    pub fn set<J: ArbJournal>(
         &self,
         value: u64,
         journal: &mut J,
@@ -127,11 +118,11 @@ impl StorageBacked<u64> {
 }
 
 impl StorageBacked<u32> {
-    pub fn get<J: JournalTr>(&self, journal: &mut J) -> Result<u32> {
+    pub fn get<J: ArbJournal>(&self, journal: &mut J) -> Result<u32> {
         Ok((*self.slot.get_inner(journal)?).try_into()?)
     }
 
-    pub fn set<J: JournalTr>(
+    pub fn set<J: ArbJournal>(
         &self,
         value: u32,
         journal: &mut J,
@@ -141,13 +132,13 @@ impl StorageBacked<u32> {
 }
 
 impl StorageBacked<i64> {
-    pub fn get<J: JournalTr>(&self, journal: &mut J) -> Result<i64> {
+    pub fn get<J: ArbJournal>(&self, journal: &mut J) -> Result<i64> {
         let signed = u256_twos_complement_to_i256(*self.slot.get_inner(journal)?);
         i64::try_from(signed)
             .map_err(|_| eyre::eyre!("signed i64 ArbOS slot value out of range: {signed}"))
     }
 
-    pub fn set<J: JournalTr>(
+    pub fn set<J: ArbJournal>(
         &self,
         value: i64,
         journal: &mut J,
@@ -163,11 +154,11 @@ impl StorageBacked<i64> {
 }
 
 impl StorageBacked<I256> {
-    pub fn get<J: JournalTr>(&self, journal: &mut J) -> Result<I256> {
+    pub fn get<J: ArbJournal>(&self, journal: &mut J) -> Result<I256> {
         Ok(u256_twos_complement_to_i256(*self.slot.get_inner(journal)?))
     }
 
-    pub fn set_checked<J: JournalTr>(
+    pub fn set_checked<J: ArbJournal>(
         &self,
         value: I256,
         journal: &mut J,
@@ -187,7 +178,7 @@ impl StorageBacked<I256> {
         }
     }
 
-    pub fn set_saturating_with_warning<J: JournalTr>(
+    pub fn set_saturating_with_warning<J: ArbJournal>(
         &self,
         value: I256,
         name: &'static str,
@@ -215,7 +206,7 @@ impl StorageBacked<I256> {
         }
     }
 
-    pub fn set_pre_version7<J: JournalTr>(
+    pub fn set_pre_version7<J: ArbJournal>(
         &self,
         value: I256,
         journal: &mut J,
@@ -228,7 +219,7 @@ impl StorageBacked<I256> {
         self.slot.set_inner(magnitude, journal)
     }
 
-    pub fn set_by_uint<J: JournalTr>(
+    pub fn set_by_uint<J: ArbJournal>(
         &self,
         value: u64,
         journal: &mut J,

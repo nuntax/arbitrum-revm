@@ -16,11 +16,11 @@ mod send_merkle;
 mod slot;
 
 use revm::{
-    context_interface::{JournalTr, context::SStoreResult, journaled_state::StateLoad},
-    database_interface::Database,
+    context_interface::{context::SStoreResult, journaled_state::StateLoad},
     primitives::{Address, Bytes, FixedBytes, StorageValue, U256, keccak256},
 };
 
+use crate::arb_journal::ArbJournal;
 use crate::constants::ARBOS_STATE_ADDRESS;
 
 pub use address_set::AddressSet;
@@ -111,37 +111,33 @@ impl StorageSpace {
     }
 
     /// Loads a storage value through a journal.
-    pub fn get<J: JournalTr>(
+    pub fn get<J: ArbJournal>(
         &self,
         hash: FixedBytes<32>,
         journal: &mut J,
-    ) -> Result<StateLoad<StorageValue>, <J::Database as Database>::Error> {
-        journal.load_account(self.account)?;
-        journal.sload(self.account, self.slot_for_hash(hash).into())
+    ) -> Result<StateLoad<StorageValue>, J::Error> {
+        journal.read_slot(self.account, self.slot_for_hash(hash).into())
     }
 
     /// Loads a storage value by integer key.
-    pub fn get_u256<J: JournalTr>(
+    pub fn get_u256<J: ArbJournal>(
         &self,
         key: U256,
         journal: &mut J,
-    ) -> Result<StateLoad<StorageValue>, <J::Database as Database>::Error> {
+    ) -> Result<StateLoad<StorageValue>, J::Error> {
         self.get(FixedBytes::from(key.to_be_bytes()), journal)
     }
 
     /// Stores a storage value through a journal.
-    pub fn set<J: JournalTr>(
+    pub fn set<J: ArbJournal>(
         &self,
         hash: FixedBytes<32>,
         value: StorageValue,
         journal: &mut J,
-    ) -> Result<StateLoad<SStoreResult>, <J::Database as Database>::Error> {
-        journal.load_account(self.account)?;
-        let result = journal.sstore(self.account, self.slot_for_hash(hash).into(), value)?;
-        // Touch the account so the write survives commit; revm's DatabaseCommit
-        // skips untouched accounts, which would discard storage-only changes.
-        journal.touch_account(self.account);
-        Ok(result)
+    ) -> Result<StateLoad<SStoreResult>, J::Error> {
+        // `write_slot` warms the account, stores the slot, and touches the account so the write
+        // survives commit (revm's `DatabaseCommit` skips untouched accounts).
+        journal.write_slot(self.account, self.slot_for_hash(hash).into(), value)
     }
 
     /// Creates an untyped storage slot accessor.

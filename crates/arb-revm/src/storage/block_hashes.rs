@@ -1,10 +1,8 @@
 use eyre::Result;
-use revm::{
-    context_interface::JournalTr,
-    primitives::{B256, FixedBytes, U256, keccak256},
-};
+use revm::primitives::{B256, FixedBytes, U256, keccak256};
 
 use super::{StorageBacked, StorageSpace};
+use crate::arb_journal::ArbJournal;
 
 /// ArbOS block-hash ring buffer view.
 pub struct BlockHashes {
@@ -20,11 +18,11 @@ impl BlockHashes {
         }
     }
 
-    pub fn l1_block_number<J: JournalTr>(&self, journal: &mut J) -> Result<u64> {
+    pub fn l1_block_number<J: ArbJournal>(&self, journal: &mut J) -> Result<u64> {
         self.l1_block_number.get(journal)
     }
 
-    pub fn block_hash<J: JournalTr>(&self, block_number: u64, journal: &mut J) -> Result<B256> {
+    pub fn block_hash<J: ArbJournal>(&self, block_number: u64, journal: &mut J) -> Result<B256> {
         let current = self.l1_block_number(journal)?;
         if block_number >= current || block_number + 256 < current {
             return Ok(B256::ZERO);
@@ -39,7 +37,7 @@ impl BlockHashes {
             .into())
     }
 
-    pub fn set_l1_block_number<J: JournalTr>(
+    pub fn set_l1_block_number<J: ArbJournal>(
         &self,
         block_number: u64,
         journal: &mut J,
@@ -48,7 +46,7 @@ impl BlockHashes {
         Ok(())
     }
 
-    pub fn set_block_hash<J: JournalTr>(
+    pub fn set_block_hash<J: ArbJournal>(
         &self,
         block_number: u64,
         block_hash: B256,
@@ -67,7 +65,7 @@ impl BlockHashes {
     ///
     /// `number` is the L1 block number whose hash is provided, and the
     /// `l1_block_number` cursor is advanced to `number + 1`.
-    pub fn record_new_l1_block<J: JournalTr>(
+    pub fn record_new_l1_block<J: ArbJournal>(
         &self,
         number: u64,
         block_hash: B256,

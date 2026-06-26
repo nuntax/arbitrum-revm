@@ -1,10 +1,8 @@
 use eyre::Result;
-use revm::{
-    context_interface::JournalTr,
-    primitives::{Address, Bytes, FixedBytes, U256},
-};
+use revm::primitives::{Address, Bytes, FixedBytes, U256};
 
 use super::{StorageBacked, StorageSpace};
+use crate::arb_journal::ArbJournal;
 
 /// ArbOS address table wrapper.
 #[derive(Debug)]
@@ -23,7 +21,7 @@ impl AddressTable {
         }
     }
 
-    pub fn register<J: JournalTr>(&self, address: Address, journal: &mut J) -> Result<u64> {
+    pub fn register<J: ArbJournal>(&self, address: Address, journal: &mut J) -> Result<u64> {
         let mut bytes = [0_u8; 32];
         bytes[12..].copy_from_slice(address.as_slice());
         let key = FixedBytes::<32>::from(bytes);
@@ -47,7 +45,7 @@ impl AddressTable {
         Ok(new_len - 1)
     }
 
-    pub fn lookup<J: JournalTr>(&self, address: Address, journal: &mut J) -> Result<Option<u64>> {
+    pub fn lookup<J: ArbJournal>(&self, address: Address, journal: &mut J) -> Result<Option<u64>> {
         let mut bytes = [0_u8; 32];
         bytes[12..].copy_from_slice(address.as_slice());
         let key = FixedBytes::<32>::from(bytes);
@@ -59,11 +57,11 @@ impl AddressTable {
         }
     }
 
-    pub fn len<J: JournalTr>(&self, journal: &mut J) -> Result<u64> {
+    pub fn len<J: ArbJournal>(&self, journal: &mut J) -> Result<u64> {
         self.num_items.get(journal)
     }
 
-    pub fn lookup_index<J: JournalTr>(
+    pub fn lookup_index<J: ArbJournal>(
         &self,
         index: u64,
         journal: &mut J,

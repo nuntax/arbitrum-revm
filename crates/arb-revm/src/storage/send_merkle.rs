@@ -1,10 +1,8 @@
 use eyre::Result;
-use revm::{
-    context_interface::JournalTr,
-    primitives::{B256, FixedBytes, U256, keccak256},
-};
+use revm::primitives::{B256, FixedBytes, U256, keccak256};
 
 use super::{StorageBacked, StorageSpace};
+use crate::arb_journal::ArbJournal;
 
 const SIZE_OFFSET: u8 = 0;
 const PARTIALS_BASE_OFFSET: u64 = 2;
@@ -31,16 +29,16 @@ impl SendMerkle {
         }
     }
 
-    pub fn size<J: JournalTr>(&self, journal: &mut J) -> Result<u64> {
+    pub fn size<J: ArbJournal>(&self, journal: &mut J) -> Result<u64> {
         self.size.get(journal)
     }
 
-    pub fn set_size<J: JournalTr>(&self, size: u64, journal: &mut J) -> Result<()> {
+    pub fn set_size<J: ArbJournal>(&self, size: u64, journal: &mut J) -> Result<()> {
         self.size.set(size, journal)?;
         Ok(())
     }
 
-    pub fn partial<J: JournalTr>(&self, level: u64, journal: &mut J) -> Result<B256> {
+    pub fn partial<J: ArbJournal>(&self, level: u64, journal: &mut J) -> Result<B256> {
         let word = self
             .storage
             .get_u256(
@@ -51,7 +49,7 @@ impl SendMerkle {
         Ok(B256::from(word.to_be_bytes::<32>()))
     }
 
-    pub fn set_partial<J: JournalTr>(
+    pub fn set_partial<J: ArbJournal>(
         &self,
         level: u64,
         value: B256,
@@ -74,7 +72,7 @@ impl SendMerkle {
     }
 
     /// Appends one send leaf hash to the Nitro-compatible accumulator.
-    pub fn append<J: JournalTr>(
+    pub fn append<J: ArbJournal>(
         &self,
         item_hash: B256,
         journal: &mut J,
@@ -114,7 +112,7 @@ impl SendMerkle {
     }
 
     /// Computes Nitro-compatible send accumulator root from stored partials.
-    pub fn root<J: JournalTr>(&self, journal: &mut J) -> Result<B256> {
+    pub fn root<J: ArbJournal>(&self, journal: &mut J) -> Result<B256> {
         let size = self.size(journal)?;
         if size == 0 {
             return Ok(B256::ZERO);
@@ -148,7 +146,7 @@ impl SendMerkle {
         Ok(hash_so_far.unwrap_or(B256::ZERO))
     }
 
-    pub fn state_for_export<J: JournalTr>(
+    pub fn state_for_export<J: ArbJournal>(
         &self,
         journal: &mut J,
     ) -> Result<(u64, B256, Vec<B256>)> {

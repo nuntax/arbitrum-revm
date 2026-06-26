@@ -11,6 +11,10 @@ eyre.workspace = true
 hex.workspace = true
 revm.workspace = true
 revm-database.workspace = true
+# reth node seam: `EvmInternals` (the state handle DynPrecompiles receive). 0.30 pins the exact
+# same revm 36 as the workspace, so this adds no new revm to the graph. Hosts the orphan-rule
+# `impl ArbJournal for EvmInternals` that lets ArbOS precompiles run on the node path.
+alloy-evm = { version = "0.30", default-features = false }
 alloy-provider = { workspace = true, features = ["reqwest", "debug-api"] }
 serde_json.workspace = true
 serde = { version = "1.0.228", features = ["derive"] }

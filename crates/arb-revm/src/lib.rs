@@ -6,6 +6,7 @@
 //! on global node state and runtime data that do not belong in a portable storage crate.
 
 pub mod api;
+pub mod arb_journal;
 pub mod chain;
 pub mod constants;
 mod deposit_tx;
