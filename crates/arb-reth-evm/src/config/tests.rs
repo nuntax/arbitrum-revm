@@ -181,6 +181,85 @@ fn executor_through_config_reads_l1_block_number_for_number_opcode() {
     assert_ne!(returned, U256::ZERO, "must not be the defaulted 0");
 }
 
+/// Stage D validation: a whole block executes through reth's GENERIC high-level executor
+/// (`ConfigureEvm::executor(db).execute(&RecoveredBlock)`), proving our `impl ConfigureEvm` plugs
+/// into reth's block-execution machinery end-to-end — pre-execution changes (StartBlock InternalTx
+/// + EIP-2935) → per-tx execution → `finish` → `BlockExecutionOutput` — driven entirely from the
+/// header (spec + L1 block number decoded via `ArbHeaderInfo`), not the manual per-tx
+/// `execute_transaction` surface that Stage C's `block/tests.rs` covers.
+#[test]
+fn block_executes_through_reth_generic_executor() {
+    use alloy_consensus::{BlockBody, TxReceipt};
+    use arb_alloy_consensus::reth::ArbBlock;
+    use reth_evm::execute::Executor;
+    use reth_evm::ConfigureEvm;
+    use reth_primitives_traits::RecoveredBlock;
+
+    const ALICE: Address = Address::with_last_byte(0x11);
+    const BOB: Address = Address::with_last_byte(0x22);
+    const CAROL: Address = Address::with_last_byte(0x33);
+    const FUND: u128 = 100_000_000_000_000_000_000;
+    const XFER0: u128 = 1_000_000;
+    const XFER1: u128 = 500_000;
+
+    let config = ArbEvmConfig::arbitrum_one();
+    let header = arb_header(); // ArbOS v51 + embedded L1 block number
+
+    // Fund ALICE + BOB.
+    let mut db = CacheDB::new(EmptyDB::default());
+    for a in [ALICE, BOB] {
+        db.insert_account_info(
+            a,
+            AccountInfo { balance: U256::from(FUND), nonce: 0, ..AccountInfo::default() },
+        );
+    }
+
+    // Two free (gas_fee_cap 0, basefee 0) value transfers: ALICE->BOB, BOB->CAROL.
+    let mk = |from, nonce, to, value: u128| {
+        ArbTxEnvelope::from(TxUnsigned {
+            chain_id: U256::from(CHAIN_ID),
+            from,
+            nonce,
+            gas_fee_cap: U256::ZERO,
+            gas_limit: 200_000,
+            to: TxKind::Call(to),
+            value: U256::from(value),
+            input: Bytes::new(),
+        })
+    };
+    let block = ArbBlock::new(
+        header,
+        BlockBody {
+            transactions: vec![mk(ALICE, 0, BOB, XFER0), mk(BOB, 0, CAROL, XFER1)],
+            ommers: vec![],
+            withdrawals: None,
+        },
+    );
+    let recovered = RecoveredBlock::new_unhashed(block, vec![ALICE, BOB]);
+
+    let output = config
+        .executor(db)
+        .execute(&recovered)
+        .expect("block executes through reth's generic Executor");
+
+    // One receipt per user tx (the StartBlock InternalTx is a pre-execution change, not a tx).
+    assert_eq!(output.result.receipts.len(), 2, "one receipt per user tx");
+    assert!(output.result.receipts.iter().all(TxReceipt::status), "both txs must succeed");
+    assert!(output.result.gas_used > 0, "block must consume gas");
+
+    // Value actually moved through the full high-level path: CAROL (fresh) is credited XFER1, and
+    // BOB nets +XFER0-XFER1 (transfers are free at basefee 0 / gas_fee_cap 0).
+    let balance_of = |addr: &Address| {
+        output.state.account(addr).and_then(|a| a.info.as_ref()).map(|i| i.balance).unwrap_or_default()
+    };
+    assert_eq!(balance_of(&CAROL), U256::from(XFER1), "CAROL must receive XFER1");
+    assert_eq!(
+        balance_of(&BOB),
+        U256::from(FUND + XFER0 - XFER1),
+        "BOB net credited XFER0-XFER1 (no fees)"
+    );
+}
+
 /// `next_evm_env` derives spec from the next-block attributes' ArbOS version, and `context_for_next_block`
 /// carries the attributes' L1 block number.
 #[test]
