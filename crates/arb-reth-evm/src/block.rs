@@ -417,13 +417,19 @@ where
 
     fn create_executor<'a, DB, I>(
         &'a self,
-        evm: ArbEvm<DB, I>,
+        mut evm: ArbEvm<DB, I>,
         ctx: Self::ExecutionCtx<'a>,
     ) -> impl BlockExecutorFor<'a, Self, DB, I>
     where
         DB: StateDB + 'a,
         I: Inspector<ArbContext<DB>> + 'a,
     {
+        // Thread the block's L1 block number into the Arbitrum chain context, so the `NUMBER`
+        // opcode (which `arb_revm` overrides to read `chain().l1_block_number`) returns the L1
+        // block number, not 0. This is the Stage B/C deferral (`ArbEvmFactory::build_ctx` defaults
+        // it) now resolved at the executor seam: `ConfigureEvm::context_for_block` populates
+        // `ArbBlockExecutionCtx::l1_block_number` from `ArbHeaderInfo`, and it flows through here.
+        evm.ctx_mut().chain.l1_block_number = ctx.l1_block_number;
         ArbBlockExecutor::new(evm, ctx, self.hooks.clone(), self.chain_id)
     }
 }

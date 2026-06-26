@@ -8,14 +8,16 @@
 
 use alloy_consensus::transaction::Transaction as AlloyTransaction;
 use alloy_eips::eip2718::{Encodable2718, Typed2718};
-use alloy_evm::{FromRecoveredTx, FromTxWithEncoded, IntoTxEnv};
-use alloy_primitives::{Address, Bytes};
+use alloy_evm::{FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, TransactionEnvMut};
+use alloy_primitives::{Address, Bytes, B256, U256};
 use arb_alloy_consensus::transactions::ArbTxEnvelope;
 use arb_revm::ArbTransaction;
 use arb_revm::transaction::RetryTxMeta;
 use core::ops::{Deref, DerefMut};
 use revm::context::TxEnv;
+use revm::context::transaction::Transaction as RevmTransaction;
 use revm::context_interface::{either::Either, transaction::AccessList};
+use revm::primitives::TxKind;
 
 /// Newtype wrapper around [`ArbTransaction<TxEnv>`] that allows implementing the foreign
 /// alloy-evm transaction traits. This is the `Tx` type carried by [`crate::ArbEvm`] /
@@ -52,6 +54,81 @@ impl DerefMut for ArbTx {
 impl IntoTxEnv<Self> for ArbTx {
     fn into_tx_env(self) -> Self {
         self
+    }
+}
+
+// `revm::context::Transaction` for the newtype: delegate to the inner `ArbTransaction<TxEnv>`, which
+// already implements it (arb_revm `transaction.rs`). Required because `TransactionEnvMut` has
+// `Transaction` as a supertrait, and reth's `ConfigureEvm` bounds the `EvmFactory::Tx` with
+// `TransactionEnvMut`. (Deref does not carry trait impls, so this must be spelled out.)
+impl RevmTransaction for ArbTx {
+    type AccessListItem<'a> = <ArbTransaction<TxEnv> as RevmTransaction>::AccessListItem<'a>;
+    type Authorization<'a> = <ArbTransaction<TxEnv> as RevmTransaction>::Authorization<'a>;
+
+    fn tx_type(&self) -> u8 {
+        self.0.tx_type()
+    }
+    fn caller(&self) -> Address {
+        self.0.caller()
+    }
+    fn gas_limit(&self) -> u64 {
+        self.0.gas_limit()
+    }
+    fn value(&self) -> U256 {
+        self.0.value()
+    }
+    fn input(&self) -> &Bytes {
+        self.0.input()
+    }
+    fn nonce(&self) -> u64 {
+        self.0.nonce()
+    }
+    fn kind(&self) -> TxKind {
+        self.0.kind()
+    }
+    fn chain_id(&self) -> Option<u64> {
+        self.0.chain_id()
+    }
+    fn access_list(&self) -> Option<impl Iterator<Item = Self::AccessListItem<'_>>> {
+        self.0.access_list()
+    }
+    fn max_priority_fee_per_gas(&self) -> Option<u128> {
+        self.0.max_priority_fee_per_gas()
+    }
+    fn max_fee_per_gas(&self) -> u128 {
+        self.0.max_fee_per_gas()
+    }
+    fn gas_price(&self) -> u128 {
+        self.0.gas_price()
+    }
+    fn blob_versioned_hashes(&self) -> &[B256] {
+        self.0.blob_versioned_hashes()
+    }
+    fn max_fee_per_blob_gas(&self) -> u128 {
+        self.0.max_fee_per_blob_gas()
+    }
+    fn effective_gas_price(&self, base_fee: u128) -> u128 {
+        self.0.effective_gas_price(base_fee)
+    }
+    fn authorization_list_len(&self) -> usize {
+        self.0.authorization_list_len()
+    }
+    fn authorization_list(&self) -> impl Iterator<Item = Self::Authorization<'_>> {
+        self.0.authorization_list()
+    }
+}
+
+// `TransactionEnvMut` mutators delegate to the inner revm `TxEnv` (`self.0.base`). This satisfies the
+// `ConfigureEvm::BlockExecutorFactory::EvmFactory::Tx: TransactionEnvMut` bound for `ArbTx`.
+impl TransactionEnvMut for ArbTx {
+    fn set_gas_limit(&mut self, gas_limit: u64) {
+        self.0.base.set_gas_limit(gas_limit);
+    }
+    fn set_nonce(&mut self, nonce: u64) {
+        self.0.base.set_nonce(nonce);
+    }
+    fn set_access_list(&mut self, access_list: AccessList) {
+        self.0.base.set_access_list(access_list);
     }
 }
 

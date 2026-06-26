@@ -29,6 +29,11 @@ pub use block::{
     ArbTxResult,
 };
 
+pub mod config;
+pub use config::{
+    ARB_ONE_CHAIN_ID, ArbEvmConfig, ArbEvmConfigError, ArbNextBlockEnvAttributes,
+};
+
 use alloy_evm::{Database, Evm, EvmEnv, EvmFactory, IntoTxEnv};
 use alloy_primitives::{Address, Bytes};
 use arb_revm::api::default_ctx::ArbContext;
