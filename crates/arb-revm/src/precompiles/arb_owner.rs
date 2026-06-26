@@ -1,7 +1,6 @@
 use super::*;
-use crate::arb_journal::ArbPrecompileCtx;
+use crate::arb_journal::{ArbCall, ArbPrecompileCtx};
 use crate::storage::{pack_uint, stylus_param_layout as layout};
-use revm::interpreter::CallInputs;
 
 const FEATURE_ENABLE_DELAY_SECONDS: u64 = 7 * 24 * 60 * 60;
 const ARBOS_VERSION_PER_TX_GAS_LIMIT: u64 = 50;
@@ -14,7 +13,7 @@ pub(super) fn run_arb_owner<CTX>(
     ctx: &mut CTX,
     input: &[u8],
     gas_limit: u64,
-    call_inputs: &CallInputs,
+    call_inputs: &ArbCall,
 ) -> InterpreterResult
 where
     CTX: ArbPrecompileCtx,

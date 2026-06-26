@@ -1,6 +1,5 @@
 use super::*;
-use crate::arb_journal::{ArbJournal, ArbPrecompileCtx};
-use revm::interpreter::CallInputs;
+use crate::arb_journal::{ArbCall, ArbJournal, ArbPrecompileCtx};
 use revm::primitives::{Address, B256, Bytes, Log, keccak256};
 
 const ARBOS_VERSION_WITH_NATIVE_TOKEN_OWNERS_SEND_RESTRICTION: u64 = 41;
@@ -14,7 +13,7 @@ pub(super) fn run_arb_sys<CTX>(
     ctx: &mut CTX,
     input: &[u8],
     gas_limit: u64,
-    call_inputs: &CallInputs,
+    call_inputs: &ArbCall,
 ) -> InterpreterResult
 where
     CTX: ArbPrecompileCtx,
@@ -133,7 +132,7 @@ where
             gas_limit,
             call_inputs.bytecode_address,
             call_inputs.caller,
-            call_inputs.call_value(),
+            call_inputs.value,
             call.destination,
             call.data.as_ref(),
         ),
@@ -142,7 +141,7 @@ where
             gas_limit,
             call_inputs.bytecode_address,
             call_inputs.caller,
-            call_inputs.call_value(),
+            call_inputs.value,
             call.destination,
             &[],
         ),

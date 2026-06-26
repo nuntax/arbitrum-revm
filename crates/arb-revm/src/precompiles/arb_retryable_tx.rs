@@ -1,8 +1,8 @@
 use super::*;
-use crate::arb_journal::{ArbJournal, ArbPrecompileCtx};
+use crate::arb_journal::{ArbCall, ArbJournal, ArbPrecompileCtx};
 use arb_alloy_consensus::transactions::TxRetry;
 use revm::{
-    interpreter::{CallInputs, Gas, InstructionResult, InterpreterResult},
+    interpreter::{Gas, InstructionResult, InterpreterResult},
     primitives::{Address, B256, Bytes, Log, TxKind, keccak256},
 };
 
@@ -34,7 +34,7 @@ pub(super) fn run_arb_retryable_tx<CTX>(
     ctx: &mut CTX,
     input: &[u8],
     gas_limit: u64,
-    call_inputs: &CallInputs,
+    call_inputs: &ArbCall,
 ) -> InterpreterResult
 where
     CTX: ArbPrecompileCtx,

@@ -1,6 +1,5 @@
 use super::*;
-use crate::arb_journal::ArbPrecompileCtx;
-use revm::interpreter::CallInputs;
+use crate::arb_journal::{ArbCall, ArbPrecompileCtx};
 
 const ARBOS_VERSION_STYLUS: u64 = 30;
 const ARBOS_VERSION_STYLUS_FIXES: u64 = 31;
@@ -9,7 +8,7 @@ pub(super) fn run_arb_wasm_cache<CTX>(
     ctx: &mut CTX,
     input: &[u8],
     gas_limit: u64,
-    call_inputs: &CallInputs,
+    call_inputs: &ArbCall,
 ) -> InterpreterResult
 where
     CTX: ArbPrecompileCtx,
