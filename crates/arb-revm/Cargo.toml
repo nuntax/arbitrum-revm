@@ -33,7 +33,6 @@ alloy-rpc-types-eth = "2.0"
 alloy-rpc-types-trace = "2.0"
 alloy-network-primitives = "2.0"
 url = "2.5"
-sequencer_client = { path = "../../../sequencer_client/crates/sequencer_client" }
 arb_alloy_consensus = { package = "arb-alloy-consensus", path = "../../../arb-alloy/crates/consensus", features = ["k256"] }
 arb_sequencer_network = { package = "arb-sequencer-network", path = "../../../arb-alloy/crates/sequencer-network" }
 arb_alloy_precompiles = { package = "arb-alloy-precompiles", path = "../../../arb-alloy/crates/precompiles" }
