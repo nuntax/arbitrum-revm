@@ -127,6 +127,96 @@ fn arb_evm_factory_transact_matches_arb_revm() {
     assert_eq!(evm.chain_id(), CHAIN_ID);
 }
 
+/// End-to-end proof of the node-path precompile bridge (#36): a tx that CALLs an ArbOS precompile
+/// (`ArbSys.arbOSVersion()`, which reads `arbos_version` from ArbOS storage) executes through the
+/// `PrecompilesMap` → `DynPrecompile` → `run_dispatch`-over-`EvmInternals` path and must match the
+/// in-EVM `arb_revm` oracle (`ArbPrecompiles`) bit-for-bit in both output and gas. Because the
+/// `arbos_version` slot is **seeded** to a known non-default value, a correct result proves the
+/// node-path `ArbInternals` adapter actually `sload`s the right slot through `EvmInternals` (not a
+/// coincidental zero), and that the `InterpreterResult`→`PrecompileResult` conversion preserves gas.
+#[test]
+fn arbos_precompile_through_precompiles_map_matches_oracle() {
+    use arb_revm::ArbosState;
+    use revm::primitives::{Bytes, keccak256};
+
+    // ArbSys lives at 0x64; arbOSVersion() returns 55 + the stored ArbOS version.
+    const ARB_SYS: Address = Address::with_last_byte(0x64);
+    const SEEDED_ARBOS_VERSION: u64 = 51;
+
+    // A funded-sender db with the ArbOS `arbos_version` storage slot seeded to a known value.
+    let seed_db = || {
+        let mut db = funded_db();
+        let (arbos_acct, arbos_slot) = ArbosState::open().arbos_version.account_and_key();
+        db.insert_account_info(arbos_acct, AccountInfo::default());
+        db.insert_account_storage(
+            arbos_acct,
+            U256::from_be_bytes(arbos_slot.0),
+            U256::from(SEEDED_ARBOS_VERSION),
+        )
+        .expect("seed arbos_version slot");
+        db
+    };
+
+    // calldata = selector of arbOSVersion() (no args).
+    let selector = keccak256("arbOSVersion()");
+    let call_tx = || {
+        ArbTransaction::new(TxEnv {
+            tx_type: 2,
+            caller: SENDER,
+            gas_limit: 1_000_000,
+            gas_price: 0,
+            kind: TxKind::Call(ARB_SYS),
+            value: U256::ZERO,
+            nonce: 0,
+            chain_id: Some(CHAIN_ID),
+            data: Bytes::copy_from_slice(&selector[..4]),
+            ..Default::default()
+        })
+    };
+
+    // Oracle: arb_revm direct (in-EVM `ArbPrecompiles` path — the parity-validated one).
+    let mut odb = seed_db();
+    let octx: ArbContext<&mut _> = Context::mainnet()
+        .with_chain(ArbChainContext::default())
+        .with_db(&mut odb)
+        .with_block(BlockEnv::default())
+        .with_cfg(cfg())
+        .with_tx(ArbTransaction::<TxEnv>::default());
+    let mut oracle_evm = octx.build_arb();
+    let oracle = oracle_evm.transact(call_tx()).expect("oracle precompile call");
+
+    // Bridge: ArbEvmFactory (node `PrecompilesMap` path).
+    let evm_env = EvmEnv::new(cfg(), BlockEnv::default());
+    let mut bridge_evm = ArbEvmFactory.create_evm(seed_db(), evm_env);
+    let bridge = bridge_evm
+        .transact_raw(ArbTx(call_tx()))
+        .expect("bridge precompile call");
+
+    assert!(oracle.result.is_success(), "oracle call failed: {:?}", oracle.result);
+    assert!(bridge.result.is_success(), "bridge call failed: {:?}", bridge.result);
+
+    let oracle_out = oracle.result.output().cloned().unwrap_or_default();
+    let bridge_out = bridge.result.output().cloned().unwrap_or_default();
+
+    // The node path must match the validated in-EVM oracle exactly.
+    assert_eq!(
+        bridge_out, oracle_out,
+        "node-path precompile output must match the in-EVM oracle"
+    );
+    // ...and must reflect the seeded ArbOS state (proves the sload hit the right slot via EvmInternals).
+    assert_eq!(
+        U256::from_be_slice(&bridge_out),
+        U256::from(55 + SEEDED_ARBOS_VERSION),
+        "arbOSVersion() must return 55 + the seeded ArbOS version"
+    );
+    // Gas must survive the InterpreterResult -> PrecompileResult conversion identically.
+    assert_eq!(
+        bridge.result.gas_used(),
+        oracle.result.gas_used(),
+        "node-path gas_used must match the in-EVM oracle"
+    );
+}
+
 #[test]
 fn create_evm_with_inspector_runs_inspecting_path() {
     use revm::inspector::NoOpInspector;
