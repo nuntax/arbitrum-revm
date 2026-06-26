@@ -307,7 +307,7 @@ where
         if commits_state {
             let start_block_result = evm.transact(start_block_tx)?;
             out.start_block_success = start_block_result.result.is_success();
-            out.start_block_gas_used = start_block_result.result.gas_used();
+            out.start_block_gas_used = start_block_result.result.tx_gas_used();
             evm.commit(start_block_result.state);
             out.writes.push(ArbWriteEffect {
                 stage: ArbWriteStage::StartBlockPrelude,
@@ -317,7 +317,7 @@ where
         } else {
             let start_block_result = evm.transact(start_block_tx)?.result;
             out.start_block_success = start_block_result.is_success();
-            out.start_block_gas_used = start_block_result.gas_used();
+            out.start_block_gas_used = start_block_result.tx_gas_used();
         }
     }
 
@@ -348,7 +348,7 @@ where
         out.executed = out.executed.saturating_add(1);
         out.txs.push(ArbTxExecution {
             tx_hash: queued.tx.hash(),
-            gas_used: result.gas_used(),
+            gas_used: result.tx_gas_used(),
             success: result.is_success(),
         });
         if commits_state {

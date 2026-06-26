@@ -282,7 +282,7 @@ where
                 .saturating_sub(REDEEM_BACKLOG_OVERRESERVE)
                 .saturating_sub(modrs_extra);
             let mut gas = Gas::new(gas_limit);
-            let _ = gas.record_cost(consumed);
+            let _ = gas.record_regular_cost(consumed);
             InterpreterResult {
                 result: InstructionResult::Return,
                 output: Bytes::from(alloy_core::sol_types::SolValue::abi_encode(&(retry_tx_hash,))),

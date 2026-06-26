@@ -149,7 +149,7 @@ impl ArbPrecompilesEnum {
         // Fold the per-call precompile gas (arg/result copy + ArbosState open) into the returned
         // gas so the CALL's net cost matches Nitro.
         let extra = arbos_call_extra_gas(arb, input_len, result.output.len(), selector);
-        if !result.gas.record_cost(extra) {
+        if !result.gas.record_regular_cost(extra) {
             result.result = InstructionResult::OutOfGas;
             result.output = Default::default();
         }
