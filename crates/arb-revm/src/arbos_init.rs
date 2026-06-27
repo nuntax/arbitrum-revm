@@ -38,13 +38,15 @@
 //! - v60: MaxFragmentCount → 2 (StylusContractLimit field added).
 
 use revm::{
-    context_interface::{ContextTr, JournalTr},
+    context_interface::{
+        journaled_state::account::JournaledAccountTr, ContextTr, JournalTr,
+    },
     primitives::{address, Address, B256, Bytes, KECCAK_EMPTY, U256},
     state::Bytecode,
 };
 
 use crate::{
-    constants::{ARBOS_ACTS_ADDRESS, BATCH_POSTER_ADDRESS},
+    constants::{ARBOS_ACTS_ADDRESS, ARBOS_STATE_ADDRESS, BATCH_POSTER_ADDRESS},
     internal_tx::upgrade_arbos_version,
     storage::ArbosState,
 };
@@ -243,6 +245,16 @@ pub fn initialize_arbos_state<J: JournalTr>(
 
     let state = ArbosState::open();
 
+    // 0. The ArbOS state account's nonce is set to 1 so geth never treats it as empty
+    //    (Nitro `arbos/storage/storage.go::KVStorage` line 73, run whenever the ArbOS storage
+    //    backing is opened). Without this the account encodes with nonce 0 and the genesis trie
+    //    diverges. Validated against the nitro-testnode genesis (0xa4b05ff… has nonce 1).
+    journal
+        .load_account_mut(ARBOS_STATE_ADDRESS)
+        .map_err(|e| format!("[ARBITRUM] failed to load ArbOS state account: {e}"))?
+        .data
+        .set_nonce(1);
+
     // 1. Fake precompile code for every precompile active at the target version. Nitro installs
     //    version-0 ones in InitializeArbosState and later ones during each UpgradeArbosVersion
     //    step; the final state (all precompiles with min_version <= target have code) is identical,
@@ -362,6 +374,36 @@ pub fn initialize_arbos_state<J: JournalTr>(
         upgrade_arbos_version(1, config.initial_arbos_version, &state, journal)?;
     }
 
+    // 9. firstTime block (Nitro arbosState.go UpgradeArbosVersion lines 519-526): runs ONCE
+    //    after the cascade, at genesis only (firstTime=true), when the target version >= 6.
+    //    It overrides L1 equilibration units and L2 speed-limit / per-block gas-limit with the
+    //    V6 constants — the V0 values written by InitializeL1/L2PricingState are only correct for
+    //    a genesis below v6. This is firstTime-ONLY: a *runtime* v6 upgrade does NOT apply it,
+    //    which is why `upgrade_arbos_version` omits it (and why mid-chain replay never needs it —
+    //    that state is already past v6). Validated slot-for-slot against the nitro-testnode genesis
+    //    (ArbOS v40): equilibrationUnits=160e6, speedLimit=7e6, perBlockGasLimit=32e6.
+    if config.initial_arbos_version >= 6 {
+        // perBatchGasCost = InitialPerBatchGasCostV6 (100_000), ONLY for target < 11; at >= 11 the
+        // v11 cascade step already set it to the V12 value (210_000).
+        if config.initial_arbos_version < 11 {
+            let _ = state.l1_pricing.per_batch_gas_cost.set(100_000_i64, journal);
+        }
+        // InitialEquilibrationUnitsV6 = TxDataNonZeroGasEIP2028(16) * 10_000_000.
+        let _ = state
+            .l1_pricing
+            .equilibration_units
+            .set(U256::from(160_000_000u64), journal);
+        // InitialSpeedLimitPerSecondV6 / InitialPerBlockGasLimitV6.
+        let _ = state
+            .l2_pricing
+            .speed_limit_per_second
+            .set(7_000_000u64, journal);
+        let _ = state
+            .l2_pricing
+            .per_block_gas_limit
+            .set(32_000_000u64, journal);
+    }
+
     Ok(())
 }
 
@@ -386,6 +428,53 @@ mod tests {
     /// Returns a fresh ArbOS context whose journal we can write to and read back from.
     fn fresh() -> ArbContext<EmptyDB> {
         <ArbContext<EmptyDB> as DefaultArb>::arb()
+    }
+
+    /// Genesis to a version >= 6 applies the firstTime V6 pricing overrides (Nitro
+    /// arbosState.go:519-526). Validated slot-for-slot against the nitro-testnode genesis
+    /// (ArbOS v40): equilibrationUnits=160e6, speedLimit=7e6, perBlockGasLimit=32e6.
+    #[test]
+    fn genesis_v6_plus_applies_v6_pricing_overrides() {
+        let mut ctx = fresh();
+        initialize_arbos_state(&cfg(40), ctx.journal_mut()).expect("init v40");
+        let state = ArbosState::open();
+        let j = ctx.journal_mut();
+        assert_eq!(
+            state.l1_pricing.equilibration_units.get(j).unwrap(),
+            U256::from(160_000_000u64),
+            "v6 equilibrationUnits override"
+        );
+        assert_eq!(
+            state.l2_pricing.speed_limit_per_second.get(j).unwrap(),
+            7_000_000,
+            "v6 speedLimit override"
+        );
+        assert_eq!(
+            state.l2_pricing.per_block_gas_limit.get(j).unwrap(),
+            32_000_000,
+            "v6 perBlockGasLimit override"
+        );
+        // perBatchGasCost stays at the v11 value (210_000) for target >= 11.
+        assert_eq!(state.l1_pricing.per_batch_gas_cost.get(j).unwrap(), 210_000);
+    }
+
+    /// Genesis below v6 keeps the V0 pricing constants (no firstTime override).
+    #[test]
+    fn genesis_below_v6_keeps_v0_pricing() {
+        let mut ctx = fresh();
+        initialize_arbos_state(&cfg(5), ctx.journal_mut()).expect("init v5");
+        let state = ArbosState::open();
+        let j = ctx.journal_mut();
+        assert_eq!(
+            state.l1_pricing.equilibration_units.get(j).unwrap(),
+            U256::from(INITIAL_EQUILIBRATION_UNITS_V0),
+            "v5 keeps V0 equilibrationUnits"
+        );
+        assert_eq!(
+            state.l2_pricing.speed_limit_per_second.get(j).unwrap(),
+            L2_INITIAL_SPEED_LIMIT_V0,
+            "v5 keeps V0 speedLimit"
+        );
     }
 
     #[test]
