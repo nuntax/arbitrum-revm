@@ -45,7 +45,8 @@ pub use precompiles::ArbPrecompiles;
 pub use revm;
 pub use spec::ArbSpecId;
 pub use storage::{
-    AddressSet, AddressTable, ArbFeatures, ArbosPrograms, ArbosState, BatchPosterState,
+    AddressSet, AddressTable, ArbBlockHeaderInfo, ArbFeatures, ArbosPrograms, ArbosState,
+    BatchPosterState,
     BatchPosterTable, BlockHashes, ChainConfig, L1Pricing, L2Pricing, ProgramDataPricer,
     RetryableRecord, Retryables, SendMerkle, StorageBacked, StorageBytes, StorageQueue,
     StorageSlot, StorageSpace,

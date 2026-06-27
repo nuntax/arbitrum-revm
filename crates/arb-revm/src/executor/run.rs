@@ -69,7 +69,15 @@ fn start_block_internal_tx(call: ArbSystemCall, chain_id: u64) -> ArbTransaction
     ArbTransaction::new(tx)
 }
 
-fn scheduled_retries_from_redeem_logs<CTX>(
+/// Derives the scheduled retry (auto-redeem) transactions implied by a transaction's
+/// `RedeemScheduled` logs, reading the retryable state from `ctx`.
+///
+/// This is the ArbOS "scheduled retry" mechanism: a successful `SubmitRetryable` (auto-redeem) or
+/// `ArbRetryableTx.redeem` precompile call emits a `RedeemScheduled` event, and ArbOS then runs the
+/// corresponding redeem transaction **within the same block**. [`execute_message`] uses this in its
+/// own loop; the reth node's block-builder loop ([`crate`] consumers) calls it after each committed
+/// tx so produced blocks include the same auto-redeem txs (and thus match Nitro's gas/state/roots).
+pub fn scheduled_retries_from_redeem_logs<CTX>(
     ctx: &mut CTX,
     logs: &[Log],
     chain_id: u64,

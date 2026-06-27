@@ -25,7 +25,7 @@ use crate::constants::ARBOS_STATE_ADDRESS;
 
 pub use address_set::AddressSet;
 pub use address_table::AddressTable;
-pub use arbos_state::ArbosState;
+pub use arbos_state::{ArbBlockHeaderInfo, ArbosState};
 pub use batch_poster_table::{BatchPosterState, BatchPosterTable};
 pub use block_hashes::BlockHashes;
 pub use bytes::StorageBytes;
