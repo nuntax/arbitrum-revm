@@ -7,6 +7,7 @@
 
 pub mod api;
 pub mod arb_journal;
+pub mod arbos_init;
 pub mod chain;
 pub mod constants;
 mod deposit_tx;

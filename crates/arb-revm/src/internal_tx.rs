@@ -192,10 +192,9 @@ fn apply_start_block<CTX: ArbContextTr>(ctx: &mut CTX, input: &Bytes) -> Result<
 /// `target_version`, incrementing one step at a time.
 ///
 /// Mirrors Nitro's `UpgradeArbosVersion` loop in arbosState.go.
-/// Only the migrations that touch storage fields available in arb-revm are implemented;
-/// Stylus-program-param upgrades (v30, v31, v40, v50 Stylus part, v60 Stylus part) are
-/// intentionally skipped — they are handled by the Stylus runtime.
-fn upgrade_arbos_version<J: JournalTr>(
+/// Stylus-program-param upgrades (v30 programs init, v31 Version+MinInitGas, v40 MaxWasmSize,
+/// v50 MaxStackDepth cap, v60 MaxFragmentCount) are now fully implemented.
+pub(crate) fn upgrade_arbos_version<J: JournalTr>(
     current_version: u64,
     target_version: u64,
     state: &ArbosState,
@@ -265,10 +264,33 @@ fn upgrade_arbos_version<J: JournalTr>(
             }
             // v21-v29: reserved for Orbit chains.
             21..=29 => {}
-            // v30: Stylus program param initialization — handled by Stylus runtime.
-            30 => {}
-            // v31: Stylus program params v2 upgrade — handled by Stylus runtime.
-            31 => {}
+            // v30: Stylus program genesis state initialization.
+            // Nitro: `programs.Initialize(nextArbosVersion=30, sto)` in arbosstate.go.
+            // Writes the packed params word (Version=1, all initial constants), data-pricer
+            // fields (bytes_per_second, last_update_time=ArbitrumStartTime, min_price, inertia),
+            // and the cacheManagers set (a no-op on a fresh trie).
+            30 => {
+                state
+                    .programs
+                    .initialize(30, journal)
+                    .map_err(|e| format!("[ARBITRUM] programs.initialize failed: {e}"))?;
+            }
+            // v31: Stylus params v2 upgrade.
+            // Nitro: `params.UpgradeToVersion(2)` + `params.Save()` in arbosstate.go.
+            // Sets Version = 2 and MinInitGas = v2MinInitGas (69).
+            31 => {
+                use crate::storage::programs::{stylus_param_layout as l, pack_uint, V2_STYLUS_VERSION, V2_MIN_INIT_GAS};
+                let mut params_word = state
+                    .programs
+                    .read_params_word(journal)
+                    .map_err(|e| format!("[ARBITRUM] v31: failed to read Stylus params: {e}"))?;
+                pack_uint(&mut params_word, l::VERSION.0,       l::VERSION.1,       V2_STYLUS_VERSION);
+                pack_uint(&mut params_word, l::MIN_INIT_GAS.0,  l::MIN_INIT_GAS.1,  V2_MIN_INIT_GAS);
+                state
+                    .programs
+                    .write_params_word(params_word, journal)
+                    .map_err(|e| format!("[ARBITRUM] v31: failed to write Stylus params: {e}"))?;
+            }
             // v32: no storage changes.
             32 => {}
             // v33-v39: reserved for Orbit chains.
@@ -345,8 +367,23 @@ fn upgrade_arbos_version<J: JournalTr>(
             51 => {}
             // v52-v59: reserved for Orbit chains.
             52..=59 => {}
-            // v60: transaction filterer subspace init — AddressSet already initializes lazily.
-            60 => {}
+            // v60: Stylus StylusContractLimit param + transaction-filterer init.
+            // Nitro: `p.UpgradeToArbosVersion(60)` sets MaxFragmentCount = initialMaxFragmentCount (2)
+            // + `addressSet.Initialize(transactionFiltererSubspace)` (no-op on fresh trie).
+            60 => {
+                use crate::storage::programs::{stylus_param_layout as l, pack_uint, INITIAL_MAX_FRAGMENT_COUNT};
+                let mut params_word = state
+                    .programs
+                    .read_params_word(journal)
+                    .map_err(|e| format!("[ARBITRUM] v60: failed to read Stylus params: {e}"))?;
+                pack_uint(&mut params_word, l::MAX_FRAGMENT_COUNT.0, l::MAX_FRAGMENT_COUNT.1, INITIAL_MAX_FRAGMENT_COUNT);
+                state
+                    .programs
+                    .write_params_word(params_word, journal)
+                    .map_err(|e| format!("[ARBITRUM] v60: failed to write Stylus params: {e}"))?;
+                // transaction-filterer AddressSet.Initialize writes 0 to slot 0 — SSTORE no-op
+                // on a fresh trie; the AddressSet already initializes lazily on first use.
+            }
             unknown => {
                 return Err(format!(
                     "[ARBITRUM] chain is upgrading to unsupported ArbOS version {unknown}; please upgrade the node"
