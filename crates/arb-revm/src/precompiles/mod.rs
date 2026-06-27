@@ -12,7 +12,7 @@ use alloy_core::sol_types::SolCall;
 use revm::{
     context_interface::{ContextTr, JournalTr},
     handler::{EthPrecompiles, PrecompileProvider},
-    interpreter::{InstructionResult, InterpreterResult},
+    interpreter::{Gas, InstructionResult, InterpreterResult},
     precompile::{Precompiles, secp256r1::P256VERIFY},
     primitives::{Address, AddressSet},
 };
@@ -146,6 +146,15 @@ impl ArbPrecompilesEnum {
             return gated_revert_result(gas_limit);
         }
         let mut result = self.dispatch(ctx, call);
+        // ArbOwner is wrapped by Nitro's `OwnerPrecompile`, which returns `multigas.ZeroGas()` —
+        // the chain owner is NEVER charged for an ArbOwner call (success or revert), so it pays
+        // neither the method gas nor the per-call arg/result-copy + ArbosState-open gas. Reset to
+        // zero-spent and skip the extra. (ArbDebug's `DebugPrecompile` does NOT do this — it charges
+        // normally — so only ArbOwner is exempt.)
+        if arb == ArbPrecompilesEnum::ArbOwner {
+            result.gas = Gas::new(gas_limit);
+            return result;
+        }
         // Fold the per-call precompile gas (arg/result copy + ArbosState open) into the returned
         // gas so the CALL's net cost matches Nitro.
         let extra = arbos_call_extra_gas(arb, input_len, result.output.len(), selector);
