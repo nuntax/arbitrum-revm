@@ -350,11 +350,19 @@ where
             return Ok(internal_success_frame_result());
         }
         if is_submit_retryable_tx(evm) {
-            submit_retryable_tx::apply_submit_retryable_tx(evm.ctx_mut())
+            let outcome = submit_retryable_tx::apply_submit_retryable_tx(evm.ctx_mut())
                 .map_err(|msg| ERROR::from_string(msg.into()))?;
-            return Ok(submit_retryable_success_frame_result(
-                evm.ctx().tx().gas_limit(),
-            ));
+            return Ok(match outcome {
+                // Ticket created: success receipt over the tx gas limit.
+                submit_retryable_tx::SubmitRetryableOutcome::Created => {
+                    submit_retryable_success_frame_result(evm.ctx().tx().gas_limit())
+                }
+                // Funds check failed: Nitro records a failed tx (status 0, gasUsed 0) and
+                // keeps the partial state (deposit mint, fee refunds) instead of halting.
+                submit_retryable_tx::SubmitRetryableOutcome::Failed => {
+                    submit_retryable_failed_frame_result()
+                }
+            });
         }
         if is_retry_tx(evm) {
             retry_tx::apply_retry_tx_pre_execution(evm.ctx_mut())
@@ -502,14 +510,12 @@ where
     ) -> Result<(), Self::Error> {
         if is_protocol_short_circuit_tx(evm) {
             let status = frame_result.interpreter_result().result;
-            if !status.is_ok() {
-                let label = if is_internal_tx(evm) {
-                    "internal"
-                } else if is_submit_retryable_tx(evm) {
-                    "submit-retryable"
-                } else {
-                    "deposit"
-                };
+            // A submit-retryable may legitimately fail its funds checks: Nitro records it as
+            // a failed tx (status 0, gasUsed 0) and continues the block, so a non-ok result
+            // here is expected, not fatal. Internal and deposit txs are protocol-guaranteed
+            // and must never fail — a non-ok result for those is a real bug.
+            if !status.is_ok() && !is_submit_retryable_tx(evm) {
+                let label = if is_internal_tx(evm) { "internal" } else { "deposit" };
                 return Err(ERROR::from_string(
                     format!("[ARBITRUM] {label} transaction execution failed").into(),
                 ));
@@ -895,6 +901,17 @@ fn submit_retryable_success_frame_result(gas_limit: u64) -> FrameResult {
             Bytes::new(),
             Gas::new_spent_with_reservoir(gas_limit, 0),
         ),
+        0..0,
+    ))
+}
+
+/// Frame result for a submit-retryable that failed a funds check: a reverted (status-0)
+/// receipt with zero gas, mirroring Nitro's `return true, ZeroGas, err, nil`. The state
+/// changes already applied in `apply_submit_retryable_tx` are not reverted (there is no
+/// frame checkpoint to unwind), matching Nitro keeping the deposit mint on failure.
+fn submit_retryable_failed_frame_result() -> FrameResult {
+    FrameResult::Call(CallOutcome::new(
+        InterpreterResult::new(InstructionResult::Revert, Bytes::new(), Gas::new(0)),
         0..0,
     ))
 }
@@ -1430,6 +1447,62 @@ mod tests {
             })
             .expect("submit-retryable should emit TicketCreated");
         assert_eq!(ticket_created.topics()[1], ticket_id);
+    }
+
+    #[test]
+    fn submit_retryable_tx_with_underfunded_submission_fee_fails_without_halting() {
+        // Nitro `tx_processor.go:258`: when the deposit mint can't cover the max submission
+        // fee, the tx is recorded as failed (status 0, gasUsed 0) and the block continues,
+        // keeping the deposit mint. It must NOT surface as a fatal EVM error (which would
+        // halt the driver — the real Arbitrum One batch-1 retryable 0xff56fb78… hits this).
+        let cfg = CfgEnv::new_with_spec(ArbSpecId::NITRO)
+            .with_chain_id(42161)
+            .with_disable_priority_fee_check(true);
+        let ctx = Context::mainnet()
+            .with_tx(ArbTransaction::<TxEnv>::default())
+            .with_cfg(cfg)
+            .with_chain(ArbChainContext::default())
+            .with_db(InMemoryDB::default());
+        let mut evm = ctx.build_arb();
+
+        let caller = Address::with_last_byte(0x71);
+        // deposit_value (1_000) < max_submission_fee (2_000); the caller starts at 0, so the
+        // balance after the mint is exactly the deposit and falls short of the fee.
+        let call = SubmitRetryableCall {
+            request_id: B256::with_last_byte(0x72),
+            l1_base_fee: U256::from(1_u64),
+            deposit_value: U256::from(1_000_u64),
+            retry_value: U256::from(5_u64),
+            gas_fee_cap: U256::from(1_u64),
+            gas_limit: 250_000,
+            max_submission_fee: U256::from(2_000_u64),
+            fee_refund_address: Address::with_last_byte(0x73),
+            beneficiary: Address::with_last_byte(0x74),
+            retry_to: Some(Address::with_last_byte(0x75)),
+            retry_data: revm::primitives::bytes!("deadbeef"),
+        };
+        let ticket_id = compute_submit_retryable_ticket_id(42161, caller, &call);
+        let tx = make_submit_retryable_tx(caller, call);
+        let out = evm.transact(tx).expect("under-funded submit-retryable must not be a fatal error");
+
+        assert!(!out.result.is_success(), "receipt status must be failure");
+        assert_eq!(out.result.gas_used(), 0, "failed submit-retryable consumes zero gas");
+        assert!(out.result.logs().is_empty(), "no TicketCreated on a failed submission");
+
+        // The deposit mint is kept (Nitro does not revert it on this failure path).
+        let caller_account =
+            out.state.get(&caller).expect("caller account present in state diff");
+        assert_eq!(caller_account.info.balance, U256::from(1_000_u64));
+
+        // No retryable record was created: its numTries slot is unwritten.
+        let arbos_state = ArbosState::open();
+        let (_, num_tries_slot) = arbos_state.retryables.retryable(ticket_id).num_tries.account_and_key();
+        let unwritten = out
+            .state
+            .get(&ARBOS_STATE_ADDRESS)
+            .and_then(|acct| acct.storage.get(&U256::from_be_bytes(num_tries_slot.0)))
+            .is_none();
+        assert!(unwritten, "failed submission must not create a retryable record");
     }
 
     #[test]

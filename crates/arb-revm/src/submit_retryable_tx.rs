@@ -26,6 +26,22 @@ const REDEEM_SCHEDULED_EVENT_SIGNATURE: &[u8] =
 const RETRYABLE_ESCROW_TAG: &[u8] = b"retryable escrow";
 const TX_GAS: u64 = 21_000;
 
+/// Outcome of applying a submit-retryable tx.
+///
+/// Mirrors Nitro `StartTxHook`'s `return true, ZeroGas, err, nil` semantics: a retryable
+/// submission can legitimately fail (e.g. the L1 deposit can't cover the max submission
+/// fee, or the sender can't fund the callvalue escrow). Nitro records such a tx as failed
+/// (status 0, gasUsed 0) **without reverting** the state changes made before the failure
+/// (notably the deposit mint) and continues the block. So these are not fatal errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubmitRetryableOutcome {
+    /// Ticket created (with or without an auto-redeem scheduled). Receipt = success.
+    Created,
+    /// Submission failed a funds check after applying its partial state changes. Receipt
+    /// = failed, gasUsed 0; the partial state (deposit mint, fee refunds) is kept.
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SubmitRetryableCall {
     pub request_id: B256,
@@ -137,7 +153,9 @@ pub(crate) fn decode_submit_retryable_calldata(
 /// 2. Validate max-submission-fee bound.
 /// 3. Move retry callvalue into deterministic escrow.
 /// 4. Create retryable record in ArbOS storage and enqueue it for timeout reaping.
-pub(crate) fn apply_submit_retryable_tx<CTX: ArbContextTr>(ctx: &mut CTX) -> Result<(), String> {
+pub(crate) fn apply_submit_retryable_tx<CTX: ArbContextTr>(
+    ctx: &mut CTX,
+) -> Result<SubmitRetryableOutcome, String> {
     let call = decode_submit_retryable_calldata(ctx.tx().input().as_ref())?;
     let from = ctx.tx().caller();
     let chain_id = ctx.tx().chain_id().ok_or_else(|| {
@@ -147,10 +165,9 @@ pub(crate) fn apply_submit_retryable_tx<CTX: ArbContextTr>(ctx: &mut CTX) -> Res
 
     let submission_fee = retryable_submission_fee(call.retry_data.len(), call.l1_base_fee);
     if call.max_submission_fee < submission_fee {
-        return Err(format!(
-            "[ARBITRUM] submit-retryable max submission fee too low: max={}, required={}",
-            call.max_submission_fee, submission_fee
-        ));
+        // Nitro `tx_processor.go`: "should be impossible as this is checked at L1"; still a
+        // recorded failure, not a fatal error.
+        return Ok(SubmitRetryableOutcome::Failed);
     }
 
     let current_timestamp: u64 = ctx
@@ -182,10 +199,11 @@ pub(crate) fn apply_submit_retryable_tx<CTX: ArbContextTr>(ctx: &mut CTX) -> Res
         .info
         .balance;
     if balance_after_mint < call.max_submission_fee {
-        return Err(format!(
-            "[ARBITRUM] insufficient funds for max submission fee: have={}, need={}",
-            balance_after_mint, call.max_submission_fee
-        ));
+        // Nitro `tx_processor.go:258`: the (aliased) sender's balance after the deposit mint
+        // can't cover the max submission fee. Nitro records the tx as failed (status 0,
+        // gasUsed 0) and keeps the block going, *without* reverting the mint. Real Arbitrum
+        // One batch-1 retryables hit this (e.g. tx 0xff56fb78…, canonical receipt status 0).
+        return Ok(SubmitRetryableOutcome::Failed);
     }
 
     let mut available_refund = call.deposit_value;
@@ -244,7 +262,11 @@ pub(crate) fn apply_submit_retryable_tx<CTX: ArbContextTr>(ctx: &mut CTX) -> Res
                     "submit-retryable withheld submission fee refund transfer",
                 )?;
             }
-            return Err(original_error);
+            // Nitro `tx_processor.go:307`: callvalue escrow couldn't be funded. The
+            // submission-fee refund dance above mirrors Nitro; the tx is then a recorded
+            // failure (state kept), not a fatal error.
+            let _ = original_error;
+            return Ok(SubmitRetryableOutcome::Failed);
         }
     }
 
@@ -311,7 +333,8 @@ pub(crate) fn apply_submit_retryable_tx<CTX: ArbContextTr>(ctx: &mut CTX) -> Res
                 .map_err(|err| format!("[ARBITRUM] failed to transfer gas-cost refund: {err}"))?;
             map_transfer_error(transfer_error, "submit-retryable gas-cost refund transfer")?;
         }
-        return Ok(());
+        // Ticket created but no auto-redeem (gas too low / can't fund gas): still a success.
+        return Ok(SubmitRetryableOutcome::Created);
     }
 
     let gascost = effective_base_fee.saturating_mul(U256::from(usergas));
@@ -389,7 +412,7 @@ pub(crate) fn apply_submit_retryable_tx<CTX: ArbContextTr>(ctx: &mut CTX) -> Res
         submission_fee,
     ));
 
-    Ok(())
+    Ok(SubmitRetryableOutcome::Created)
 }
 
 fn ticket_created_log(ticket_id: B256) -> Log {
