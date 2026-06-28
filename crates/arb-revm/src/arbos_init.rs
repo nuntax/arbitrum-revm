@@ -95,6 +95,16 @@ pub fn arb_genesis_accounts(
     // For `ArbContext<EmptyDB>`, `State = revm::state::EvmState = AddressMap<Account>`.
     let evm_state = ctx.journal_mut().finalize();
 
+    Ok(evm_state_to_genesis_accounts(evm_state))
+}
+
+/// Converts a finalized revm [`EvmState`](revm::state::EvmState) into the sorted, trie-relevant
+/// [`ArbGenesisAccount`] list: drops fully-empty accounts (no code/balance/nonce/storage — they
+/// produce no trie entry per EIP-161), filters zero-valued storage slots, and sorts both the
+/// per-account storage (by slot) and the account list (by address) for deterministic output.
+fn evm_state_to_genesis_accounts(
+    evm_state: revm::state::EvmState,
+) -> Vec<ArbGenesisAccount> {
     let mut accounts: Vec<ArbGenesisAccount> = evm_state
         .iter()
         .filter_map(|(addr, account)| {
@@ -148,7 +158,177 @@ pub fn arb_genesis_accounts(
     // Sort by address for deterministic output.
     accounts.sort_by_key(|a| a.address);
 
-    Ok(accounts)
+    accounts
+}
+
+/// A classic-state account to import at genesis — Nitro
+/// `statetransfer.AccountInitializationInfo` (the JSON `accounts.json` records).
+#[derive(Debug, Clone)]
+pub struct GenesisAccountInput {
+    /// Account address.
+    pub address: Address,
+    /// ETH balance (wei).
+    pub balance: U256,
+    /// Account nonce.
+    pub nonce: u64,
+    /// Deployed bytecode (original bytes); empty for EOAs.
+    pub code: Bytes,
+    /// Non-zero storage slots `(slot, value)`.
+    pub storage: Vec<(B256, B256)>,
+}
+
+/// A retryable ticket to seed at genesis — Nitro
+/// `statetransfer.InitializationDataForRetryable` (the JSON `retryables.json` records).
+#[derive(Debug, Clone)]
+pub struct GenesisRetryableInput {
+    /// Ticket id.
+    pub id: B256,
+    /// Expiry timestamp (seconds).
+    pub timeout: u64,
+    /// Ticket creator.
+    pub from: Address,
+    /// Destination (`None` == contract-creation / nil address).
+    pub to: Option<Address>,
+    /// Escrowed call value (wei).
+    pub callvalue: U256,
+    /// Beneficiary credited on expiry / cancellation.
+    pub beneficiary: Address,
+    /// Retry calldata.
+    pub calldata: Bytes,
+}
+
+/// `keccak256("retryable escrow" ++ ticket_id)[12:]` — the per-ticket escrow address that holds a
+/// live retryable's call value (Nitro `retryables.RetryableEscrowAddress`).
+fn genesis_retryable_escrow_address(ticket_id: B256) -> Address {
+    let mut preimage = Vec::with_capacity(16 + 32);
+    preimage.extend_from_slice(b"retryable escrow");
+    preimage.extend_from_slice(ticket_id.as_slice());
+    Address::from_word(revm::primitives::keccak256(preimage))
+}
+
+/// Builds the **full Arbitrum One mainnet genesis state** by reproducing Nitro's
+/// `arbos/arbosState/initialize.go::InitializeArbosInDatabase` against a fresh empty state, then
+/// extracting every trie account as an [`ArbGenesisAccount`].
+///
+/// Steps (Nitro order — order matters for balance collisions):
+/// 1. [`initialize_arbos_state`] — ArbOS baseline (incl. chain-owner add).
+/// 2. Register every `address_table` entry in order (sequential slots).
+/// 3. Retryables: expired (`timeout <= current_timestamp`) credit the beneficiary with the call
+///    value; live ones are sorted by `(timeout, id)`, get their call value escrowed, and are
+///    written as records + enqueued in the timeout queue.
+/// 4. Import each classic account: balance / nonce / code / storage. `SetBalance` **overwrites**,
+///    so an account also credited as a retryable beneficiary keeps its `accounts.json` balance
+///    (escrow addresses never collide with the classic dump, so their credits survive).
+///
+/// `accounts` is consumed lazily (streamed) — only the finalized [`EvmState`](revm::state::EvmState)
+/// is held in memory, which the caller's machine must fit (≈1.29M accounts for Arbitrum One).
+pub fn build_mainnet_genesis_accounts<AT, RT, AC>(
+    config: &ArbosInitConfig,
+    address_table: AT,
+    retryables: RT,
+    accounts: AC,
+    current_timestamp: u64,
+) -> Result<Vec<ArbGenesisAccount>, String>
+where
+    AT: IntoIterator<Item = Address>,
+    RT: IntoIterator<Item = GenesisRetryableInput>,
+    AC: IntoIterator<Item = GenesisAccountInput>,
+{
+    use crate::api::default_ctx::{ArbContext, DefaultArb};
+    use revm::database_interface::EmptyDB;
+
+    let mut ctx = <ArbContext<EmptyDB> as DefaultArb>::arb();
+    let journal = ctx.journal_mut();
+
+    // 1. ArbOS baseline (precompile codes, pricing, chain owner, chain config, ...).
+    initialize_arbos_state(config, journal)?;
+    let state = ArbosState::open();
+
+    // 2. Address table — register in file order; slot N goes to the N-th address.
+    for (i, addr) in address_table.into_iter().enumerate() {
+        let slot = state
+            .address_table
+            .register(addr, journal)
+            .map_err(|e| format!("[ARBITRUM] failed to register address-table entry {i}: {e}"))?;
+        if slot != i as u64 {
+            return Err(format!(
+                "[ARBITRUM] address-table slot mismatch at entry {i}: got slot {slot}"
+            ));
+        }
+    }
+
+    // 3. Retryables. Expired tickets just refund the beneficiary; live tickets are recreated.
+    let mut live: Vec<GenesisRetryableInput> = Vec::new();
+    for r in retryables {
+        if r.timeout <= current_timestamp {
+            if r.callvalue != U256::ZERO {
+                credit_balance(journal, r.beneficiary, r.callvalue)?;
+            }
+        } else {
+            live.push(r);
+        }
+    }
+    // Nitro sorts the survivors by (timeout, then ticket id as a big integer). B256 orders
+    // lexicographically big-endian == big-integer order.
+    live.sort_by(|a, b| a.timeout.cmp(&b.timeout).then_with(|| a.id.cmp(&b.id)));
+    for r in live {
+        if r.callvalue != U256::ZERO {
+            let escrow = genesis_retryable_escrow_address(r.id);
+            credit_balance(journal, escrow, r.callvalue)?;
+        }
+        let rec = state.retryables.retryable(r.id);
+        let e = |what: &'static str| move |err| format!("[ARBITRUM] retryable {what}: {err}");
+        rec.num_tries.set(0, journal).map_err(e("numTries"))?;
+        rec.from.set(r.from, journal).map_err(e("from"))?;
+        rec.set_to(r.to, journal).map_err(e("to"))?;
+        rec.callvalue.set(r.callvalue, journal).map_err(e("callvalue"))?;
+        rec.beneficiary.set(r.beneficiary, journal).map_err(e("beneficiary"))?;
+        rec.timeout.set(r.timeout, journal).map_err(e("timeout"))?;
+        rec.timeout_windows_left.set(0, journal).map_err(e("timeoutWindowsLeft"))?;
+        rec.calldata.set_fresh(r.calldata.as_ref(), journal).map_err(e("calldata"))?;
+        state
+            .retryables
+            .timeout_queue
+            .put(r.id, journal)
+            .map_err(|e| format!("[ARBITRUM] failed to enqueue retryable timeout: {e}"))?;
+    }
+
+    // 4. Classic accounts — balance / nonce / code / storage (SetBalance overwrites collisions).
+    //    All mutators on the journaled-account handle touch the account, so it survives finalize.
+    for acct in accounts {
+        let loaded = journal
+            .load_account_mut(acct.address)
+            .map_err(|e| format!("[ARBITRUM] failed to load account {}: {e}", acct.address))?;
+        let mut a = loaded.data;
+        a.set_balance(acct.balance);
+        a.set_nonce(acct.nonce);
+        if !acct.code.is_empty() {
+            a.set_code_and_hash_slow(Bytecode::new_raw(acct.code.clone()));
+        }
+        for (slot, value) in &acct.storage {
+            a.sstore(
+                U256::from_be_bytes(slot.0),
+                U256::from_be_bytes(value.0),
+                false,
+            )
+            .map_err(|e| {
+                format!("[ARBITRUM] failed to write storage for {}: {e:?}", acct.address)
+            })?;
+        }
+    }
+
+    let evm_state = ctx.journal_mut().finalize();
+    Ok(evm_state_to_genesis_accounts(evm_state))
+}
+
+/// Adds `amount` to `addr`'s balance (genesis credit), creating + touching the account. Mirrors
+/// geth `statedb.AddBalance` as used by Nitro's retryable init.
+fn credit_balance<J: JournalTr>(journal: &mut J, addr: Address, amount: U256) -> Result<(), String> {
+    let mut loaded = journal
+        .load_account_mut(addr)
+        .map_err(|e| format!("[ARBITRUM] failed to load account {addr} for credit: {e}"))?;
+    loaded.data.incr_balance(amount);
+    Ok(())
 }
 
 /// ArbOS version at which `networkFeeAccount` / L1 reward recipient become the chain owner
