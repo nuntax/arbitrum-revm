@@ -98,7 +98,10 @@ impl SendMerkle {
                 break;
             }
 
-            so_far = keccak_concat(this_level.as_slice(), so_far.as_slice());
+            // Combine hash goes through the journal so a `MeteredJournal` bills it (Nitro's
+            // `merkleAccumulator.Keccak` → burner). The leaf hash above stays a raw `keccak256`,
+            // matching Nitro's `crypto.Keccak256(itemHash)` which is NOT burner-charged.
+            so_far = journal.keccak(&[this_level.as_slice(), so_far.as_slice()]);
             self.set_partial(level, B256::ZERO, journal)?;
             level = level.saturating_add(1);
             events.push(SendMerkleUpdateEvent {

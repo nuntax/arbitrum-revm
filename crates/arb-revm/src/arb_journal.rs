@@ -30,7 +30,7 @@ use revm::{
         journaled_state::{StateLoad, TransferError, account::JournaledAccountTr},
     },
     database_interface::Database,
-    primitives::{Address, B256, Bytes, Log, StorageKey, StorageValue, U256},
+    primitives::{Address, B256, Bytes, Log, StorageKey, StorageValue, U256, keccak256},
 };
 
 /// The narrow journal surface ArbOS storage + precompiles need. See the module docs.
@@ -78,6 +78,122 @@ pub trait ArbJournal {
 
     /// Emit a log.
     fn emit_log(&mut self, log: Log);
+
+    /// Keccak-256 of the concatenated `parts`. The default does NOT meter gas — system /
+    /// start-block paths run under a non-metering burner, exactly like Nitro's `SystemBurner`.
+    /// [`MeteredJournal`] overrides this to charge `30 + 6*words` per Nitro
+    /// `arbos/storage/storage.go Storage.Keccak`, so ArbOS-storage keccaks performed inside a
+    /// precompile body (e.g. the send-merkle combine hash) are billed to the call's gas.
+    fn keccak(&mut self, parts: &[&[u8]]) -> B256 {
+        let mut buf = Vec::new();
+        for p in parts {
+            buf.extend_from_slice(p);
+        }
+        keccak256(buf)
+    }
+}
+
+/// Flat per-operation ArbOS storage gas costs (Nitro `arbos/storage/storage.go`). These are NOT
+/// the EIP-2929 cold/warm/refund schedule — ArbOS bills a flat amount per op through its burner.
+pub const STORAGE_READ_COST: u64 = 800; // params.SloadGasEIP2200
+pub const STORAGE_WRITE_COST: u64 = 20_000; // params.SstoreSetGasEIP2200
+pub const STORAGE_WRITE_ZERO_COST: u64 = 5_000; // params.SstoreResetGasEIP2200
+const LOG_GAS: u64 = 375; // params.LogGas
+const LOG_TOPIC_GAS: u64 = 375; // params.LogTopicGas (charged per topic, incl. the signature)
+const LOG_DATA_GAS: u64 = 8; // params.LogDataGas (per byte)
+
+/// Gas a single ArbOS-storage keccak charges (Nitro `Storage.Keccak`): `30 + 6*words`.
+fn keccak_gas(byte_len: usize) -> u64 {
+    30 + 6 * (byte_len as u64).div_ceil(32)
+}
+
+/// An [`ArbJournal`] wrapper that meters the gas an ArbOS precompile body burns on storage
+/// reads/writes, keccaks, and event emission — mirroring Nitro's precompile `Burner`, which
+/// accumulates these per-op costs and folds them into the call's gas. Delegates every op to the
+/// inner journal; balance reads/debits/transfers are not metered (Nitro charges those through the
+/// EVM/state, not the burner). Read [`Self::burned`] after the metered section and record it onto
+/// the precompile result's gas.
+pub struct MeteredJournal<'a, J: ArbJournal> {
+    inner: &'a mut J,
+    /// Total gas burned by ops routed through this wrapper.
+    pub burned: u64,
+}
+
+impl<'a, J: ArbJournal> MeteredJournal<'a, J> {
+    pub fn new(inner: &'a mut J) -> Self {
+        Self { inner, burned: 0 }
+    }
+
+    #[inline]
+    fn burn(&mut self, amount: u64) {
+        self.burned = self.burned.saturating_add(amount);
+    }
+}
+
+impl<J: ArbJournal> ArbJournal for MeteredJournal<'_, J> {
+    type Error = J::Error;
+
+    fn read_slot(
+        &mut self,
+        account: Address,
+        slot: StorageKey,
+    ) -> Result<StateLoad<StorageValue>, Self::Error> {
+        self.burn(STORAGE_READ_COST);
+        self.inner.read_slot(account, slot)
+    }
+
+    fn write_slot(
+        &mut self,
+        account: Address,
+        slot: StorageKey,
+        value: StorageValue,
+    ) -> Result<StateLoad<SStoreResult>, Self::Error> {
+        self.burn(if value.is_zero() {
+            STORAGE_WRITE_ZERO_COST
+        } else {
+            STORAGE_WRITE_COST
+        });
+        self.inner.write_slot(account, slot, value)
+    }
+
+    fn account_balance(&mut self, account: Address) -> Result<U256, Self::Error> {
+        self.inner.account_balance(account)
+    }
+
+    fn account_code(&mut self, account: Address) -> Result<Bytes, Self::Error> {
+        self.inner.account_code(account)
+    }
+
+    fn debit_balance(&mut self, account: Address, amount: U256) -> Result<bool, Self::Error> {
+        self.inner.debit_balance(account, amount)
+    }
+
+    fn transfer(
+        &mut self,
+        from: Address,
+        to: Address,
+        amount: U256,
+    ) -> Result<Option<TransferError>, Self::Error> {
+        self.inner.transfer(from, to, amount)
+    }
+
+    fn emit_log(&mut self, log: Log) {
+        let cost = LOG_GAS
+            + LOG_TOPIC_GAS * log.data.topics().len() as u64
+            + LOG_DATA_GAS * log.data.data.len() as u64;
+        self.burn(cost);
+        self.inner.emit_log(log);
+    }
+
+    fn keccak(&mut self, parts: &[&[u8]]) -> B256 {
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        self.burn(keccak_gas(total));
+        let mut buf = Vec::with_capacity(total);
+        for p in parts {
+            buf.extend_from_slice(p);
+        }
+        keccak256(buf)
+    }
 }
 
 /// Blanket impl: every revm journal is an [`ArbJournal`]. This is what keeps all existing
