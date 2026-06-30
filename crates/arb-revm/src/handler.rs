@@ -566,9 +566,15 @@ where
     ) {
         // Nitro caps SSTORE-style refunds against (gasUsed - posterGas), where poster gas is
         // nonrefundable. Revm's default cap uses gasUsed only, so we specialize it here.
+        // Use tx-level total_gas_spent (which includes intrinsic, unlike frame-level).
         let gas = frame_result.gas_mut();
         gas.record_refund(eip7702_refund);
 
+        let tx_gas_spent = {
+            let tx_limit = evm.ctx().tx().gas_limit();
+            let remaining = gas.remaining();
+            tx_limit.saturating_sub(remaining)
+        };
         let spec: SpecId = evm.ctx().cfg().spec().into();
         let max_refund_quotient = if spec.is_enabled_in(SpecId::LONDON) {
             5
@@ -576,7 +582,7 @@ where
             2
         };
         let nonrefundable = evm.ctx().chain().poster_gas;
-        let refundable_spent = gas.total_gas_spent().saturating_sub(nonrefundable);
+        let refundable_spent = tx_gas_spent.saturating_sub(nonrefundable);
         let max_refund = refundable_spent / max_refund_quotient;
         let current_refund = gas.refunded().max(0) as u64;
         gas.set_refund(current_refund.min(max_refund) as i64);
@@ -616,7 +622,13 @@ where
         // AddToL1FeesAvailable(posterFee) is called when ArbOS >= 10.
         // GrowBacklog grows by computeGas only (not gasUsed).
         let gas = frame_result.interpreter_result().gas;
-        let gas_used = gas.spent_sub_refunded();
+        let tx_gas_limit = {
+            let ctx = evm.ctx();
+            ctx.tx().gas_limit()
+        };
+        let remaining = gas.remaining();
+        let refund = gas.refunded().max(0) as u64;
+        let gas_used = tx_gas_limit.saturating_sub(remaining).saturating_sub(refund);
         // gas.refunded() is the capped EIP-3529 refund that reimburse_caller returns to the
         // caller. Nitro's gasUsed = GasLimit - gasLeft (where gasLeft includes the refund),
         // which maps to revm's spent_sub_refunded() at this stage.
@@ -786,7 +798,13 @@ where
             max_refund = retry_meta.max_refund;
             submission_fee_refund = retry_meta.submission_fee_refund;
         }
-        let gas_used = gas.spent_sub_refunded();
+        // Nitro: gasUsed = gasLimit - gasLeft (where gasLeft = remaining + refund).
+        // Frame-level `spent_sub_refunded()` misses intrinsic because
+        // `first_frame_input` subtracts it from the budget. We reconstruct the
+        // tx-level gas directly from the raw gas tracker fields.
+        let remaining = gas.remaining();
+        let refund = gas.refunded().max(0) as u64;
+        let gas_used = tx_gas_limit.saturating_sub(remaining).saturating_sub(refund);
         let gas_left = tx_gas_limit.saturating_sub(gas_used);
 
         let arbos_state = ArbosState::open();
