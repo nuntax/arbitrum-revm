@@ -111,6 +111,11 @@ struct AccountWriteSet {
     nonce: Option<u64>,
     code_hash: Option<B256>,
     storage: BTreeMap<U256, U256>,
+    /// Our execution marked this account `Created` (revm `mark_created`). revm-database's
+    /// `apply_account_state` writes a created account via `newly_created` *before* the EIP-161
+    /// empty-clear, so a created-but-empty account (e.g. the ArbOS pre-Stylus "zombie escrow")
+    /// is kept in the trie. Mirror that here so the witness root matches the node/canonical.
+    created: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -264,6 +269,7 @@ fn merge_state_writes(writes: &mut BTreeMap<Address, AccountWriteSet>, state: &E
         }
 
         let entry = writes.entry(*address).or_default();
+        entry.created |= account.is_created();
         if info_changed {
             entry.balance = Some(account.info.balance);
             entry.nonce = Some(account.info.nonce);
@@ -543,12 +549,15 @@ async fn witness_state_root_check<P: Provider<Arbitrum>>(
             },
         );
 
-        // EIP-161: an account that becomes empty is removed from the trie.
+        // EIP-161: an account that becomes empty is removed from the trie — UNLESS our
+        // execution explicitly materialized it (revm `Created`). A created account is written
+        // by revm-database `newly_created` even when empty (the `is_created` check precedes the
+        // empty-clear), which is how the ArbOS pre-Stylus "zombie escrow" stays present.
         let is_empty = nonce == 0
             && balance.is_zero()
             && code_hash == KECCAK_EMPTY
             && new_storage_root == alloy_trie::EMPTY_ROOT_HASH;
-        if is_empty {
+        if is_empty && !expected.created {
             account_updates.insert(key, None);
         } else {
             let account = TrieAccount {
@@ -558,6 +567,14 @@ async fn witness_state_root_check<P: Provider<Arbitrum>>(
                 code_hash,
             };
             account_updates.insert(key, Some(alloy_rlp::encode(&account)));
+        }
+
+        // ACCT_DEBUG=1: print our recomputed post-state account fields so the diverging
+        // account can be named by diffing storage_root/nonce/balance vs canonical getProof@N.
+        if std::env::var("ACCT_DEBUG").is_ok() {
+            println!(
+                "  ACCT {address:?} nonce={nonce} balance={balance} storage_root={new_storage_root:#x} code_hash={code_hash:#x} empty={is_empty}"
+            );
         }
     }
 
@@ -1024,6 +1041,16 @@ async fn main() -> Result<()> {
             state_writes.len(),
             state_slot_count
         );
+        // DUMP_WRITES=1: enumerate our net write-set (account: nonce/balance + slots) so a
+        // "missing write" can be diffed against the canonical prestateTracer diff.
+        if std::env::var("DUMP_WRITES").is_ok() {
+            for (addr, w) in &state_writes {
+                println!("  WRITE {addr:?} nonce={:?} balance={:?}", w.nonce, w.balance);
+                for (slot, val) in &w.storage {
+                    println!("      slot {slot:#x} = {val:#x}");
+                }
+            }
+        }
         // Primary gate: Stage-2 witness state-root recompute (catches missing writes too).
         match witness_state_root_check(&provider, block_number, state_root, &state_writes).await? {
             None => {

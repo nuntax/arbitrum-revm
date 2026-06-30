@@ -25,6 +25,10 @@ const REDEEM_SCHEDULED_EVENT_SIGNATURE: &[u8] =
 
 const RETRYABLE_ESCROW_TAG: &[u8] = b"retryable escrow";
 const TX_GAS: u64 = 21_000;
+/// Nitro `params.ArbosVersion_Stylus`. Below this version, ArbOS's `util.TransferBalance`
+/// resurrects a zero-value transfer's destructed `from` account as an empty "zombie"
+/// (see the auto-redeem escrow handling in [`apply_submit_retryable_tx`]).
+const ARBOS_VERSION_STYLUS: u64 = 30;
 
 /// Outcome of applying a submit-retryable tx.
 ///
@@ -385,6 +389,45 @@ pub(crate) fn apply_submit_retryable_tx<CTX: ArbContextTr>(
     retryable.num_tries.set(1, journal).map_err(|err| {
         format!("[ARBITRUM] failed to mark retryable auto-redeem scheduled: {err}")
     })?;
+
+    // ArbOS pre-Stylus "zombie escrow" quirk. The auto-redeem we just scheduled runs in this
+    // same block; Nitro's redeem (`arbos/tx_processor.go`) does
+    // `util.TransferBalance(escrow, from, callvalue)`, and for `callvalue == 0` with
+    // `ArbOSVersion < Stylus` the `from`-side of that transfer takes the
+    // `CreateZombieIfDeleted(escrow)` branch (`arbos/util/transfer.go`). The escrow was
+    // destructed by the submit's own zero-value escrow touch earlier this block, so it is
+    // resurrected as a *present-but-empty* account that survives EIP-161 state-clearing
+    // (go-ethereum `statedb.Finalise` keeps accounts whose only journal entries are zombie
+    // entries). Because the submit and its auto-redeem are always in the same block, we
+    // materialize that identical end state here — avoiding cross-tx "destructed this block"
+    // tracking in the redeem hook — by marking the escrow Created + Touched. revm's commit
+    // then writes it via `newly_created` (revm-database `apply_account_state` checks
+    // `is_created` *before* the empty-clear), matching canonical (escrow present, nonce 0,
+    // balance 0, empty code/storage). Retryables with `callvalue > 0` don't hit this: their
+    // escrow holds the value across the submit and is emptied-then-cleared when the redeem
+    // moves it back out.
+    if call.retry_value == U256::ZERO {
+        let arbos_version = arbos_state
+            .arbos_version
+            .get(journal)
+            .map_err(|err| format!("[ARBITRUM] failed to read ArbOS version: {err}"))?;
+        if arbos_version < ARBOS_VERSION_STYLUS {
+            let escrow = retryable_escrow_address(ticket_id);
+            // Materialize the escrow in journal state, then mark it Created + Touched directly.
+            // revm's `JournaledAccount` wrapper exposes neither flag, and
+            // `create_account_checkpoint` is unusable here — it forces nonce = 1 under
+            // SpuriousDragon, whereas the canonical zombie escrow has nonce 0. `ArbContextTr`
+            // pins `Journal::State = EvmState`, so `evm_state_mut()` yields the raw account map.
+            journal.load_account(escrow).map_err(|err| {
+                format!("[ARBITRUM] failed to load retryable escrow for zombie materialization: {err}")
+            })?;
+            if let Some(escrow_account) = journal.evm_state_mut().get_mut(&escrow) {
+                escrow_account.mark_created();
+                escrow_account.mark_touch();
+            }
+        }
+    }
+
     let retry_tx_hash = TxRetry {
         chain_id: U256::from(chain_id),
         nonce: 0,
