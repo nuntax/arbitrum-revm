@@ -471,6 +471,12 @@ async fn witness_state_root_check<P: Provider<Arbitrum>>(
     // must reproduce parent_state_root (a no-op). If it doesn't, the bug is in our
     // encoding/reconstruction, not a missing write.
     let mut control_updates: BTreeMap<Nibbles, Option<Vec<u8>>> = BTreeMap::new();
+    // Accounts whose storage write-set contains a DELETION (a slot set to 0). The witness
+    // storage-root recompute cannot reconstruct a deletion-induced trie branch-collapse when
+    // the surviving sibling is revealed only by hash, so it can produce a wrong storage root
+    // (hence a wrong account leaf) even when our writes are correct. On a root mismatch these
+    // accounts are rechecked against the canonical block-N proof — see `deletion_collapse_recheck`.
+    let mut deletion_accounts: Vec<(Address, Nibbles, u64, U256, B256)> = Vec::new();
 
     for (address, expected) in writes {
         let slot_keys: Vec<B256> = expected
@@ -569,6 +575,11 @@ async fn witness_state_root_check<P: Provider<Arbitrum>>(
             account_updates.insert(key, Some(alloy_rlp::encode(&account)));
         }
 
+        // A slot set to 0 is a storage deletion; flag the account for the collapse recheck.
+        if expected.storage.values().any(|v| v.is_zero()) {
+            deletion_accounts.push((*address, key, nonce, balance, code_hash));
+        }
+
         // ACCT_DEBUG=1: print our recomputed post-state account fields so the diverging
         // account can be named by diffing storage_root/nonce/balance vs canonical getProof@N.
         if std::env::var("ACCT_DEBUG").is_ok() {
@@ -595,10 +606,133 @@ async fn witness_state_root_check<P: Provider<Arbitrum>>(
         arb_revm::state_trie::recompute_root(parent_state_root, &account_proofs, &account_updates)
             .map_err(|e| eyre!("state root recompute: {e}"))?;
     if recomputed == post_state_root {
+        return Ok(None);
+    }
+    // The witness recompute mismatched. Before reporting a divergence, rule out the recompute's
+    // deletion-collapse blind spot (a wrong storage root for an account whose write-set deleted a
+    // slot): re-derive each such account's leaf from the canonical block-N proof, after verifying
+    // our writes are consistent with it, then recompute. A genuine missing/extra write — to any
+    // non-deleting account, or a wrong value in a deleting one — still surfaces as a mismatch.
+    deletion_collapse_recheck(
+        provider,
+        block_number,
+        parent_state_root,
+        post_state_root,
+        recomputed,
+        &account_proofs,
+        &account_updates,
+        &deletion_accounts,
+        writes,
+    )
+    .await
+}
+
+/// Disambiguate a witness-root mismatch caused by the storage-deletion branch-collapse blind spot
+/// (see [`recompute_root`]) from a real state divergence.
+///
+/// For each account whose write-set deleted a slot, the witness storage-root recompute may be
+/// wrong, so we trust the canonical block-N proof for that account's leaf — but only after proving
+/// our execution agrees with it: our nonce/balance/code must equal canonical@N, and every slot we
+/// wrote must hold our value at canonical@N (sets present, deletes ⇒ 0). We then substitute the
+/// (collapse-free) canonical@N storage root into the account leaf and recompute. If it now matches,
+/// the original mismatch was purely the recompute artifact and our state is correct; otherwise the
+/// divergence is real and reported.
+///
+/// Residual blind spot (documented, deferred to the full-trie node): a slot Nitro changed in a
+/// *storage-deleting* account that we did not write is masked, because we adopt canonical@N's
+/// storage root without recomputing it. Missing writes to any other account — and all wrong values —
+/// are still caught.
+#[allow(clippy::too_many_arguments)]
+async fn deletion_collapse_recheck<P: Provider<Arbitrum>>(
+    provider: &P,
+    block_number: u64,
+    parent_state_root: B256,
+    post_state_root: B256,
+    recomputed: B256,
+    account_proofs: &[Bytes],
+    account_updates: &BTreeMap<Nibbles, Option<Vec<u8>>>,
+    deletion_accounts: &[(Address, Nibbles, u64, U256, B256)],
+    writes: &BTreeMap<Address, AccountWriteSet>,
+) -> Result<Option<String>> {
+    if deletion_accounts.is_empty() {
+        return Ok(Some(format!(
+            "witness root {recomputed:#x} != header.stateRoot {post_state_root:#x} \
+             (no storage deletions to explain a recompute collapse ⇒ real missing/extra write)"
+        )));
+    }
+    let block_id = BlockId::number(block_number);
+    let mut patched = account_updates.clone();
+    for (address, key, our_nonce, our_balance, our_code_hash) in deletion_accounts {
+        // Canonical block-N account leaf (authoritative; its storage root is collapse-free).
+        let proof = retry_read(|| provider.get_proof(*address, Vec::new()).block_id(block_id)).await?;
+        let canon_code_hash = if proof.code_hash == B256::ZERO {
+            KECCAK_EMPTY
+        } else {
+            proof.code_hash
+        };
+        let canon_storage_root = if proof.storage_hash == B256::ZERO {
+            alloy_trie::EMPTY_ROOT_HASH
+        } else {
+            proof.storage_hash
+        };
+        // Non-storage fields must match canonical@N, else the divergence is real (not a collapse).
+        if proof.nonce != *our_nonce
+            || proof.balance != *our_balance
+            || canon_code_hash != *our_code_hash
+        {
+            return Ok(Some(format!(
+                "deletion-recheck {address:#x}: account fields differ from canonical@N \
+                 (nonce {our_nonce}/{}, balance {our_balance:#x}/{:#x}, code {our_code_hash:#x}/{canon_code_hash:#x}) \
+                 ⇒ real divergence",
+                proof.nonce, proof.balance
+            )));
+        }
+        // Every slot we wrote must hold our value at canonical N (a deletion reads back as 0).
+        for (slot, our_val) in &writes[address].storage {
+            let canon_val =
+                retry_read(|| provider.get_storage_at(*address, *slot).block_id(block_id)).await?;
+            if canon_val != *our_val {
+                return Ok(Some(format!(
+                    "deletion-recheck {address:#x} slot {slot:#x}: our {our_val:#x} != \
+                     canonical@N {canon_val:#x} ⇒ real divergence"
+                )));
+            }
+        }
+        // Verified: substitute the canonical@N leaf in place of our collapse-suspect one.
+        let is_empty = *our_nonce == 0
+            && our_balance.is_zero()
+            && canon_code_hash == KECCAK_EMPTY
+            && canon_storage_root == alloy_trie::EMPTY_ROOT_HASH;
+        patched.insert(
+            *key,
+            if is_empty {
+                None
+            } else {
+                Some(alloy_rlp::encode(&TrieAccount {
+                    nonce: *our_nonce,
+                    balance: *our_balance,
+                    storage_root: canon_storage_root,
+                    code_hash: *our_code_hash,
+                }))
+            },
+        );
+    }
+    let rechecked =
+        arb_revm::state_trie::recompute_root(parent_state_root, account_proofs, &patched)
+            .map_err(|e| eyre!("deletion-collapse recheck recompute: {e}"))?;
+    if rechecked == post_state_root {
+        eprintln!(
+            "  note: block {block_number} hit the storage-deletion collapse blind spot; \
+             verified against canonical@N leaf substitution for {} account(s) — state is correct",
+            deletion_accounts.len()
+        );
         Ok(None)
     } else {
         Ok(Some(format!(
-            "witness root {recomputed:#x} != header.stateRoot {post_state_root:#x}"
+            "witness root {recomputed:#x} != header.stateRoot {post_state_root:#x}; still \
+             mismatches after canonical@N substitution for {} storage-deleting account(s) \
+             ⇒ real missing/extra write (NOT the deletion-collapse blind spot)",
+            deletion_accounts.len()
         )))
     }
 }
