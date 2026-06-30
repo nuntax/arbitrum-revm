@@ -768,6 +768,7 @@ where
         let tx_gas_limit: u64;
         let effective_base_fee: U256;
         let refund_to: Address;
+        let from: Address;
         let max_refund: U256;
         let submission_fee_refund: U256;
         {
@@ -775,6 +776,9 @@ where
             let tx = ctx.tx();
             tx_gas_limit = tx.gas_limit();
             effective_base_fee = U256::from(tx.gas_price());
+            // `from` is the retryable's sender: any refund beyond the L1-deposit budget
+            // (`max_refund`) goes here rather than to `refund_to` (Nitro `refund()` helper).
+            from = tx.caller();
             let retry_meta = tx.retry_meta().ok_or_else(|| {
                 ERROR::from_string("[ARBITRUM] retry EndTxHook: missing retry metadata".into())
             })?;
@@ -805,60 +809,50 @@ where
             .get(journal)
             .unwrap_or_default();
 
-        // Track remaining refund budget.
+        // Track remaining refund budget (the L1 deposit still available to reimburse `refund_to`).
         let mut remaining_refund = max_refund;
 
         if success {
-            // Refund submission_fee_refund from networkFeeAccount → refund_to.
-            let sub_fee_refund = submission_fee_refund.min(remaining_refund);
-            if sub_fee_refund > U256::ZERO && net_account != Address::ZERO {
-                let actual = available_balance(journal, net_account, sub_fee_refund);
-                if actual > U256::ZERO {
-                    let _ = journal.transfer(net_account, refund_to, actual);
-                }
-            }
-            remaining_refund = remaining_refund.saturating_sub(submission_fee_refund);
+            // Refund the submission fee from the network fee account (see `retry_fee_refund`).
+            retry_fee_refund(
+                journal,
+                net_account,
+                submission_fee_refund,
+                refund_to,
+                from,
+                &mut remaining_refund,
+            );
         } else {
-            // No submission fee refund on failure; just deduct from budget.
+            // The submission fee is still taken from the L1 deposit, just not refunded.
             remaining_refund = remaining_refund.saturating_sub(submission_fee_refund);
         }
 
-        // Deduct single-gas cost (execution cost) from remaining refund.
+        // Deduct single-gas cost (execution cost) from the deposit budget (no transfer).
         let single_gas_cost = effective_base_fee.saturating_mul(U256::from(gas_used));
         remaining_refund = remaining_refund.saturating_sub(single_gas_cost);
 
-        // Refund unused gas from fee accounts → refund_to (bounded by remaining_refund).
-        let gas_refund = effective_base_fee.saturating_mul(U256::from(gas_left));
-        let gas_refund = gas_refund.min(remaining_refund);
+        // Refund the unused gas. Nitro carves the infra share out of the gas bucket first, then
+        // refunds infra and network buckets separately — each via `refund()` (deposit cap +
+        // excess to `from`). Not pre-capped by the budget; `retry_fee_refund` applies the cap.
+        let mut network_refund = effective_base_fee.saturating_mul(U256::from(gas_left));
 
-        if gas_refund > U256::ZERO {
-            // Nitro retry refund split:
-            //   1) start with full unused-gas refund in network bucket
-            //   2) if infra account exists, carve out infra share from that bucket
-            //   3) refund carved infra share from infra account
-            //   4) refund remaining bucket from network account
-            let mut network_refund = gas_refund;
-
-            if spec.is_enabled_in(ArbSpecId::ARBOS_5) && infra_account != Address::ZERO {
-                let infra_fee = min_base_fee.min(effective_base_fee);
-                let infra_refund = infra_fee
-                    .saturating_mul(U256::from(gas_left))
-                    .min(network_refund);
-                network_refund = network_refund.saturating_sub(infra_refund);
-
-                let actual = available_balance(journal, infra_account, infra_refund);
-                if actual > U256::ZERO {
-                    let _ = journal.transfer(infra_account, refund_to, actual);
-                }
-            }
-
-            if network_refund > U256::ZERO && net_account != Address::ZERO {
-                let actual = available_balance(journal, net_account, network_refund);
-                if actual > U256::ZERO {
-                    let _ = journal.transfer(net_account, refund_to, actual);
-                }
-            }
+        if spec.is_enabled_in(ArbSpecId::ARBOS_5) && infra_account != Address::ZERO {
+            let infra_fee = min_base_fee.min(effective_base_fee);
+            let infra_refund = infra_fee
+                .saturating_mul(U256::from(gas_left))
+                .min(network_refund);
+            network_refund = network_refund.saturating_sub(infra_refund);
+            retry_fee_refund(
+                journal,
+                infra_account,
+                infra_refund,
+                refund_to,
+                from,
+                &mut remaining_refund,
+            );
         }
+
+        retry_fee_refund(journal, net_account, network_refund, refund_to, from, &mut remaining_refund);
 
         // GrowBacklog by gas_used (Nitro retry path: gasLimit - gasLeft), using the
         // active L2 pricing model.
@@ -873,6 +867,44 @@ where
             .map_err(|msg| ERROR::from_string(msg.into()))?;
 
         Ok(())
+    }
+}
+
+/// Nitro's retryable `refund()` helper (`arbos/tx_processor.go`): move the full `amount` out of
+/// `refund_from`, split between `refund_to` and `from`.
+///
+/// `budget` is the remaining L1-deposit allowance: `min(amount, budget)` is reimbursed to
+/// `refund_to` (and decrements `budget`), while the EXCESS — which can't be charged against the
+/// deposit — is returned to `from` (the retryable's sender). Both transfers come from
+/// `refund_from` (a fee account). Balances are read first to avoid `OutOfFunds`.
+fn retry_fee_refund<J: JournalTr>(
+    journal: &mut J,
+    refund_from: Address,
+    amount: U256,
+    refund_to: Address,
+    from: Address,
+    budget: &mut U256,
+) {
+    if amount == U256::ZERO {
+        return;
+    }
+    let to_refund_addr = amount.min(*budget);
+    *budget = budget.saturating_sub(to_refund_addr);
+    if refund_from == Address::ZERO {
+        return;
+    }
+    if to_refund_addr > U256::ZERO {
+        let actual = available_balance(journal, refund_from, to_refund_addr);
+        if actual > U256::ZERO {
+            let _ = journal.transfer(refund_from, refund_to, actual);
+        }
+    }
+    let excess = amount.saturating_sub(to_refund_addr);
+    if excess > U256::ZERO {
+        let actual = available_balance(journal, refund_from, excess);
+        if actual > U256::ZERO {
+            let _ = journal.transfer(refund_from, from, actual);
+        }
     }
 }
 
