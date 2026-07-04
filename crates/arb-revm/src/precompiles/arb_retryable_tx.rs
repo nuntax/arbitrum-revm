@@ -29,6 +29,14 @@ const REDEEM_READ_BURNS_BASE: u64 = 28_353;
 // ShrinkBacklog write is a reset (5000) of the already-non-zero backlog: 15000 is refunded. This
 // is what makes the redeem tx gasUsed independent of the donation amount.
 const REDEEM_BACKLOG_OVERRESERVE: u64 = REDEEM_STORAGE_WRITE - 5_000;
+// Nitro's Redeem, on a missing/expired ticket, reads the retryable `timeout` twice before
+// reverting (RetryableSizeBytes -> OpenRetryable, then the direct OpenRetryable), each a flat
+// StorageReadCost. arb_revm's ArbosState reads are free, so charge the equivalent so the not-found
+// path burns the same computation gas as canonical (first observed at Arb One block 25523923).
+const REDEEM_NOT_FOUND_READ_BURNS: u64 = 2 * REDEEM_STORAGE_READ;
+// `NoTicketWithID()` custom-error selector, the revert reason Nitro returns for a missing ticket at
+// ArbOS >= 3 (oldNotFoundError). Matching it also matches the revert-output copy gas.
+const NO_TICKET_WITH_ID_SELECTOR: [u8; 4] = [0x80, 0x69, 0x84, 0x56];
 
 pub(super) fn run_arb_retryable_tx<CTX>(
     ctx: &mut CTX,
@@ -154,7 +162,20 @@ where
                 Err(e) => return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}")),
             };
             if !exists {
-                return revert_result(gas_limit, "ArbRetryableTx: ticket does not exist");
+                let arbos_version = state.arbos_version.get(ctx.journal_mut()).unwrap_or(0);
+                if arbos_version >= 3 {
+                    let mut gas = Gas::new(gas_limit);
+                    let _ = gas.record_regular_cost(REDEEM_NOT_FOUND_READ_BURNS);
+                    return InterpreterResult {
+                        result: InstructionResult::Revert,
+                        output: Bytes::from_static(&NO_TICKET_WITH_ID_SELECTOR),
+                        gas,
+                    };
+                }
+                // Pre-v3: the legacy `Error("ticketId not found")` string, with the same read burns.
+                let mut result = revert_result(gas_limit, "ticketId not found");
+                let _ = result.gas.record_regular_cost(REDEEM_NOT_FOUND_READ_BURNS);
+                return result;
             }
 
             let nonce = match retryable.num_tries.get(ctx.journal_mut()) {
