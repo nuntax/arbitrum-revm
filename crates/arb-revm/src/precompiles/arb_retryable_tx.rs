@@ -270,16 +270,31 @@ where
                 return revert_result(gas_limit, &format!("ArbRetryableTx: backlog error: {e}"));
             }
 
+            // The redeem reserves a full StorageWrite (20000) for the ShrinkBacklog SSTORE, but the
+            // realized cost is Nitro's `writeCost(newValue)` (arbos/storage/storage.go): only 5000
+            // (StorageWriteZeroCost) when the backlog is shrunk to ZERO, otherwise the full 20000.
+            // So the 15000 over-reserve is refunded ONLY when the post-shrink backlog is zero -- the
+            // case on a low-usage chain (the v40 testnode this was calibrated against), but NOT on a
+            // busy one (e.g. early-ArbOS mainnet, where the backlog stays non-zero: block 22362432).
+            // Reading gas_backlog here is free in arb_revm (ArbosState reads don't burn). v50+
+            // (multi-gas-constraints) charges a fixed backlog cost, not writeCost(value), so leave
+            // its separately-calibrated over-reserve untouched.
+            let backlog_overreserve = if arbos_version >= 50 {
+                REDEEM_BACKLOG_OVERRESERVE
+            } else {
+                let new_backlog = state.l2_pricing.gas_backlog.get(ctx.journal_mut()).unwrap_or(0);
+                if new_backlog == 0 { REDEEM_BACKLOG_OVERRESERVE } else { 0 }
+            };
+
             // gasUsed is INDEPENDENT of the donation: Nitro charges read_burns + donation + post-run
-            // costs, and read_burns cancels against the donation reservation. What remains is the
-            // backlog SstoreSet over-reserve (15000) — refunded because the real ShrinkBacklog write
-            // is a reset, not a set. precompiles/mod.rs::run re-adds arbos_call_extra_gas (ArbosState
-            // open + arg/result copy) on top of our result, so subtract it to avoid double-charging.
+            // costs, and read_burns cancels against the donation reservation. precompiles/mod.rs::run
+            // re-adds arbos_call_extra_gas (ArbosState open + arg/result copy) on top of our result,
+            // so subtract it to avoid double-charging.
             let modrs_extra = ARBOS_STATE_OPEN_GAS
                 + COPY_GAS * words_for_bytes(redeem_input_len.saturating_sub(4))
                 + COPY_GAS * words_for_bytes(32); // output = ABI-encoded retry_tx_hash (32 bytes)
             let consumed = gas_limit
-                .saturating_sub(REDEEM_BACKLOG_OVERRESERVE)
+                .saturating_sub(backlog_overreserve)
                 .saturating_sub(modrs_extra);
             let mut gas = Gas::new(gas_limit);
             let _ = gas.record_regular_cost(consumed);

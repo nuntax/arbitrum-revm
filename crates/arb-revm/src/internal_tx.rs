@@ -204,6 +204,11 @@ fn apply_start_block<CTX: ArbContextTr>(ctx: &mut CTX, input: &Bytes) -> Result<
     // ArbOS-state value for the rest of this block's transactions.
     ctx.chain_mut().l1_block_number = new_l1_block_number;
 
+    // New block: no retryables have been submitted yet, so drop any zombie-escrow tickets
+    // carried over from the previous block. This is what scopes the pre-Stylus zombie escrow
+    // to same-block submit+redeem pairs (see `ArbChainContext::pending_zombie_escrow_tickets`).
+    ctx.chain_mut().pending_zombie_escrow_tickets.clear();
+
     Ok(())
 }
 

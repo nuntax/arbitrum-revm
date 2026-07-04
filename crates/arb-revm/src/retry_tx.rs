@@ -74,6 +74,11 @@ pub(crate) fn apply_retry_tx_post_execution<CTX: ArbContextTr>(
     let ticket_id = retry_meta.ticket_id;
     let from = tx.caller();
 
+    // Was this ticket's escrow destructed by a same-block submit (pre-Stylus, zero callvalue)?
+    // If so, a *successful* redeem resurrects it as a present-but-empty "zombie"; a failed one
+    // leaves it absent. Read before borrowing the journal (see submit_retryable_tx.rs).
+    let zombie_eligible = ctx.chain().pending_zombie_escrow_tickets.contains(&ticket_id);
+
     let arbos_state = ArbosState::open();
     let journal = ctx.journal_mut();
     let retryable = arbos_state.retryables.retryable(ticket_id);
@@ -87,6 +92,26 @@ pub(crate) fn apply_retry_tx_post_execution<CTX: ArbContextTr>(
             .retryables
             .delete_retryable(ticket_id, journal)
             .map_err(|err| format!("[ARBITRUM] failed to delete retryable after success: {err}"))?;
+
+        // Pre-Stylus zombie escrow (see submit_retryable_tx.rs / ArbChainContext): a
+        // zero-callvalue retryable whose escrow was destructed by the same-block submit is
+        // resurrected as a present-but-empty account, and go-ethereum keeps that zombie only
+        // when this redeem SUCCEEDS. Materialize it now by marking the escrow Created + Touched,
+        // so revm-database's `apply_account_state` writes it via `newly_created` *before* the
+        // EIP-161 empty-clear — matching canonical (escrow present, nonce 0, balance 0, empty
+        // code/storage). `ArbContextTr` pins `Journal::State = EvmState`, so `evm_state_mut()`
+        // yields the raw account map; `create_account_checkpoint` is unusable here as it forces
+        // nonce 1 under SpuriousDragon, whereas the canonical zombie escrow has nonce 0.
+        if zombie_eligible {
+            let escrow = retryable_escrow_address(ticket_id);
+            journal.load_account(escrow).map_err(|err| {
+                format!("[ARBITRUM] failed to load retryable escrow for zombie materialization: {err}")
+            })?;
+            if let Some(escrow_account) = journal.evm_state_mut().get_mut(&escrow) {
+                escrow_account.mark_created();
+                escrow_account.mark_touch();
+            }
+        }
     } else if callvalue > U256::ZERO {
         let escrow = retryable_escrow_address(ticket_id);
         let transfer_error = journal.transfer(from, escrow, callvalue).map_err(|err| {
@@ -94,6 +119,9 @@ pub(crate) fn apply_retry_tx_post_execution<CTX: ArbContextTr>(
         })?;
         map_transfer_error(transfer_error, "retry callvalue return transfer")?;
     }
+    // A failed zero-callvalue redeem intentionally does nothing: the escrow was never
+    // materialized (the submit only recorded eligibility), so it stays absent — matching Nitro,
+    // where the failed redeem's resurrected zombie does not survive `Finalise`.
 
     Ok(())
 }

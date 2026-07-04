@@ -39,8 +39,14 @@ const ARBOS_VERSION_STYLUS: u64 = 30;
 /// (notably the deposit mint) and continues the block. So these are not fatal errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubmitRetryableOutcome {
-    /// Ticket created (with or without an auto-redeem scheduled). Receipt = success.
-    Created,
+    /// Ticket created. Receipt = success. `gas_used` is the value Nitro reports for the
+    /// submit tx's receipt: `0` when no auto-redeem is scheduled (Nitro `StartTxHook` returns
+    /// `ZeroGas` on the gas-too-low / can't-fund-gas path, `tx_processor.go:346`), or the
+    /// retryable's `usergas` when the auto-redeem *is* scheduled (Nitro returns
+    /// `SingleDimGas(usergas)`, `tx_processor.go:435`). The reserved `usergas` is charged as
+    /// the submit's gasUsed only in the latter case; the separate auto-redeem retry tx that
+    /// then runs carries its own receipt.
+    Created { gas_used: u64 },
     /// Submission failed a funds check after applying its partial state changes. Receipt
     /// = failed, gasUsed 0; the partial state (deposit mint, fee refunds) is kept.
     Failed,
@@ -337,8 +343,10 @@ pub(crate) fn apply_submit_retryable_tx<CTX: ArbContextTr>(
                 .map_err(|err| format!("[ARBITRUM] failed to transfer gas-cost refund: {err}"))?;
             map_transfer_error(transfer_error, "submit-retryable gas-cost refund transfer")?;
         }
-        // Ticket created but no auto-redeem (gas too low / can't fund gas): still a success.
-        return Ok(SubmitRetryableOutcome::Created);
+        // Ticket created but no auto-redeem (gas too low / can't fund gas): still a success,
+        // but Nitro returns `ZeroGas` for the submit receipt (no `usergas` is charged since the
+        // auto-redeem it would have paid for is not scheduled).
+        return Ok(SubmitRetryableOutcome::Created { gas_used: 0 });
     }
 
     let gascost = effective_base_fee.saturating_mul(U256::from(usergas));
@@ -395,38 +403,28 @@ pub(crate) fn apply_submit_retryable_tx<CTX: ArbContextTr>(
     // `util.TransferBalance(escrow, from, callvalue)`, and for `callvalue == 0` with
     // `ArbOSVersion < Stylus` the `from`-side of that transfer takes the
     // `CreateZombieIfDeleted(escrow)` branch (`arbos/util/transfer.go`). The escrow was
-    // destructed by the submit's own zero-value escrow touch earlier this block, so it is
-    // resurrected as a *present-but-empty* account that survives EIP-161 state-clearing
-    // (go-ethereum `statedb.Finalise` keeps accounts whose only journal entries are zombie
-    // entries). Because the submit and its auto-redeem are always in the same block, we
-    // materialize that identical end state here — avoiding cross-tx "destructed this block"
-    // tracking in the redeem hook — by marking the escrow Created + Touched. revm's commit
-    // then writes it via `newly_created` (revm-database `apply_account_state` checks
-    // `is_created` *before* the empty-clear), matching canonical (escrow present, nonce 0,
-    // balance 0, empty code/storage). Retryables with `callvalue > 0` don't hit this: their
-    // escrow holds the value across the submit and is emptied-then-cleared when the redeem
-    // moves it back out.
-    if call.retry_value == U256::ZERO {
+    // destructed by the submit's own zero-value escrow touch earlier this block, so it *can* be
+    // resurrected as a present-but-empty account — but go-ethereum's `Finalise` keeps that
+    // zombie only when the redeem SUCCEEDS (the `DeleteRetryable` path). A redeem that reverts
+    // (e.g. out of gas) leaves the escrow ABSENT — confirmed on Arb One via `eth_getProof`: the
+    // successful redeem at block 22209702 leaves the escrow present-empty, the OOG redeem at
+    // block 22307236 leaves it non-existent (an exclusion proof, not a zeroed leaf). Since the
+    // outcome isn't known until the redeem runs, we can't materialize the escrow here; instead
+    // record this ticket as zombie-eligible for the current block and let the redeem hook
+    // (`retry_tx.rs`) materialize the escrow iff it succeeds. Block-scoping the set (cleared
+    // each StartBlock) excludes later-block manual redeems, which see no same-block destruct and
+    // so never resurrect the escrow. Retryables with `callvalue > 0` don't hit this: their
+    // escrow holds the value across the submit and is emptied-then-cleared when the redeem moves
+    // it back out.
+    let track_zombie_escrow = if call.retry_value == U256::ZERO {
         let arbos_version = arbos_state
             .arbos_version
             .get(journal)
             .map_err(|err| format!("[ARBITRUM] failed to read ArbOS version: {err}"))?;
-        if arbos_version < ARBOS_VERSION_STYLUS {
-            let escrow = retryable_escrow_address(ticket_id);
-            // Materialize the escrow in journal state, then mark it Created + Touched directly.
-            // revm's `JournaledAccount` wrapper exposes neither flag, and
-            // `create_account_checkpoint` is unusable here — it forces nonce = 1 under
-            // SpuriousDragon, whereas the canonical zombie escrow has nonce 0. `ArbContextTr`
-            // pins `Journal::State = EvmState`, so `evm_state_mut()` yields the raw account map.
-            journal.load_account(escrow).map_err(|err| {
-                format!("[ARBITRUM] failed to load retryable escrow for zombie materialization: {err}")
-            })?;
-            if let Some(escrow_account) = journal.evm_state_mut().get_mut(&escrow) {
-                escrow_account.mark_created();
-                escrow_account.mark_touch();
-            }
-        }
-    }
+        arbos_version < ARBOS_VERSION_STYLUS
+    } else {
+        false
+    };
 
     let retry_tx_hash = TxRetry {
         chain_id: U256::from(chain_id),
@@ -455,7 +453,14 @@ pub(crate) fn apply_submit_retryable_tx<CTX: ArbContextTr>(
         submission_fee,
     ));
 
-    Ok(SubmitRetryableOutcome::Created)
+    // Journal borrow released above; record zombie-escrow eligibility for the same-block redeem.
+    if track_zombie_escrow {
+        ctx.chain_mut().pending_zombie_escrow_tickets.push(ticket_id);
+    }
+
+    // Auto-redeem scheduled: Nitro returns `SingleDimGas(usergas)`, so the submit tx's receipt
+    // gasUsed is the reserved `usergas`.
+    Ok(SubmitRetryableOutcome::Created { gas_used: usergas })
 }
 
 fn ticket_created_log(ticket_id: B256) -> Log {

@@ -1,4 +1,4 @@
-use revm::primitives::U256;
+use revm::primitives::{B256, U256};
 
 /// Arbitrum chain-scoped execution context carried alongside block/tx/cfg.
 ///
@@ -33,6 +33,14 @@ pub struct ArbChainContext {
     /// model to price page growth across the tx's (possibly nested) Stylus calls.
     pub stylus_pages_open: u16,
     pub stylus_pages_ever: u16,
+    /// Ticket ids of pre-Stylus (`ArbOS < 30`) zero-callvalue retryables *submitted in this
+    /// block*. Nitro's `util.TransferBalance` resurrects the escrow (destructed by the submit)
+    /// as a present-but-empty "zombie" only when a same-block redeem takes the
+    /// `CreateZombieIfDeleted` branch AND succeeds; a failed (e.g. OOG) redeem, or a redeem in a
+    /// later block, leaves the escrow ABSENT. The submit hook records the ticket here and the
+    /// redeem hook materializes the escrow only on success; cleared each `StartBlock` so that
+    /// later-block (manual) redeems — which see no same-block destruct — never resurrect it.
+    pub pending_zombie_escrow_tickets: Vec<B256>,
 }
 
 impl ArbChainContext {
@@ -48,6 +56,7 @@ impl ArbChainContext {
             paid_gas_price: 0,
             stylus_pages_open: 0,
             stylus_pages_ever: 0,
+            pending_zombie_escrow_tickets: Vec::new(),
         }
     }
 

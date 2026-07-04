@@ -212,6 +212,17 @@ where
         init_and_floor_gas: &mut InitialAndFloorGas,
     ) -> Result<u64, Self::Error> {
         if is_protocol_env_bypass_tx(evm) {
+            // Protocol txs (internal/deposit/submit-retryable/retry) carry no L1 poster cost and
+            // skip the GasChargingHook below, but they still execute EVM and must obey EIP-2929.
+            // `load_accounts` is what pre-warms the precompile addresses (revm pre_execution.rs) —
+            // Nitro's geth runs `Prepare` (which warms all active precompiles) for EVERY tx type, so
+            // skipping it here charged a COLD (2600) access instead of WARM (100) the first time a
+            // protocol tx touches a precompile. Observed as +2500 gas on a retry tx that STATICCALLs
+            // ArbSys (0x64) at Arb One block 22487517. Warm accounts (precompiles + set journal spec)
+            // before returning; we still skip caller-deduction + GasChargingHook (protocol txs are
+            // gas-prepaid and poster-cost-free).
+            self.load_accounts(evm)?;
+            evm.ctx_mut().chain_mut().reset_poster_state();
             return Ok(0);
         }
 
@@ -353,9 +364,10 @@ where
             let outcome = submit_retryable_tx::apply_submit_retryable_tx(evm.ctx_mut())
                 .map_err(|msg| ERROR::from_string(msg.into()))?;
             return Ok(match outcome {
-                // Ticket created: success receipt over the tx gas limit.
-                submit_retryable_tx::SubmitRetryableOutcome::Created => {
-                    submit_retryable_success_frame_result(evm.ctx().tx().gas_limit())
+                // Ticket created: success receipt. gasUsed is `usergas` only when the auto-redeem
+                // was scheduled, else 0 (Nitro `StartTxHook`); the outcome carries the value.
+                submit_retryable_tx::SubmitRetryableOutcome::Created { gas_used } => {
+                    submit_retryable_success_frame_result(gas_used)
                 }
                 // Funds check failed: Nitro records a failed tx (status 0, gasUsed 0) and
                 // keeps the partial state (deposit mint, fee refunds) instead of halting.
@@ -944,12 +956,12 @@ fn internal_success_frame_result() -> FrameResult {
     ))
 }
 
-fn submit_retryable_success_frame_result(gas_limit: u64) -> FrameResult {
+fn submit_retryable_success_frame_result(gas_used: u64) -> FrameResult {
     FrameResult::Call(CallOutcome::new(
         InterpreterResult::new(
             InstructionResult::Stop,
             Bytes::new(),
-            Gas::new_spent_with_reservoir(gas_limit, 0),
+            Gas::new_spent_with_reservoir(gas_used, 0),
         ),
         0..0,
     ))
@@ -1001,8 +1013,8 @@ where
             let outcome = submit_retryable_tx::apply_submit_retryable_tx(evm.ctx_mut())
                 .map_err(|msg| ERROR::from_string(msg.into()))?;
             return Ok(match outcome {
-                submit_retryable_tx::SubmitRetryableOutcome::Created => {
-                    submit_retryable_success_frame_result(evm.ctx().tx().gas_limit())
+                submit_retryable_tx::SubmitRetryableOutcome::Created { gas_used } => {
+                    submit_retryable_success_frame_result(gas_used)
                 }
                 submit_retryable_tx::SubmitRetryableOutcome::Failed => {
                     submit_retryable_failed_frame_result()
@@ -1541,8 +1553,8 @@ mod tests {
         );
         assert_eq!(
             out.result.gas_used(),
-            250_000,
-            "submit-retryable receipts should consume the user-specified gas limit"
+            0,
+            "submit-retryable with no scheduled auto-redeem reports gasUsed 0 (Nitro ZeroGas)"
         );
         assert_eq!(
             out.result.logs().len(),
@@ -1675,6 +1687,11 @@ mod tests {
                     && log.topics()[1] == ticket_id
             }),
             "missing RedeemScheduled log"
+        );
+        assert_eq!(
+            out.result.gas_used(),
+            21_000,
+            "submit-retryable with a scheduled auto-redeem charges the reserved usergas as gasUsed"
         );
     }
 
