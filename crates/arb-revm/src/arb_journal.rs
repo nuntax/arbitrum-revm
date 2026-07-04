@@ -79,6 +79,13 @@ pub trait ArbJournal {
     /// Emit a log.
     fn emit_log(&mut self, log: Log);
 
+    /// Transient-storage (EIP-1153 TLOAD) read. Used to read the current transaction's L1 poster
+    /// fee written by the gas-charging handler (see [`crate::constants::CURRENT_TX_L1_FEE_ADDR`]).
+    /// Lives on `ArbJournal` — rather than being read off the chain context — because the node-path
+    /// `EvmInternals` handle does not expose the chain context to precompiles, so transient storage
+    /// is the only value channel shared by both the in-EVM and node execution paths.
+    fn transient_load(&mut self, account: Address, slot: StorageKey) -> StorageValue;
+
     /// Keccak-256 of the concatenated `parts`. The default does NOT meter gas — system /
     /// start-block paths run under a non-metering burner, exactly like Nitro's `SystemBurner`.
     /// [`MeteredJournal`] overrides this to charge `30 + 6*words` per Nitro
@@ -185,6 +192,11 @@ impl<J: ArbJournal> ArbJournal for MeteredJournal<'_, J> {
         self.inner.emit_log(log);
     }
 
+    fn transient_load(&mut self, account: Address, slot: StorageKey) -> StorageValue {
+        // Not metered: Nitro reads the current tx's poster fee from a Go field, charging nothing.
+        self.inner.transient_load(account, slot)
+    }
+
     fn keccak(&mut self, parts: &[&[u8]]) -> B256 {
         let total: usize = parts.iter().map(|p| p.len()).sum();
         self.burn(keccak_gas(total));
@@ -252,6 +264,10 @@ where
     fn emit_log(&mut self, log: Log) {
         JournalTr::log(self, log);
     }
+
+    fn transient_load(&mut self, account: Address, slot: StorageKey) -> StorageValue {
+        JournalTr::tload(self, account, slot)
+    }
 }
 
 /// Node-path journal: a local newtype over alloy-evm's [`EvmInternals`] state handle.
@@ -313,6 +329,10 @@ impl ArbJournal for ArbInternals<'_, '_> {
 
     fn emit_log(&mut self, log: Log) {
         self.0.log(log);
+    }
+
+    fn transient_load(&mut self, account: Address, slot: StorageKey) -> StorageValue {
+        self.0.tload(account, slot)
     }
 }
 

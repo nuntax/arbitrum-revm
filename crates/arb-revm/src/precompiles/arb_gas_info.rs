@@ -1,5 +1,5 @@
 use super::*;
-use crate::arb_journal::ArbPrecompileCtx;
+use crate::arb_journal::{ArbJournal, ArbPrecompileCtx, MeteredJournal};
 
 const ASSUMED_SIMPLE_TX_SIZE: u64 = 140;
 const TX_DATA_NON_ZERO_GAS_EIP2028: u64 = 16;
@@ -20,16 +20,25 @@ where
 
     let state = ArbosState::open();
     let l2_gas_price = U256::from(ctx.block_basefee());
-    let j = ctx.journal_mut();
 
-    match call {
+    // ArbOS version is a cached field on Nitro's opened `ArbosState` (no per-read storage charge),
+    // so read it through the raw journal to keep it unmetered. Every other ArbOS-storage read below
+    // goes through `MeteredJournal`, which bills 800 gas per read (Nitro's precompile burner /
+    // `StorageReadCost`) on top of the per-call OpenArbosState charge already folded in by
+    // `arbos_call_extra_gas`. Without this the getters undercharged their storage reads — e.g.
+    // getPricesInArbGas (1 read) billed 800 too little per call (Arb One block 23372325 tx[1]:
+    // 2 getPricesInArbGas calls = −1600 computation gas → wrong receipt gasUsed → fee mispricing).
+    let arbos_version = match state.arbos_version.get(ctx.journal_mut()) {
+        Ok(v) => v,
+        Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+    };
+    let mut journal = MeteredJournal::new(ctx.journal_mut());
+    let j = &mut journal;
+
+    let mut result = match call {
         ArbGasInfo::ArbGasInfoCalls::getPricesInWei(_) => {
             // (perL2Tx, perL1CalldataUnit, perStorageAllocation,
             //  perArbGasBase, perArbGasCongestion, perArbGasTotal)
-            let arbos_version = match state.arbos_version.get(j) {
-                Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
-            };
             let min_base_fee = match state.l2_pricing.min_base_fee_wei.get(j) {
                 Ok(v) => v,
                 Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
@@ -63,10 +72,6 @@ where
         }
         ArbGasInfo::ArbGasInfoCalls::getPricesInWeiWithAggregator(_) => {
             // Deprecated aggregator path; return same as getPricesInWei.
-            let arbos_version = match state.arbos_version.get(j) {
-                Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
-            };
             let min_base_fee = match state.l2_pricing.min_base_fee_wei.get(j) {
                 Ok(v) => v,
                 Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
@@ -100,10 +105,6 @@ where
         }
         ArbGasInfo::ArbGasInfoCalls::getPricesInArbGas(_) => {
             // (perL2Tx, perL1Calldata, perStorageAllocation)
-            let arbos_version = match state.arbos_version.get(j) {
-                Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
-            };
             let l1_price = match state.l1_pricing.price_per_unit.get(j) {
                 Ok(v) => v,
                 Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
@@ -134,10 +135,6 @@ where
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getPricesInArbGasWithAggregator(_) => {
-            let arbos_version = match state.arbos_version.get(j) {
-                Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
-            };
             let l1_price = match state.l1_pricing.price_per_unit.get(j) {
                 Ok(v) => v,
                 Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
@@ -257,10 +254,14 @@ where
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getCurrentTxL1GasFees(_) => {
-            // Current tx L1 fees are tracked in transient state; return 0 here.
+            // Nitro returns txProcessor.PosterFee — the L1 poster fee charged to the current tx,
+            // set in GasChargingHook. The gas-charging handler publishes it to a transient-storage
+            // slot (CURRENT_TX_L1_FEE_ADDR); read it back here so both the in-EVM and node execution
+            // paths agree (the node-path EvmInternals handle cannot expose the chain context).
+            let fee = j.transient_load(crate::constants::CURRENT_TX_L1_FEE_ADDR, U256::ZERO);
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(U256::ZERO,)),
+                alloy_core::sol_types::SolValue::abi_encode(&(fee,)),
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getGasBacklog(_) => {
@@ -400,5 +401,15 @@ where
                 alloy_core::sol_types::SolValue::abi_encode(&(limit,)),
             )
         }
+    };
+
+    // Fold the per-read storage gas the method burned (via MeteredJournal) into the call's result,
+    // matching Nitro's precompile burner. Reverts already consume all gas, so this only affects the
+    // success paths.
+    let burned = journal.burned;
+    if !result.gas.record_regular_cost(burned) {
+        result.result = revm::interpreter::InstructionResult::OutOfGas;
+        result.output = revm::primitives::Bytes::new();
     }
+    result
 }

@@ -4,7 +4,7 @@ use crate::{
     constants::{
         ARB_RETRYABLE_TX_ADDRESS, ARBITRUM_DEPOSIT_TX_TYPE, ARBITRUM_INTERNAL_TX_TYPE,
         ARBITRUM_RETRY_TX_TYPE, ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE, ARBOS_ACTS_ADDRESS,
-        BATCH_POSTER_ADDRESS, L1_PRICER_FUNDS_POOL_ADDRESS,
+        BATCH_POSTER_ADDRESS, CURRENT_TX_L1_FEE_ADDR, L1_PRICER_FUNDS_POOL_ADDRESS,
     },
     deposit_tx, internal_tx,
     l1_cost::{compute_poster_info, encode_tx_bytes},
@@ -223,6 +223,15 @@ where
             // gas-prepaid and poster-cost-free).
             self.load_accounts(evm)?;
             evm.ctx_mut().chain_mut().reset_poster_state();
+            // Protocol txs carry no L1 poster fee; publish 0 so a getCurrentTxL1GasFees call within
+            // this tx reads 0 rather than a value leaked from a prior tx (belt-and-braces: revm also
+            // clears transient storage per tx).
+            JournalTr::tstore(
+                evm.ctx_mut().journal_mut(),
+                CURRENT_TX_L1_FEE_ADDR,
+                U256::ZERO,
+                U256::ZERO,
+            );
             return Ok(0);
         }
 
@@ -337,6 +346,16 @@ where
             ctx.chain_mut().poster_gas = info.poster_gas;
             ctx.chain_mut().poster_fee = info.poster_fee;
             ctx.chain_mut().hold_gas = hold_gas;
+
+            // Publish the current tx's L1 poster fee for ArbGasInfo.getCurrentTxL1GasFees (Nitro:
+            // txProcessor.PosterFee). Transient storage is the only channel the node-path precompile
+            // (over EvmInternals, which hides the chain context) can read; not consensus state.
+            JournalTr::tstore(
+                ctx.journal_mut(),
+                CURRENT_TX_L1_FEE_ADDR,
+                U256::ZERO,
+                info.poster_fee,
+            );
         }
 
         // In revm, pre_execution's return value is interpreted as an EIP-7702 refund delta,
