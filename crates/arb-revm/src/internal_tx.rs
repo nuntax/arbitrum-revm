@@ -193,6 +193,8 @@ fn apply_start_block<CTX: ArbContextTr>(ctx: &mut CTX, input: &Bytes) -> Result<
         upgrade_arbos_version(
             arbos_version,
             upgrade_version,
+            // A runtime upgrade is never the firstTime (genesis) path.
+            false,
             &arbos_state,
             journal,
         )
@@ -221,6 +223,10 @@ fn apply_start_block<CTX: ArbContextTr>(ctx: &mut CTX, input: &Bytes) -> Result<
 pub(crate) fn upgrade_arbos_version<J: JournalTr>(
     current_version: u64,
     target_version: u64,
+    // Mirrors Nitro's `firstTime` flag: true for the genesis cascade (`UpgradeArbosVersion(desired,
+    // firstTime=true)`), false for a runtime upgrade. A few steps (e.g. v11's chain-owner list
+    // clear) run only when NOT firstTime.
+    first_time: bool,
     state: &ArbosState,
     journal: &mut J,
 ) -> Result<(), String> {
@@ -276,9 +282,14 @@ pub(crate) fn upgrade_arbos_version<J: JournalTr>(
                         .amortized_cost_cap_bips
                         .set(0_u64, journal);
                 }
-                // chain_owners list clear is a no-op here (list integrity is managed by
-                // the AddressSet implementation; clearing is only needed for firstTime init,
-                // which is not our concern during normal block execution).
+                // Clear the chain-owners list, but only on a runtime upgrade: Nitro guards this
+                // with `if !firstTime { chainOwners.ClearList() }`, so the genesis cascade must
+                // NOT run it (a chain genesis'd at >= v11 keeps its owner list). It zeroes the list
+                // slots + size (members stay in the by-address mapping), a real storage write:
+                // skipping it on a runtime upgrade diverges the state root at the v11 block.
+                if !first_time {
+                    let _ = state.chain_owners.clear_list(journal);
+                }
             }
             // v12-v19: reserved for Orbit chains; no mainnet state changes.
             12..=19 => {}

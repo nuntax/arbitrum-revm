@@ -64,6 +64,26 @@ impl AddressSet {
         Ok(members)
     }
 
+    /// Clears the list (the 1-indexed slots and the size), leaving the by-address mapping intact.
+    /// Mirrors Nitro `AddressSet.ClearList`: it zeroes each list slot `1..=size` and resets the
+    /// size to 0, so the members remain resolvable via the mapping until it is rectified. The v11
+    /// ArbOS upgrade calls this to allow later rectification of the chain-owners mapping.
+    pub fn clear_list<J: ArbJournal>(&self, journal: &mut J) -> Result<()> {
+        let size = self.size.get(journal)?;
+        if size == 0 {
+            return Ok(());
+        }
+        for i in 1..=size {
+            self.backing.set(
+                FixedBytes::from(U256::from(i).to_be_bytes()),
+                U256::ZERO,
+                journal,
+            )?;
+        }
+        self.size.set(0, journal)?;
+        Ok(())
+    }
+
     pub fn remove<J: ArbJournal>(&self, address: Address, journal: &mut J) -> Result<()> {
         let address_value = address_to_u256(address);
         let position = self

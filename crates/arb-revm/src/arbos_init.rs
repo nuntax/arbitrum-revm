@@ -551,7 +551,8 @@ pub fn initialize_arbos_state<J: JournalTr>(
     // 8. Run the per-version migration cascade up to the target version (Nitro's
     //    UpgradeArbosVersion(desired, firstTime=true)). See the module note on Stylus state.
     if config.initial_arbos_version > 1 {
-        upgrade_arbos_version(1, config.initial_arbos_version, &state, journal)?;
+        // Genesis is Nitro's firstTime cascade: first_time = true.
+        upgrade_arbos_version(1, config.initial_arbos_version, true, &state, journal)?;
     }
 
     // 9. firstTime block (Nitro arbosState.go UpgradeArbosVersion lines 519-526): runs ONCE
