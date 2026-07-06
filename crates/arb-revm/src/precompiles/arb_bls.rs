@@ -2,7 +2,7 @@ use super::revert_result;
 use crate::arb_journal::ArbPrecompileCtx;
 use revm::interpreter::InterpreterResult;
 
-/// ArbBLS — legacy BLS public key registry from Classic-era Arbitrum.
+/// ArbBLS, legacy BLS public key registry from Classic-era Arbitrum.
 ///
 /// In Nitro this precompile has no active methods; the struct exists solely to
 /// occupy address 0x67 in the registry.  Any call is treated as a call to a

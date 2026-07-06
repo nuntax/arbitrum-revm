@@ -4,22 +4,22 @@
 //!
 //! ## Why this exists
 //! reth v2.0.0's `ConfigureEvm` hard-requires `EvmFactory<…, Precompiles = PrecompilesMap, …>`.
-//! `PrecompilesMap` holds `DynPrecompile`s — boxed closures invoked with a `PrecompileInput`
+//! `PrecompilesMap` holds `DynPrecompile`s, boxed closures invoked with a `PrecompileInput`
 //! carrying an [`EvmInternals`] state handle, NOT a revm `Context`. ArbOS precompiles, however,
 //! are written against `ContextTr<Journal: JournalTr>`. This module bridges the two with two
 //! traits, so the *same* precompile bodies (hence the same parity-validated logic) serve both
 //! paths:
 //!
-//! * [`ArbJournal`] — the handful of journal ops ArbOS storage actually performs (slot read/write,
+//! * [`ArbJournal`], the handful of journal ops ArbOS storage actually performs (slot read/write,
 //!   balance read, balance debit, code read, log emit).
-//! * [`ArbPrecompileCtx`] — what a precompile body reads beyond the journal: block
+//! * [`ArbPrecompileCtx`], what a precompile body reads beyond the journal: block
 //!   basefee/number/timestamp, tx origin, and call depth.
 //!
 //! Both are blanket-impl'd for the in-EVM types (`JournalTr` / `ContextTr`) and concretely for the
 //! node path ([`EvmInternals`] / [`ArbNodeCtx`]). Because `JournalTr ⟹ ArbJournal` and
 //! `ContextTr ⟹ ArbPrecompileCtx` are strict supersets, migrating a storage accessor or a
 //! precompile from the revm bound to the `Arb*` bound is fully backward-compatible with the
-//! existing in-EVM dispatcher — the crate compiles and every existing test passes after each
+//! existing in-EVM dispatcher, the crate compiles and every existing test passes after each
 //! individual conversion.
 
 use alloy_evm::{EvmInternals, EvmInternalsError};
@@ -81,12 +81,12 @@ pub trait ArbJournal {
 
     /// Transient-storage (EIP-1153 TLOAD) read. Used to read the current transaction's L1 poster
     /// fee written by the gas-charging handler (see [`crate::constants::CURRENT_TX_L1_FEE_ADDR`]).
-    /// Lives on `ArbJournal` — rather than being read off the chain context — because the node-path
+    /// Lives on `ArbJournal`, rather than being read off the chain context, because the node-path
     /// `EvmInternals` handle does not expose the chain context to precompiles, so transient storage
     /// is the only value channel shared by both the in-EVM and node execution paths.
     fn transient_load(&mut self, account: Address, slot: StorageKey) -> StorageValue;
 
-    /// Keccak-256 of the concatenated `parts`. The default does NOT meter gas — system /
+    /// Keccak-256 of the concatenated `parts`. The default does NOT meter gas, system /
     /// start-block paths run under a non-metering burner, exactly like Nitro's `SystemBurner`.
     /// [`MeteredJournal`] overrides this to charge `30 + 6*words` per Nitro
     /// `arbos/storage/storage.go Storage.Keccak`, so ArbOS-storage keccaks performed inside a
@@ -101,7 +101,7 @@ pub trait ArbJournal {
 }
 
 /// Flat per-operation ArbOS storage gas costs (Nitro `arbos/storage/storage.go`). These are NOT
-/// the EIP-2929 cold/warm/refund schedule — ArbOS bills a flat amount per op through its burner.
+/// the EIP-2929 cold/warm/refund schedule, ArbOS bills a flat amount per op through its burner.
 pub const STORAGE_READ_COST: u64 = 800; // params.SloadGasEIP2200
 pub const STORAGE_WRITE_COST: u64 = 20_000; // params.SstoreSetGasEIP2200
 pub const STORAGE_WRITE_ZERO_COST: u64 = 5_000; // params.SstoreResetGasEIP2200
@@ -115,7 +115,7 @@ fn keccak_gas(byte_len: usize) -> u64 {
 }
 
 /// An [`ArbJournal`] wrapper that meters the gas an ArbOS precompile body burns on storage
-/// reads/writes, keccaks, and event emission — mirroring Nitro's precompile `Burner`, which
+/// reads/writes, keccaks, and event emission, mirroring Nitro's precompile `Burner`, which
 /// accumulates these per-op costs and folds them into the call's gas. Delegates every op to the
 /// inner journal; balance reads/debits/transfers are not metered (Nitro charges those through the
 /// EVM/state, not the burner). Read [`Self::burned`] after the metered section and record it onto
@@ -276,7 +276,7 @@ where
 /// impl collides with the `impl<J: JournalTr> ArbJournal for J` blanket under E0119, because rustc
 /// cannot prove the *foreign* `EvmInternals` does not implement `JournalTr`. For this *local* type,
 /// rustc has complete knowledge of its `JournalTr` impls (there are none) and the orphan rule bars
-/// any other crate from adding one — so the blanket and this impl are provably disjoint.
+/// any other crate from adding one, so the blanket and this impl are provably disjoint.
 pub struct ArbInternals<'a, 'b>(pub &'b mut EvmInternals<'a>);
 
 impl ArbJournal for ArbInternals<'_, '_> {
@@ -344,7 +344,7 @@ pub trait ArbPrecompileCtx {
     /// Mutable access to the journal (ArbOS storage reads/writes go through this).
     fn journal_mut(&mut self) -> &mut Self::Journal;
 
-    /// `block.basefee` — the current L2 base fee (wei).
+    /// `block.basefee`, the current L2 base fee (wei).
     fn block_basefee(&self) -> u64;
 
     /// `block.number`.
@@ -353,7 +353,7 @@ pub trait ArbPrecompileCtx {
     /// `block.timestamp`.
     fn block_timestamp(&self) -> u64;
 
-    /// Transaction origin (the signer), i.e. revm `tx.caller()`. NOT the immediate CALL caller —
+    /// Transaction origin (the signer), i.e. revm `tx.caller()`. NOT the immediate CALL caller
     /// that is supplied per-call (see the dispatcher's `ArbCall`).
     fn tx_caller(&self) -> Address;
 
@@ -440,7 +440,7 @@ impl<'a, 'b> ArbNodeCtx<'a, 'b> {
     /// Builds a node-path precompile context over an `EvmInternals` handle.
     ///
     /// `EvmInternals` does not expose the EVM call depth, so it is passed in. It is best-effort on
-    /// this path (the alloy-evm `PrecompileInput` carries no depth) — see `ArbSys.isTopLevelCall`.
+    /// this path (the alloy-evm `PrecompileInput` carries no depth), see `ArbSys.isTopLevelCall`.
     pub fn new(internals: &'b mut EvmInternals<'a>, call_depth: usize) -> Self {
         Self { journal: ArbInternals(internals), call_depth }
     }

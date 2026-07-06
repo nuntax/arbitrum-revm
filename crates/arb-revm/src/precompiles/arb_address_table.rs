@@ -26,7 +26,7 @@ where
     // args/result/OpenArbosState charge that `arbos_call_extra_gas` already folds in. Route the
     // table ops through `MeteredJournal` and add its total to the call's gas. Example: `lookupIndex`
     // reads `numItems` + the address (2×800=1600), so canonical bills 806+1600 = 2406; without
-    // this we'd undercharge 1600 per call (Arb One block 22211284 tx[1]: 4 lookups = −6400 gas).
+    // this we'd undercharge 1600 per call.
     let mut journal = MeteredJournal::new(ctx.journal_mut());
 
     let mut result = match call {

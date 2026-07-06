@@ -9,7 +9,7 @@ pub struct ArbChainContext {
     /// Sequencer feed sequence number for this message.
     pub sequence_number: Option<u64>,
     /// L1 block number for this L2 block. On Arbitrum the EVM `NUMBER` opcode
-    /// (`block.number`) returns this, NOT the L2 block number — Nitro patches
+    /// (`block.number`) returns this, NOT the L2 block number, Nitro patches
     /// `opNumber` to read `ProcessingHook.L1BlockNumber` while keeping the L2
     /// number for chain rules. Block-scoped: set once when the block is built.
     pub l1_block_number: u64,
@@ -39,7 +39,7 @@ pub struct ArbChainContext {
     /// `CreateZombieIfDeleted` branch AND succeeds; a failed (e.g. OOG) redeem, or a redeem in a
     /// later block, leaves the escrow ABSENT. The submit hook records the ticket here and the
     /// redeem hook materializes the escrow only on success; cleared each `StartBlock` so that
-    /// later-block (manual) redeems — which see no same-block destruct — never resurrect it.
+    /// later-block (manual) redeems, which see no same-block destruct, never resurrect it.
     pub pending_zombie_escrow_tickets: Vec<B256>,
 }
 

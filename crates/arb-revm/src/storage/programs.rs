@@ -109,7 +109,7 @@ pub mod stylus_param_layout {
 
 /// Stored metadata for an activated Stylus program (Nitro `Program`), read from the
 /// program_data mapping. These are the values set at activation time and are the source of
-/// truth for init/page gas — Nitro reads them rather than re-deriving from the WASM.
+/// truth for init/page gas, Nitro reads them rather than re-deriving from the WASM.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProgramInfo {
     pub version: u16,
@@ -165,7 +165,7 @@ impl ArbosPrograms {
     ///
     /// 1. `initStylusParams`: builds and writes the packed 32-byte params word.
     /// 2. `initDataPricer`: sets the non-zero data-pricer fields.
-    /// 3. `cacheManagers`: Nitro calls `addressSet.Initialize` which sets slot 0 to 0 —
+    /// 3. `cacheManagers`: Nitro calls `addressSet.Initialize` which sets slot 0 to 0
     ///    a SSTORE no-op on a fresh trie, so we do nothing here.
     pub fn initialize<J: ArbJournal>(
         &self,
@@ -431,7 +431,7 @@ mod tests {
         assert_eq!(unpack_uint(&word, l::MIN_INIT_GAS.0, l::MIN_INIT_GAS.1), 69, "MinInitGas must be 69 after v31");
         // v40 stored MaxWasmSize = 128 * 1024 = 131072.
         assert_eq!(unpack_uint(&word, l::MAX_WASM_SIZE.0, l::MAX_WASM_SIZE.1), 131_072, "MaxWasmSize must be 131072 at v40");
-        // v50 not yet reached — MaxStackDepth still 262144.
+        // v50 not yet reached, MaxStackDepth still 262144.
         assert_eq!(unpack_uint(&word, l::MAX_STACK_DEPTH.0, l::MAX_STACK_DEPTH.1), 262_144, "MaxStackDepth unchanged before v50");
         // MaxFragmentCount not yet set (v60 not reached).
         assert_eq!(unpack_uint(&word, l::MAX_FRAGMENT_COUNT.0, l::MAX_FRAGMENT_COUNT.1), 0, "MaxFragmentCount 0 before v60");

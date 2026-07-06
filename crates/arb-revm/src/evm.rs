@@ -42,8 +42,7 @@ where
 /// Mirrors Nitro's patched `GetHashFn` (`go-ethereum`), which reads `state.blockhashes`
 /// (the last 256 L1 block hashes recorded by `Blockhashes.RecordNewL1Block`). The stock
 /// revm instruction compares the requested number against the **L2** block number and so
-/// returns 0 for any L1 number — diverging the first time a tx reads `BLOCKHASH(l1Num)`
-/// (Arb One block 22220937 tx[1]: −19900 gas + a zeroed log/state hash). The internal
+/// returns 0 for any L1 number, diverging the first time a tx reads `BLOCKHASH(l1Num)`. The internal
 /// ArbOS-storage read is unmetered (matching geth's free `GetHashFn`); only the fixed
 /// 20-gas table cost applies.
 fn arb_block_hash<CTX>(ctx: InstructionContext<'_, CTX, EthInterpreter>) -> InstructionExecResult

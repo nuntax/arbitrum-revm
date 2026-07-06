@@ -3,7 +3,7 @@
 //! Maps one Arbitrum sequencer [`BroadcastFeedMessage`] into the [`ArbMessageEnvelope`] /
 //! [`ArbExecutionInput`] the executor consumes. One feed message produces one block; the parent
 //! header is supplied by the caller from the node's chain tip (it is *not* carried in the message).
-//! This is the message half of Nitro's block production — the L2 transaction decode is delegated to
+//! This is the message half of Nitro's block production, the L2 transaction decode is delegated to
 //! [`arb_sequencer_network::reader::parse_message`] (verified against Nitro `arbos/parse_l2.go`).
 
 use crate::executor::contract::{

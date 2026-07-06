@@ -25,9 +25,7 @@ where
     // so read it through the raw journal to keep it unmetered. Every other ArbOS-storage read below
     // goes through `MeteredJournal`, which bills 800 gas per read (Nitro's precompile burner /
     // `StorageReadCost`) on top of the per-call OpenArbosState charge already folded in by
-    // `arbos_call_extra_gas`. Without this the getters undercharged their storage reads — e.g.
-    // getPricesInArbGas (1 read) billed 800 too little per call (Arb One block 23372325 tx[1]:
-    // 2 getPricesInArbGas calls = −1600 computation gas → wrong receipt gasUsed → fee mispricing).
+    // `arbos_call_extra_gas`. Without this the getters undercharged their storage reads by 800 per read, mispricing the receipt gasUsed.
     let arbos_version = match state.arbos_version.get(ctx.journal_mut()) {
         Ok(v) => v,
         Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
@@ -254,7 +252,7 @@ where
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getCurrentTxL1GasFees(_) => {
-            // Nitro returns txProcessor.PosterFee — the L1 poster fee charged to the current tx,
+            // Nitro returns txProcessor.PosterFee, the L1 poster fee charged to the current tx,
             // set in GasChargingHook. The gas-charging handler publishes it to a transient-storage
             // slot (CURRENT_TX_L1_FEE_ADDR); read it back here so both the in-EVM and node execution
             // paths agree (the node-path EvmInternals handle cannot expose the chain context).

@@ -404,11 +404,11 @@ pub(crate) fn apply_submit_retryable_tx<CTX: ArbContextTr>(
     // `ArbOSVersion < Stylus` the `from`-side of that transfer takes the
     // `CreateZombieIfDeleted(escrow)` branch (`arbos/util/transfer.go`). The escrow was
     // destructed by the submit's own zero-value escrow touch earlier this block, so it *can* be
-    // resurrected as a present-but-empty account — but go-ethereum's `Finalise` keeps that
+    // resurrected as a present-but-empty account, but go-ethereum's `Finalise` keeps that
     // zombie only when the redeem SUCCEEDS (the `DeleteRetryable` path). A redeem that reverts
-    // (e.g. out of gas) leaves the escrow ABSENT — confirmed on Arb One via `eth_getProof`: the
-    // successful redeem at block 22209702 leaves the escrow present-empty, the OOG redeem at
-    // block 22307236 leaves it non-existent (an exclusion proof, not a zeroed leaf). Since the
+    // (e.g. out of gas) leaves the escrow ABSENT, confirmed on Arb One via `eth_getProof`: a
+    // successful redeem leaves the escrow present-empty, an OOG redeem leaves it non-existent
+    // (an exclusion proof, not a zeroed leaf). Since the
     // outcome isn't known until the redeem runs, we can't materialize the escrow here; instead
     // record this ticket as zombie-eligible for the current block and let the redeem hook
     // (`retry_tx.rs`) materialize the escrow iff it succeeds. Block-scoping the set (cleared

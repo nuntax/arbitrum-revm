@@ -6,10 +6,10 @@
 //! the transactions as received over RPC, and the values Nitro produced for them.
 //!
 //! The flow is:
-//!  * **record** — wrap a live state source in [`RecordingDb`] while replaying a block
+//!  * **record**, wrap a live state source in [`RecordingDb`] while replaying a block
 //!    so every account / storage slot / blockhash the block touches is logged, then
 //!    serialize the result with the transactions and Nitro's receipts.
-//!  * **replay** — [`replay_fixture`] seeds an in-memory DB from the snapshot, runs
+//!  * **replay**, [`replay_fixture`] seeds an in-memory DB from the snapshot, runs
 //!    each transaction through the same conversion + handler the binary uses, and
 //!    diffs the outcome against the recorded expectations.
 //!
@@ -52,7 +52,7 @@ pub struct ReplayFixture {
     pub transactions: Vec<RpcArbTransaction>,
     /// Per-transaction outcomes Nitro produced (the parity oracle).
     pub expected: Vec<ExpectedTx>,
-    /// Nitro's post-block state for every account/slot the engine wrote — the
+    /// Nitro's post-block state for every account/slot the engine wrote, the
     /// state-parity oracle. Captured at block `N` for exactly the accounts and
     /// slots our execution touched. Empty when not recorded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -168,7 +168,7 @@ impl ReplayReport {
 ///
 /// Because reads only miss through to the inner source on first access, and commits
 /// land in the outer cache rather than here, the recorded set is exactly the block's
-/// prestate — minimal and free of values produced during execution.
+/// prestate, minimal and free of values produced during execution.
 pub struct RecordingDb<DB> {
     inner: DB,
     recorded: RefCell<Recorded>,

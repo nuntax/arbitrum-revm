@@ -45,7 +45,7 @@ const EXEC_MAX_ATTEMPTS: usize = 8;
 
 /// Wraps [`AlloyDB`] to distinguish a genuinely non-existent account from an existing
 /// empty one. Over RPC both read back as zero-balance / zero-nonce / empty-code, so plain
-/// `AlloyDB` always returns `Some(empty)` — which makes revm treat absent accounts as
+/// `AlloyDB` always returns `Some(empty)`, which makes revm treat absent accounts as
 /// existing, corrupting EIP-7702 refunds, empty-account gas, and (provider-dependently)
 /// the write set. For an empty-looking account we run one `eth_getProof` and, if its
 /// account proof proves *absence* under the state root, return `None` like a real
@@ -381,7 +381,7 @@ async fn verify_writes_against_state_root<P: Provider<Arbitrum>>(
         .await?;
 
         // 1) Prove the canonical account (nonce/balance/storageRoot/codeHash) is committed
-        //    in the block's state root — authenticates the values we compare against.
+        //    in the block's state root, authenticates the values we compare against.
         let account = TrieAccount {
             nonce: proof.nonce,
             balance: proof.balance,
@@ -475,7 +475,7 @@ async fn witness_state_root_check<P: Provider<Arbitrum>>(
     // storage-root recompute cannot reconstruct a deletion-induced trie branch-collapse when
     // the surviving sibling is revealed only by hash, so it can produce a wrong storage root
     // (hence a wrong account leaf) even when our writes are correct. On a root mismatch these
-    // accounts are rechecked against the canonical block-N proof — see `deletion_collapse_recheck`.
+    // accounts are rechecked against the canonical block-N proof, see `deletion_collapse_recheck`.
     let mut deletion_accounts: Vec<(Address, Nibbles, u64, U256, B256)> = Vec::new();
 
     for (address, expected) in writes {
@@ -555,7 +555,7 @@ async fn witness_state_root_check<P: Provider<Arbitrum>>(
             },
         );
 
-        // EIP-161: an account that becomes empty is removed from the trie — UNLESS our
+        // EIP-161: an account that becomes empty is removed from the trie, UNLESS our
         // execution explicitly materialized it (revm `Created`). A created account is written
         // by revm-database `newly_created` even when empty (the `is_created` check precedes the
         // empty-clear), which is how the ArbOS pre-Stylus "zombie escrow" stays present.
@@ -611,8 +611,8 @@ async fn witness_state_root_check<P: Provider<Arbitrum>>(
     // The witness recompute mismatched. Before reporting a divergence, rule out the recompute's
     // deletion-collapse blind spot (a wrong storage root for an account whose write-set deleted a
     // slot): re-derive each such account's leaf from the canonical block-N proof, after verifying
-    // our writes are consistent with it, then recompute. A genuine missing/extra write — to any
-    // non-deleting account, or a wrong value in a deleting one — still surfaces as a mismatch.
+    // our writes are consistent with it, then recompute. A genuine missing/extra write, to any
+    // non-deleting account, or a wrong value in a deleting one, still surfaces as a mismatch.
     deletion_collapse_recheck(
         provider,
         block_number,
@@ -631,7 +631,7 @@ async fn witness_state_root_check<P: Provider<Arbitrum>>(
 /// (see [`recompute_root`]) from a real state divergence.
 ///
 /// For each account whose write-set deleted a slot, the witness storage-root recompute may be
-/// wrong, so we trust the canonical block-N proof for that account's leaf — but only after proving
+/// wrong, so we trust the canonical block-N proof for that account's leaf, but only after proving
 /// our execution agrees with it: our nonce/balance/code must equal canonical@N, and every slot we
 /// wrote must hold our value at canonical@N (sets present, deletes ⇒ 0). We then substitute the
 /// (collapse-free) canonical@N storage root into the account leaf and recompute. If it now matches,
@@ -640,7 +640,7 @@ async fn witness_state_root_check<P: Provider<Arbitrum>>(
 ///
 /// Residual blind spot (documented, deferred to the full-trie node): a slot Nitro changed in a
 /// *storage-deleting* account that we did not write is masked, because we adopt canonical@N's
-/// storage root without recomputing it. Missing writes to any other account — and all wrong values —
+/// storage root without recomputing it. Missing writes to any other account, and all wrong values
 /// are still caught.
 #[allow(clippy::too_many_arguments)]
 async fn deletion_collapse_recheck<P: Provider<Arbitrum>>(
@@ -723,7 +723,7 @@ async fn deletion_collapse_recheck<P: Provider<Arbitrum>>(
     if rechecked == post_state_root {
         eprintln!(
             "  note: block {block_number} hit the storage-deletion collapse blind spot; \
-             verified against canonical@N leaf substitution for {} account(s) — state is correct",
+             verified against canonical@N leaf substitution for {} account(s), state is correct",
             deletion_accounts.len()
         );
         Ok(None)
@@ -896,7 +896,7 @@ async fn main() -> Result<()> {
         println!("debug trace output parity: unavailable (skipping byte-level output checks)");
     }
 
-    // State root at the parent (N-1) block — anchors the non-existence proofs in the
+    // State root at the parent (N-1) block, anchors the non-existence proofs in the
     // existence-aware DB so absent accounts read back as `None`, not `Some(empty)`.
     let parent_state_root =
         retry_read(|| provider.get_block_by_number(BlockNumberOrTag::Number(state_block_number)))
@@ -1193,8 +1193,8 @@ async fn main() -> Result<()> {
                 );
             }
             Some(diag) => {
-                // Root diverged — localize with the per-write proof check (Stage 1).
-                println!("state-root parity: MISMATCH — {diag}");
+                // Root diverged, localize with the per-write proof check (Stage 1).
+                println!("state-root parity: MISMATCH, {diag}");
                 let state_errors = verify_writes_against_state_root(
                     &provider,
                     block_number,
@@ -1346,7 +1346,7 @@ async fn build_expected_state<P: Provider<Arbitrum>>(
 }
 
 /// Fetches a receipt, retrying when the (load-balanced) endpoint transiently returns
-/// `null` — dRPC and similar LBs route requests across backends with differing archive
+/// `null`, dRPC and similar LBs route requests across backends with differing archive
 /// depth, so a receipt that's missing on one node is usually present on a retry.
 async fn fetch_receipt<P: Provider<Arbitrum>>(
     provider: &P,

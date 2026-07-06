@@ -3,7 +3,7 @@
 //! Given a set of Merkle-proof nodes (from `eth_getProof`) anchored to a known trie
 //! root, plus a set of updates, this recomputes the resulting root. Untouched subtrees
 //! are carried by their committed hash (via `HashBuilder::add_branch`), so a change that
-//! *should* have happened but didn't surfaces as a root mismatch — the blind spot that
+//! *should* have happened but didn't surfaces as a root mismatch, the blind spot that
 //! the per-write proof check (`verify_writes_against_state_root`) structurally cannot see.
 //!
 //! Both the account trie and each storage trie are the same secure-MPT shape (32-byte

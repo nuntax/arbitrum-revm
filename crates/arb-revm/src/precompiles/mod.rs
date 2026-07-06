@@ -65,7 +65,6 @@ use common::input_bytes;
 
 // Stylus params are now read/written through the packed word helpers in
 // ArbosPrograms::read_params_word / write_params_word (see storage/programs.rs).
-// The old per-slot WASM_*_OFFSET constants have been removed.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArbPrecompilesEnum {
@@ -146,11 +145,11 @@ impl ArbPrecompilesEnum {
             return gated_revert_result(gas_limit);
         }
         let mut result = self.dispatch(ctx, call);
-        // ArbOwner is wrapped by Nitro's `OwnerPrecompile`, which returns `multigas.ZeroGas()` —
+        // ArbOwner is wrapped by Nitro's `OwnerPrecompile`, which returns `multigas.ZeroGas()`
         // the chain owner is NEVER charged for an ArbOwner call (success or revert), so it pays
         // neither the method gas nor the per-call arg/result-copy + ArbosState-open gas. Reset to
-        // zero-spent and skip the extra. (ArbDebug's `DebugPrecompile` does NOT do this — it charges
-        // normally — so only ArbOwner is exempt.)
+        // zero-spent and skip the extra. (ArbDebug's `DebugPrecompile` does NOT do this, it charges
+        // normally, so only ArbOwner is exempt.)
         if arb == ArbPrecompilesEnum::ArbOwner {
             result.gas = Gas::new(gas_limit);
             return result;
@@ -165,7 +164,7 @@ impl ArbPrecompilesEnum {
         result
     }
 
-    /// Path-agnostic method dispatch (no gating, no per-call gas — see [`Self::run_dispatch`]).
+    /// Path-agnostic method dispatch (no gating, no per-call gas, see [`Self::run_dispatch`]).
     /// `call.input` is the already-resolved calldata; the immediate-call fields (caller/value/
     /// bytecode_address) come from [`ArbCall`].
     pub fn dispatch<CTX>(&self, ctx: &mut CTX, call: &ArbCall) -> InterpreterResult
@@ -238,7 +237,7 @@ fn words_for_bytes(n: usize) -> u64 {
 ///   + OpenArbosState read (800) for every non-pure method.
 ///
 /// Note: storage reads/writes performed *inside* a method body (beyond the
-/// state-open) are not yet metered here — only the per-call costs are. Read-only
+/// state-open) are not yet metered here, only the per-call costs are. Read-only
 /// getters (the common case) do no extra storage I/O, so this is exact for them.
 fn arbos_call_extra_gas(
     arb: ArbPrecompilesEnum,
@@ -269,7 +268,7 @@ fn precompile_min_arbos_version(arb: ArbPrecompilesEnum) -> u64 {
 /// `(minArbosVersion, maxArbosVersion)` for a precompile method (max 0 = no upper bound). A call
 /// with `version < min` or `version > max>0` reverts (Nitro `precompile.go` Call, method gate).
 /// Only methods with a non-default bound that are also decodable by our sol interfaces need an
-/// entry — methods absent from the interface already revert via `abi_decode` failure. Covers the
+/// entry, methods absent from the interface already revert via `abi_decode` failure. Covers the
 /// 40→51 gates (native-token v41, gas methods v50, and `cacheCodehash` removed after v30).
 fn method_arbos_bounds(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> (u64, u64) {
     match arb {
@@ -325,7 +324,7 @@ fn method_arbos_bounds(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> (u64, u64) {
 /// (`gethhook/geth-hook.go`): ArbOS 30-49 = Cancun (0x01-0x0a, NO BLS) + the standalone
 /// secp256r1 P256VERIFY (RIP-7212, 0x100); ArbOS 50+ (`IsDia`) = Osaka (Prague + BLS + P256 +
 /// EIP-7823/7883 modexp). arb_revm targets ArbOS 40+. NOTE: this is keyed on the ArbOS
-/// version, NOT the eth spec — at ArbOS 40-51 the eth spec is Prague throughout, but the
+/// version, NOT the eth spec, at ArbOS 40-51 the eth spec is Prague throughout, but the
 /// precompile set flips at the ArbOS 50 boundary.
 pub fn arb_eth_precompiles(spec: ArbSpecId) -> &'static Precompiles {
     if spec.arbos_version() >= 50 {
@@ -434,7 +433,7 @@ where
 
 #[cfg(test)]
 mod gating_tests {
-    // Note: do NOT `use ArbPrecompilesEnum::*` here — the variant names (ArbGasInfo, ArbOwner, …)
+    // Note: do NOT `use ArbPrecompilesEnum::*` here, the variant names (ArbGasInfo, ArbOwner, …)
     // would shadow the sol-interface modules of the same name and break `Module::methodCall::SELECTOR`.
     use super::{ArbPrecompilesEnum as E, method_arbos_bounds, precompile_min_arbos_version};
     use super::{ArbGasInfo, ArbOwner, ArbOwnerPublic};

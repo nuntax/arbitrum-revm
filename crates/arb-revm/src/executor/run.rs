@@ -366,7 +366,7 @@ where
                 tx_index: queued.tx_index,
                 target: ArbWriteTarget::StateDatabase,
             });
-            // Scheduled retries — including a submit-retryable's auto-redeem — are
+            // Scheduled retries, including a submit-retryable's auto-redeem, are
             // derived uniformly from the `RedeemScheduled` logs emitted during this
             // transaction. The submit path emits exactly that log when it auto-redeems,
             // so it must not be scheduled a second time here.

@@ -1,8 +1,8 @@
 //! Stylus execution driver: builds the WASM program's view of the block/tx context and
-//! (TODO) runs the program against arb_revm's Context via the [`super::api`] bridge.
+//! runs the program against arb_revm's Context via the [`super::api`] bridge.
 //!
 //! Inspired by arbos-revm's `stylus_executor.rs` but written against arb_revm's own
-//! Context and canonical Nitro — kept generic over revm's `ContextTr` and using explicit
+//! Context and canonical Nitro, kept generic over revm's `ContextTr` and using explicit
 //! inputs rather than coupling to revm-internal frame types.
 
 use arbutil::{
@@ -30,7 +30,7 @@ use stylus::{
 
 use crate::{spec::ArbSpecId, stylus::api::StylusHandler};
 
-/// Assemble the [`EvmData`] passed to a Stylus program for one call — the block, tx and
+/// Assemble the [`EvmData`] passed to a Stylus program for one call, the block, tx and
 /// call-frame context the WASM hostios read from.
 #[allow(clippy::too_many_arguments)]
 pub fn build_evm_data<CTX>(
