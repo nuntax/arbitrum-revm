@@ -14,7 +14,7 @@ sol! {
     }
 }
 
-/// ArbNativeTokenManager — mint/burn native token for authorised callers.
+/// ArbNativeTokenManager, mint/burn native token for authorised callers.
 ///
 /// Active from ArbOS v41.  Before that version Nitro returns empty bytes (the
 /// precompile "doesn't exist yet").  After activation, full implementation is

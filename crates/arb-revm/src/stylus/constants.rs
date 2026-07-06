@@ -4,7 +4,7 @@
 
 /// Code prefix that marks a contract as a Stylus (WASM) program. A contract whose runtime
 /// bytecode starts with these bytes is dispatched to the WASM runtime instead of the EVM
-/// interpreter. (`0xEF 0xF0 0x00` — an EOF-like magic.)
+/// interpreter. (`0xEF 0xF0 0x00`, an EOF-like magic.)
 pub const STYLUS_DISCRIMINANT: &[u8] = &[0xEF, 0xF0, 0x00];
 
 // Initial Stylus parameters (Nitro `programs/params.go` const block).

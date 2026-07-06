@@ -6,10 +6,10 @@
 //! pulls the forked wasmer.
 //!
 //! Layout (mirrors arbos-revm):
-//! - [`constants`] — Stylus discriminant + initial param values + memory model.
-//! - [`gas`] — pure gas-model helpers (page/init/cached costs).
-//! - `executor` — run/compile/activate/cache flow + the `EvmData` builder (TODO).
-//! - `api` — the `StylusHandler` `RequestHandler` bridge to revm state (TODO).
+//! - [`constants`], Stylus discriminant + initial param values + memory model.
+//! - [`gas`], pure gas-model helpers (page/init/cached costs).
+//! - `executor`, run/compile/activate/cache flow + the `EvmData` builder.
+//! - `api`, the `StylusHandler` `RequestHandler` bridge to revm state.
 
 pub mod api;
 pub mod constants;

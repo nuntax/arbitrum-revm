@@ -17,7 +17,7 @@ const HISTORY_STORAGE_ADDRESS: Address = Address::new([
 /// Arbitrum's EIP-2935 ring-buffer size (`0x05ffd0`); Nitro widened the Ethereum default
 /// of 8191 to this. See `params.HistoryStorageCodeArbitrum`.
 const HISTORY_SERVE_WINDOW: u64 = 393_168;
-/// `params.HistoryStorageCodeArbitrum` — the EIP-2935 history contract runtime code
+/// `params.HistoryStorageCodeArbitrum`, the EIP-2935 history contract runtime code
 /// (rings at 393168 and reads the L2 block number via ArbSys `arbBlockNumber`, since the
 /// `NUMBER` opcode returns the L1 block number on Arbitrum). Deployed at the v40 upgrade.
 const HISTORY_STORAGE_CODE_HEX: &str = "3373fffffffffffffffffffffffffffffffffffffffe1460605760203603605c575f3563a3b1b31d5f5260205f6004601c60645afa15605c575f51600181038211605c57816205ffd0910311605c576205ffd09006545f5260205ff35b5f5ffd5b5f356205ffd0600163a3b1b31d5f5260205f6004601c60645afa15605c575f5103065500";
@@ -156,8 +156,7 @@ fn apply_start_block<CTX: ArbContextTr>(ctx: &mut CTX, input: &Bytes) -> Result<
     // message's number (the `l1_block_number++` above). The block-scoped chain context still
     // carries the raw message value the driver/replay seeded it with, so refresh it from the
     // post-update ArbOS state here; every user tx in this block then sees the correct
-    // `NUMBER`. Without this, a tx that reads/stores `NUMBER` diverges from canonical (first
-    // observed at Arb One block 22207832).
+    // `NUMBER`. Without this, a tx that reads/stores `NUMBER` diverges from canonical.
     let new_l1_block_number = arbos_state
         .block_hashes
         .l1_block_number(journal)
@@ -329,7 +328,7 @@ pub(crate) fn upgrade_arbos_version<J: JournalTr>(
             32 => {}
             // v33-v39: reserved for Orbit chains.
             33..=39 => {}
-            // v40: EIP-2935 history storage and Stylus params — EVM code install handled externally.
+            // v40: EIP-2935 history storage and Stylus params, EVM code install handled externally.
             // v40: deploy the EIP-2935 history-storage contract (nonce=1 + Arbitrum code).
             // Nitro: arbosState.go UpgradeArbosVersion case ArbosVersion_40.
             40 => {
@@ -407,7 +406,7 @@ pub(crate) fn upgrade_arbos_version<J: JournalTr>(
                     .programs
                     .write_params_word(params_word, journal)
                     .map_err(|e| format!("[ARBITRUM] v60: failed to write Stylus params: {e}"))?;
-                // transaction-filterer AddressSet.Initialize writes 0 to slot 0 — SSTORE no-op
+                // transaction-filterer AddressSet.Initialize writes 0 to slot 0, SSTORE no-op
                 // on a fresh trie; the AddressSet already initializes lazily on first use.
             }
             unknown => {

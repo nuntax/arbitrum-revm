@@ -40,7 +40,7 @@ arb_alloy_rpc_types = { package = "arb-alloy-rpc-types", path = "../../../arb-al
 arb_alloy_network = { package = "arb-alloy-network", path = "../../../arb-alloy/crates/network" }
 brotli = { path = "../../../nitro/crates/brotli", features = ["cc_brotli"] }
 
-# Stylus WASM execution. Feature-gated ("stylus"; pulls Nitro's forked wasmer — heavy
+# Stylus WASM execution. Feature-gated ("stylus"; pulls Nitro's forked wasmer, heavy
 # build). Uses the CANONICAL local Nitro crates (exact runtime the real chain runs = best
 # parity; fork-in-place if we ever need to change them). arbos-revm is the integration
 # blueprint, but the runtime is upstream Nitro (its arbutil exposes the same API).

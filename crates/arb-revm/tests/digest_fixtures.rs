@@ -1,7 +1,7 @@
 //! Hermetic `DigestMessage` round-trip tests (Stage E.3).
 //!
 //! Feeds real captured sequencer feed messages (`testdata/fixtures/*_message_only.json`) through
-//! `executor::digest_message_envelope` and asserts the assembled [`ArbMessageEnvelope`] — exercising
+//! `executor::digest_message_envelope` and asserts the assembled [`ArbMessageEnvelope`], exercising
 //! the relocated l2msg decoder (base64 -> `parse_message` -> typed `ArbTxEnvelope`) plus the
 //! `L1Header` normalization, end to end, with no node or network.
 

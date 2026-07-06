@@ -98,7 +98,7 @@ pub(crate) fn apply_retry_tx_post_execution<CTX: ArbContextTr>(
         // resurrected as a present-but-empty account, and go-ethereum keeps that zombie only
         // when this redeem SUCCEEDS. Materialize it now by marking the escrow Created + Touched,
         // so revm-database's `apply_account_state` writes it via `newly_created` *before* the
-        // EIP-161 empty-clear — matching canonical (escrow present, nonce 0, balance 0, empty
+        // EIP-161 empty-clear, matching canonical (escrow present, nonce 0, balance 0, empty
         // code/storage). `ArbContextTr` pins `Journal::State = EvmState`, so `evm_state_mut()`
         // yields the raw account map; `create_account_checkpoint` is unusable here as it forces
         // nonce 1 under SpuriousDragon, whereas the canonical zombie escrow has nonce 0.
@@ -120,7 +120,7 @@ pub(crate) fn apply_retry_tx_post_execution<CTX: ArbContextTr>(
         map_transfer_error(transfer_error, "retry callvalue return transfer")?;
     }
     // A failed zero-callvalue redeem intentionally does nothing: the escrow was never
-    // materialized (the submit only recorded eligibility), so it stays absent — matching Nitro,
+    // materialized (the submit only recorded eligibility), so it stays absent, matching Nitro,
     // where the failed redeem's resurrected zombie does not survive `Finalise`.
 
     Ok(())

@@ -56,7 +56,7 @@ impl RequestHandler<VecReader> for StylusHandler {
 // EIP-2929 storage/account access costs. TODO(parity): these are the static EIP-2929
 // values; SSTORE in particular needs the full EIP-2200/3529 transition cost (against the
 // slot's original/current value). Will be tuned exactly against the witness root once
-// execution is wired up — revm 36 no longer exposes standalone `sstore_cost`/`sload_cost`.
+// execution is wired up, revm 36 no longer exposes standalone `sstore_cost`/`sload_cost`.
 const COLD_SLOAD_COST: u64 = 2100;
 const WARM_STORAGE_READ_COST: u64 = 100;
 const COLD_ACCOUNT_ACCESS_COST: u64 = 2600;
@@ -65,7 +65,7 @@ const SSTORE_RESET_GAS: u64 = 2900;
 
 /// EIP-2200 + EIP-2929 SSTORE gas from the storage transition (matches go-ethereum's
 /// `gasSStoreEIP2929`, which Nitro charges via the hostio). SET vs RESET is chosen by the
-/// `original == present` / `original == 0` value transition — NOT by cold/warm. The cold
+/// `original == present` / `original == 0` value transition, NOT by cold/warm. The cold
 /// surcharge is added separately when the slot is cold.
 fn sstore_cost(res: &SStoreResult, is_cold: bool) -> u64 {
     let mut cost = if is_cold { COLD_SLOAD_COST } else { 0 };

@@ -1,4 +1,4 @@
-# Manual Redeem Gas Accounting — arb-revm ↔ Nitro Parity
+# Manual Redeem Gas Accounting, arb-revm ↔ Nitro Parity
 
 Companion to [`retryable-flow-nitro.md`](./retryable-flow-nitro.md). That doc describes Nitro's
 *behavior*; this one documents how `arb-revm` reproduces the **exact gas accounting and state
@@ -54,7 +54,7 @@ Two facts that are easy to get wrong and cost a lot of debugging:
 
 `read_burns` reconstructs Nitro's pre-`GasLeft` storage burns. Empirically calibrated against the v40
 oracle (the exact per-op trace summed to ~27550; the remaining residual to the oracle's 28353 is folded
-into the base constant — anchor on the oracle, not a hand count):
+into the base constant, anchor on the oracle, not a hand count):
 
 ```rust
 read_burns = REDEEM_READ_BURNS_BASE              // 28_353  (empty-calldata, v40)
@@ -63,7 +63,7 @@ read_burns = REDEEM_READ_BURNS_BASE              // 28_353  (empty-calldata, v40
 // W = words_for_bytes(retryable.calldata.len())
 ```
 
-The donation drives **three** observable things — all wrong if the donation is off by even 1 gas:
+The donation drives **three** observable things, all wrong if the donation is off by even 1 gas:
 the `RedeemScheduled` event `donatedGas` field, the **retry tx hash** (`retryTx.Gas = donated_gas`),
 and the `ShrinkBacklog` amount.
 
@@ -72,7 +72,7 @@ and the `ShrinkBacklog` amount.
 Key insight: in Nitro, `read_burns` *cancels* against the donation reservation
 (`gasUsed = intrinsic + read_burns + donation + post_run`, and `donation = GasLeft − futureGasCosts`
 where `GasLeft = gas_limit − read_burns`). So `gasUsed` does **not** depend on `read_burns` or the
-donation at all — it only depends on the backlog over-reserve:
+donation at all, it only depends on the backlog over-reserve:
 
 ```rust
 // SstoreSet(20000) reserved vs the real ShrinkBacklog write being an SstoreReset(5000) => 15000 refunded
@@ -92,7 +92,7 @@ double-charged. Build the result gas with `Gas::new(gas_limit)` + `record_cost(c
 
 `l2_pricing.rs::shrink_backlog` already existed but was unwired. Call it from the redeem arm. On the
 idle testnode the L2 backlog is 0, so the shrink floors to 0, then the handler's per-tx
-`grow_backlog(compute_gas)` (EndTxHook, `handler.rs:718`) writes it — which matches Nitro's
+`grow_backlog(compute_gas)` (EndTxHook, `handler.rs:718`) writes it, which matches Nitro's
 shrink-then-grow on a zero backlog. On a busy chain the shrink is a real subtraction.
 
 ## 3. The ArbOS slots this touches (testnode v40)
@@ -114,7 +114,7 @@ The replay harness compares arb-revm's write-set to ground truth. For a fresh te
 1. Create a no-auto-redeem ticket: `node stylus-counter/create_retryable.js` (uses `gasLimit=0` so the
    submit does not auto-redeem; prints `TICKETID`). A copy of a recorded oracle is at
    `testdata/oracles/testnode_manual_redeem_20924.json` (kept OUT of `tests/fixtures/` so the corpus
-   stays green — see the queue caveat below).
+   stays green, see the queue caveat below).
 2. Manually redeem: send a tx to `0x…006e` with data `0xeda1122c<ticketId>`, `gasLimit: 2_000_000`.
 3. Replay + compare: `cargo run --bin replay_block --features stylus -- http://localhost:8547 <block>`.
 4. To diff arb-revm's exact write-set against Nitro, trace the block with the **prestateTracer in
@@ -128,7 +128,7 @@ corpus (auto-redeem `477180356`, the 40→51 transition `419260688`) and all 32 
 ## 5. Caveat: the timeout-queue `nextPut` is a TESTNODE ARTIFACT, not a redeem bug
 
 On the testnode the *only* remaining state mismatch on a redeem block is the timeout-queue `nextPut`
-(`0x3c79da47…dfe600`): arb-revm reads a stale value vs the chain. Root cause is a **test artifact** —
+(`0x3c79da47…dfe600`): arb-revm reads a stale value vs the chain. Root cause is a **test artifact**
 repeatedly running `create_retryable.js` left ~17000 stale entries in the queue, exercising a
 prestate-read edge case that does not occur on a realistic chain. Evidence it is not an arb-revm logic
 bug:

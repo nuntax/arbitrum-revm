@@ -1,7 +1,7 @@
 //! Stylus program compile / activate / extraction + the compiled-program LRU cache.
 //!
-//! Ported from arbos-revm's `stylus_executor.rs` — only the runtime-facing, Context-free
-//! helpers — against the canonical Nitro `stylus` crate. These wrap `native::compile` /
+//! Ported from arbos-revm's `stylus_executor.rs`, only the runtime-facing, Context-free
+//! helpers, against the canonical Nitro `stylus` crate. These wrap `native::compile` /
 //! `native::activate` and brotli decompression; no revm Context is involved here.
 
 use std::{num::NonZeroUsize, sync::Mutex};

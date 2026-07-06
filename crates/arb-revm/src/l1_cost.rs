@@ -40,7 +40,7 @@ fn tx_type_has_poster_costs(tx_type: u8) -> bool {
 ///
 /// Mirrors `tx.MarshalBinary()` in Nitro: produces the EIP-2718 typed envelope
 /// (or RLP-encoded legacy bytes) without requiring the actual ECDSA signature.
-/// Signature bytes are zeroed — they contribute only ~65 bytes of overhead that
+/// Signature bytes are zeroed, they contribute only ~65 bytes of overhead that
 /// compresses away well at any quality level.
 ///
 /// Returns an empty `Vec` for Arbitrum-specific tx types that carry no L1 cost.
@@ -215,11 +215,11 @@ pub fn encode_tx_bytes<T: ArbTxTr>(tx: &T) -> Vec<u8> {
 
 /// Computes L1 poster cost information from pre-encoded transaction bytes.
 ///
-/// `tx_bytes`       — result of `encode_tx_bytes(tx)` (empty → no cost).
-/// `coinbase`       — block beneficiary; costs only charged when == BATCH_POSTER_ADDRESS.
-/// `price_per_unit` — current L1 price per calldata unit in wei.
-/// `gas_price`      — effective gas price of the tx in wei.
-/// `brotli_level`   — ArbOS brotli compression level.
+/// `tx_bytes`, result of `encode_tx_bytes(tx)` (empty → no cost).
+/// `coinbase`, block beneficiary; costs only charged when == BATCH_POSTER_ADDRESS.
+/// `price_per_unit`, current L1 price per calldata unit in wei.
+/// `gas_price`, effective gas price of the tx in wei.
+/// `brotli_level`, ArbOS brotli compression level.
 pub fn compute_poster_info(
     tx_bytes: &[u8],
     coinbase: revm::primitives::Address,

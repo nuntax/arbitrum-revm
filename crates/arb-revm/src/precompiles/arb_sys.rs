@@ -200,11 +200,11 @@ where
     // folded into the call's gas. The version + L1-block reads above are intentionally OUTSIDE the
     // metered scope: Nitro caches the ArbOS version (charged once via the makeContext state-open
     // already in `arbos_call_extra_gas`) and sources the L1 block from the tx processor, neither
-    // billed to the method body. The callvalue burn (`debit_balance`) is also unmetered — Nitro's
+    // billed to the method body. The callvalue burn (`debit_balance`) is also unmetered, Nitro's
     // `util.BurnBalance` touches the state DB directly, not the burner.
     let mut journal = MeteredJournal::new(ctx.journal_mut());
 
-    // sendHash = arbosState.KeccakHash(...) — charged through the metered journal.
+    // sendHash = arbosState.KeccakHash(...), charged through the metered journal.
     let send_hash = {
         let arb = arb_block_num.to_be_bytes::<32>();
         let l1 = l1_block_num_u256.to_be_bytes::<32>();
@@ -264,9 +264,9 @@ where
             u256_to_b256(U256::from(leaf_num)),
         ],
         // Event data is ABI parameter-encoded (head/tail), NOT a single-value encoding:
-        // `abi_encode` would wrap this tuple — which ends in a dynamic `bytes` — in an extra
+        // `abi_encode` would wrap this tuple, which ends in a dynamic `bytes`, in an extra
         // outer offset word (0x20), but Solidity/geth emit the non-indexed args inline. Use
-        // `abi_encode_params` so the leading word is `caller` (verified vs Arb One block 22208498).
+        // `abi_encode_params` so the leading word is `caller`.
         Bytes::from(alloy_core::sol_types::SolValue::abi_encode_params(&(
             caller,
             arb_block_num,

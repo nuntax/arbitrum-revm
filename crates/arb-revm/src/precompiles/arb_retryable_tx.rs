@@ -14,7 +14,7 @@ const REDEEM_COPY_GAS: u64 = 3; // params.CopyGas (gasCostToReturnResult)
 const BACKLOG_UPDATE_COST_PRE_V50: u64 = 20_800; // StorageRead(800)+StorageWrite(20000)
 const BACKLOG_UPDATE_COST_V50: u64 = 21_600; // +StorageRead(800) for GasModelToUse
 // ArbOS flat storage gas (Nitro arbos/storage): every read = StorageReadCost, every write =
-// StorageWriteCost (SstoreSetGasEIP2200, flat — not EIP-2929). The retryable-size burn at
+// StorageWriteCost (SstoreSetGasEIP2200, flat, not EIP-2929). The retryable-size burn at
 // ArbRetryableTx.go:60 uses params.SloadGas (the *COPY* multiplier = 50), NOT StorageReadCost.
 const REDEEM_STORAGE_READ: u64 = 800; // StorageReadCost = SloadGasEIP2200
 const REDEEM_STORAGE_WRITE: u64 = 20_000; // StorageWriteCost = SstoreSetGasEIP2200
@@ -32,7 +32,7 @@ const REDEEM_BACKLOG_OVERRESERVE: u64 = REDEEM_STORAGE_WRITE - 5_000;
 // Nitro's Redeem, on a missing/expired ticket, reads the retryable `timeout` twice before
 // reverting (RetryableSizeBytes -> OpenRetryable, then the direct OpenRetryable), each a flat
 // StorageReadCost. arb_revm's ArbosState reads are free, so charge the equivalent so the not-found
-// path burns the same computation gas as canonical (first observed at Arb One block 25523923).
+// path burns the same computation gas as canonical.
 const REDEEM_NOT_FOUND_READ_BURNS: u64 = 2 * REDEEM_STORAGE_READ;
 // `NoTicketWithID()` custom-error selector, the revert reason Nitro returns for a missing ticket at
 // ArbOS >= 3 (oldNotFoundError). Matching it also matches the revert-output copy gas.
@@ -209,8 +209,8 @@ where
             // Donation, per Nitro ArbRetryableTx.Redeem: gasToDonate = GasLeft - futureGasCosts,
             // where GasLeft is already reduced by the ArbOS-storage gas burned reading the retryable
             // (RetryableSizeBytes, OpenRetryable x2, IncrementNumTries, MakeTx fields). arb_revm's
-            // ArbosState reads are free, so subtract the equivalent burns so the donated gas — hence
-            // the retry tx hash, the RedeemScheduled event, and the ShrinkBacklog below — matches.
+            // ArbosState reads are free, so subtract the equivalent burns so the donated gas, hence
+            // the retry tx hash, the RedeemScheduled event, and the ShrinkBacklog below, matches.
             // 40-49: legacy backlog cost (20800); 50-59: single-gas-constraints (+800 GasModelToUse).
             let arbos_version = state.arbos_version.get(ctx.journal_mut()).unwrap_or(0);
             let backlog_update_cost = if (50..60).contains(&arbos_version) {
@@ -282,8 +282,8 @@ where
             ));
 
             // Nitro shrinks the L2 gas backlog by the donated gas: it is not consumed by the redeem
-            // tx itself (the retry re-grows it). Without this the backlog slot — and thus the state
-            // root — is too high. Single-backlog (legacy / single-constraint) path; v40 testnode.
+            // tx itself (the retry re-grows it). Without this the backlog slot, and thus the state
+            // root, is too high. Single-backlog (legacy / single-constraint) path; v40 testnode.
             if let Err(e) = state
                 .l2_pricing
                 .shrink_backlog(donated_gas, ctx.journal_mut())
@@ -296,7 +296,7 @@ where
             // (StorageWriteZeroCost) when the backlog is shrunk to ZERO, otherwise the full 20000.
             // So the 15000 over-reserve is refunded ONLY when the post-shrink backlog is zero -- the
             // case on a low-usage chain (the v40 testnode this was calibrated against), but NOT on a
-            // busy one (e.g. early-ArbOS mainnet, where the backlog stays non-zero: block 22362432).
+            // busy one (e.g. early-ArbOS mainnet, where the backlog stays non-zero).
             // Reading gas_backlog here is free in arb_revm (ArbosState reads don't burn). v50+
             // (multi-gas-constraints) charges a fixed backlog cost, not writeCost(value), so leave
             // its separately-calibrated over-reserve untouched.

@@ -3,7 +3,7 @@
 //! Two layers:
 //!  * `deposit_fixture_round_trips_and_replays` builds a fixture in code, sends it
 //!    through `serde` and the public replay API, and asserts the engine reproduces
-//!    the expected outcome — proving the harness end-to-end with no files or node.
+//!    the expected outcome, proving the harness end-to-end with no files or node.
 //!  * `recorded_fixtures_replay_with_parity` scans `tests/fixtures/*.json` and
 //!    replays every captured fixture. Drop a fixture produced by
 //!    `replay_block --record <path>` into that directory and it becomes a
@@ -81,7 +81,7 @@ fn build_deposit_fixture() -> ReplayFixture {
             created_address: None,
             logs: Vec::new(),
         }],
-        // The deposit mints `value` to the recipient — assert that post-state so the
+        // The deposit mints `value` to the recipient, assert that post-state so the
         // fixture also exercises state-write parity.
         expected_state: vec![ExpectedAccountState {
             address: to,

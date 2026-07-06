@@ -214,11 +214,10 @@ where
         if is_protocol_env_bypass_tx(evm) {
             // Protocol txs (internal/deposit/submit-retryable/retry) carry no L1 poster cost and
             // skip the GasChargingHook below, but they still execute EVM and must obey EIP-2929.
-            // `load_accounts` is what pre-warms the precompile addresses (revm pre_execution.rs) —
+            // `load_accounts` is what pre-warms the precompile addresses (revm pre_execution.rs)
             // Nitro's geth runs `Prepare` (which warms all active precompiles) for EVERY tx type, so
             // skipping it here charged a COLD (2600) access instead of WARM (100) the first time a
-            // protocol tx touches a precompile. Observed as +2500 gas on a retry tx that STATICCALLs
-            // ArbSys (0x64) at Arb One block 22487517. Warm accounts (precompiles + set journal spec)
+            // protocol tx touches a precompile. Warm accounts (precompiles + set journal spec)
             // before returning; we still skip caller-deduction + GasChargingHook (protocol txs are
             // gas-prepaid and poster-cost-free).
             self.load_accounts(evm)?;
@@ -404,7 +403,7 @@ where
         // Nitro charges poster gas before EVM compute starts, and caps the compute gas
         // at the per-block/per-tx limit by withholding `hold_gas`. In revm both are
         // expressed by reducing the initial frame gas limit. Crucially, `hold_gas` is
-        // only a *cap* — Nitro returns whatever the tx doesn't actually use — so it must
+        // only a *cap*, Nitro returns whatever the tx doesn't actually use, so it must
         // not end up in `gasUsed`. (poster_gas IS charged and stays.)
         let (tx_gas_limit, poster_gas, hold_gas) = {
             let ctx = evm.ctx();
@@ -544,7 +543,7 @@ where
             // A submit-retryable may legitimately fail its funds checks: Nitro records it as
             // a failed tx (status 0, gasUsed 0) and continues the block, so a non-ok result
             // here is expected, not fatal. Internal and deposit txs are protocol-guaranteed
-            // and must never fail — a non-ok result for those is a real bug.
+            // and must never fail, a non-ok result for those is a real bug.
             if !status.is_ok() && !is_submit_retryable_tx(evm) {
                 let label = if is_internal_tx(evm) { "internal" } else { "deposit" };
                 return Err(ERROR::from_string(
@@ -702,8 +701,8 @@ where
 
         // Split compute cost between the infra and network fee accounts.
         //
-        // Nitro (tx_processor.go EndTxHook) carves out the infra portion — both the
-        // mint AND the `computeCost -= infraComputeCost` subtraction — *only* when an
+        // Nitro (tx_processor.go EndTxHook) carves out the infra portion, both the
+        // mint AND the `computeCost -= infraComputeCost` subtraction, *only* when an
         // infra fee account is configured. When it is unset (e.g. infraFeeAccount == 0),
         // the entire compute cost goes to the network fee account. Subtracting the infra
         // portion unconditionally (as before) silently burned it and under-credited the
@@ -774,7 +773,7 @@ where
             .l2_pricing
             .grow_backlog(compute_gas, arbos_version, journal);
 
-        // Do NOT call mainnet.reward_beneficiary — Arbitrum replaces that entire path.
+        // Do NOT call mainnet.reward_beneficiary, Arbitrum replaces that entire path.
         Ok(())
     }
 }
@@ -881,7 +880,7 @@ where
         remaining_refund = remaining_refund.saturating_sub(single_gas_cost);
 
         // Refund the unused gas. Nitro carves the infra share out of the gas bucket first, then
-        // refunds infra and network buckets separately — each via `refund()` (deposit cap +
+        // refunds infra and network buckets separately, each via `refund()` (deposit cap +
         // excess to `from`). Not pre-capped by the budget; `retry_fee_refund` applies the cap.
         let mut network_refund = effective_base_fee.saturating_mul(U256::from(gas_left));
 
@@ -923,8 +922,8 @@ where
 /// `refund_from`, split between `refund_to` and `from`.
 ///
 /// `budget` is the remaining L1-deposit allowance: `min(amount, budget)` is reimbursed to
-/// `refund_to` (and decrements `budget`), while the EXCESS — which can't be charged against the
-/// deposit — is returned to `from` (the retryable's sender). Both transfers come from
+/// `refund_to` (and decrements `budget`), while the EXCESS, which can't be charged against the
+/// deposit, is returned to `from` (the retryable's sender). Both transfers come from
 /// `refund_from` (a fee account). Balances are read first to avoid `OutOfFunds`.
 fn retry_fee_refund<J: JournalTr>(
     journal: &mut J,
@@ -1011,7 +1010,7 @@ where
     /// Mirror [`ArbHandler::execution`] (protocol short-circuits + poster/hold gas
     /// reservation) but drive the **inspecting** frame loop. The default
     /// `inspect_execution` skips the poster-gas reservation, so the inspector path would
-    /// otherwise leave `posterGas` in the EVM gas pool — inflating the `GAS` opcode and
+    /// otherwise leave `posterGas` in the EVM gas pool, inflating the `GAS` opcode and
     /// diverging gas-sensitive contracts from the non-inspect `transact` path.
     fn inspect_execution(
         &mut self,
@@ -1599,7 +1598,7 @@ mod tests {
         // Nitro `tx_processor.go:258`: when the deposit mint can't cover the max submission
         // fee, the tx is recorded as failed (status 0, gasUsed 0) and the block continues,
         // keeping the deposit mint. It must NOT surface as a fatal EVM error (which would
-        // halt the driver — the real Arbitrum One batch-1 retryable 0xff56fb78… hits this).
+        // halt the driver, the real Arbitrum One batch-1 retryable 0xff56fb78… hits this).
         let cfg = CfgEnv::new_with_spec(ArbSpecId::NITRO)
             .with_chain_id(42161)
             .with_disable_priority_fee_check(true);

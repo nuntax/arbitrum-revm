@@ -90,7 +90,7 @@ where
             let params = StylusParams::from_word(&params_word);
             let arbos_version = ctx.cfg().spec().arbos_version();
 
-            // Stored program metadata — Nitro's source of truth for init/page gas, set at
+            // Stored program metadata, Nitro's source of truth for init/page gas, set at
             // activation. We still compile/activate below for the executable module, but charge
             // gas from these stored values (re-deriving from the WASM can differ by a few units).
             let program = ArbosState::open()

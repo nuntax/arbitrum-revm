@@ -26,7 +26,7 @@ pub struct ArbBlockHeaderInfo {
     /// differ from the raw message `l1BlockNumber` (version shims / no-advance blocks).
     pub l1_block_number: u64,
     /// Raw chain-wide tip-collection setting (Nitro `CollectTips()`). The block-level flag in
-    /// `mix_hash[25]` additionally requires the coinbase to be the batch poster — applied by the
+    /// `mix_hash[25]` additionally requires the coinbase to be the batch poster, applied by the
     /// caller, which knows the block coinbase.
     pub collect_tips: bool,
     /// L2 base fee in wei after start-of-block pricing (→ header `base_fee_per_gas`).
@@ -117,7 +117,7 @@ impl ArbosState {
     /// Called after all of a block's transactions have been committed (the journal then
     /// loads the committed values straight from the underlying state), so the send-Merkle
     /// root/size, the (possibly upgraded) ArbOS version, and the L2 base fee all reflect the
-    /// finalized block — exactly the inputs Nitro feeds into the block header.
+    /// finalized block, exactly the inputs Nitro feeds into the block header.
     pub fn read_block_header_info<J: ArbJournal>(
         journal: &mut J,
     ) -> eyre::Result<ArbBlockHeaderInfo> {

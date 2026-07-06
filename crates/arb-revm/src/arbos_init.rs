@@ -1,4 +1,4 @@
-//! ArbOS genesis initialization — the Rust equivalent of Nitro's
+//! ArbOS genesis initialization, the Rust equivalent of Nitro's
 //! `arbos/arbosState/arbosstate.go::InitializeArbosState`.
 //!
 //! A brand-new Arbitrum chain has no downloadable genesis state: block 0's state root is the
@@ -91,7 +91,7 @@ pub fn arb_genesis_accounts(
     let mut ctx = <ArbContext<EmptyDB> as DefaultArb>::arb();
     initialize_arbos_state(config, ctx.journal_mut())?;
 
-    // `JournalTr::finalize(&mut self) -> Self::State` — returns the dirty EvmState.
+    // `JournalTr::finalize(&mut self) -> Self::State`, returns the dirty EvmState.
     // For `ArbContext<EmptyDB>`, `State = revm::state::EvmState = AddressMap<Account>`.
     let evm_state = ctx.journal_mut().finalize();
 
@@ -99,7 +99,7 @@ pub fn arb_genesis_accounts(
 }
 
 /// Converts a finalized revm [`EvmState`](revm::state::EvmState) into the sorted, trie-relevant
-/// [`ArbGenesisAccount`] list: drops fully-empty accounts (no code/balance/nonce/storage — they
+/// [`ArbGenesisAccount`] list: drops fully-empty accounts (no code/balance/nonce/storage, they
 /// produce no trie entry per EIP-161), filters zero-valued storage slots, and sorts both the
 /// per-account storage (by slot) and the account list (by address) for deterministic output.
 fn evm_state_to_genesis_accounts(
@@ -127,7 +127,7 @@ fn evm_state_to_genesis_accounts(
                 .collect();
             let has_storage = !storage.is_empty();
 
-            // Skip fully-empty accounts — they produce no trie entry.
+            // Skip fully-empty accounts, they produce no trie entry.
             if !has_code && !has_balance && !has_nonce && !has_storage {
                 return None;
             }
@@ -161,7 +161,7 @@ fn evm_state_to_genesis_accounts(
     accounts
 }
 
-/// A classic-state account to import at genesis — Nitro
+/// A classic-state account to import at genesis, Nitro
 /// `statetransfer.AccountInitializationInfo` (the JSON `accounts.json` records).
 #[derive(Debug, Clone)]
 pub struct GenesisAccountInput {
@@ -177,7 +177,7 @@ pub struct GenesisAccountInput {
     pub storage: Vec<(B256, B256)>,
 }
 
-/// A retryable ticket to seed at genesis — Nitro
+/// A retryable ticket to seed at genesis, Nitro
 /// `statetransfer.InitializationDataForRetryable` (the JSON `retryables.json` records).
 #[derive(Debug, Clone)]
 pub struct GenesisRetryableInput {
@@ -197,7 +197,7 @@ pub struct GenesisRetryableInput {
     pub calldata: Bytes,
 }
 
-/// `keccak256("retryable escrow" ++ ticket_id)[12:]` — the per-ticket escrow address that holds a
+/// `keccak256("retryable escrow" ++ ticket_id)[12:]`, the per-ticket escrow address that holds a
 /// live retryable's call value (Nitro `retryables.RetryableEscrowAddress`).
 fn genesis_retryable_escrow_address(ticket_id: B256) -> Address {
     let mut preimage = Vec::with_capacity(16 + 32);
@@ -210,8 +210,8 @@ fn genesis_retryable_escrow_address(ticket_id: B256) -> Address {
 /// `arbos/arbosState/initialize.go::InitializeArbosInDatabase` against a fresh empty state, then
 /// extracting every trie account as an [`ArbGenesisAccount`].
 ///
-/// Steps (Nitro order — order matters for balance collisions):
-/// 1. [`initialize_arbos_state`] — ArbOS baseline (incl. chain-owner add).
+/// Steps (Nitro order, order matters for balance collisions):
+/// 1. [`initialize_arbos_state`], ArbOS baseline (incl. chain-owner add).
 /// 2. Register every `address_table` entry in order (sequential slots).
 /// 3. Retryables: expired (`timeout <= current_timestamp`) credit the beneficiary with the call
 ///    value; live ones are sorted by `(timeout, id)`, get their call value escrowed, and are
@@ -220,7 +220,7 @@ fn genesis_retryable_escrow_address(ticket_id: B256) -> Address {
 ///    so an account also credited as a retryable beneficiary keeps its `accounts.json` balance
 ///    (escrow addresses never collide with the classic dump, so their credits survive).
 ///
-/// `accounts` is consumed lazily (streamed) — only the finalized [`EvmState`](revm::state::EvmState)
+/// `accounts` is consumed lazily (streamed), only the finalized [`EvmState`](revm::state::EvmState)
 /// is held in memory, which the caller's machine must fit (≈1.29M accounts for Arbitrum One).
 pub fn build_mainnet_genesis_accounts<AT, RT, AC>(
     config: &ArbosInitConfig,
@@ -244,7 +244,7 @@ where
     initialize_arbos_state(config, journal)?;
     let state = ArbosState::open();
 
-    // 2. Address table — register in file order; slot N goes to the N-th address.
+    // 2. Address table, register in file order; slot N goes to the N-th address.
     for (i, addr) in address_table.into_iter().enumerate() {
         let slot = state
             .address_table
@@ -293,7 +293,7 @@ where
             .map_err(|e| format!("[ARBITRUM] failed to enqueue retryable timeout: {e}"))?;
     }
 
-    // 4. Classic accounts — balance / nonce / code / storage (SetBalance overwrites collisions).
+    // 4. Classic accounts, balance / nonce / code / storage (SetBalance overwrites collisions).
     //    All mutators on the journaled-account handle touch the account, so it survives finalize.
     for acct in accounts {
         let loaded = journal
@@ -365,7 +365,7 @@ const PRECOMPILE_FAKE_CODE: [u8; 1] = [0xfe];
 /// `[INVALID]` code so its account has a non-empty code hash in the trie. Addresses from
 /// `go-ethereum/core/types/arbitrum_signer.go`.
 ///
-/// `(address, min_arbos_version, debug_only)` — `debug_only` precompiles (ArbDebug) are installed
+/// `(address, min_arbos_version, debug_only)`, `debug_only` precompiles (ArbDebug) are installed
 /// only when `debug_precompiles` is requested.
 const ARBOS_PRECOMPILES: &[(Address, u64, bool)] = &[
     (address!("0x0000000000000000000000000000000000000064"), 0, false), // ArbSys
@@ -416,7 +416,7 @@ pub(crate) fn install_precompiles_introduced_at<J: JournalTr>(
 /// (Nitro `arbostypes.ParsedInitMessage` + `params.ChainConfig.ArbitrumChainParams`).
 #[derive(Debug, Clone)]
 pub struct ArbosInitConfig {
-    /// `chainConfig.ArbitrumChainParams.InitialArbOSVersion` — must be ≥ 1.
+    /// `chainConfig.ArbitrumChainParams.InitialArbOSVersion`, must be ≥ 1.
     pub initial_arbos_version: u64,
     /// `chainConfig.ArbitrumChainParams.InitialChainOwner` (may be the zero address).
     pub initial_chain_owner: Address,
@@ -435,7 +435,7 @@ pub struct ArbosInitConfig {
 /// Writes the genesis ArbOS state into `journal`, mirroring Nitro's `InitializeArbosState`.
 ///
 /// The journal must be fresh (ArbOS version slot == 0); this is the genesis path and does not
-/// guard against re-initialization (Nitro returns `ErrAlreadyInitialized` — left to the caller).
+/// guard against re-initialization (Nitro returns `ErrAlreadyInitialized`, left to the caller).
 ///
 /// After this returns, committing the journal yields block 0's ArbOS state. See the module-level
 /// note on the Stylus/programs limitation for target versions ≥ 30.
@@ -462,7 +462,7 @@ pub fn initialize_arbos_state<J: JournalTr>(
     // 1. Fake precompile code for every precompile active at the target version. Nitro installs
     //    version-0 ones in InitializeArbosState and later ones during each UpgradeArbosVersion
     //    step; the final state (all precompiles with min_version <= target have code) is identical,
-    //    so we install them in one pass here. (The upgrader also re-installs 0x73 at v41 — the
+    //    so we install them in one pass here. (The upgrader also re-installs 0x73 at v41, the
     //    repeated SetCode is idempotent.)
     for (addr, min_version, debug_only) in ARBOS_PRECOMPILES {
         if *min_version > config.initial_arbos_version {
@@ -570,7 +570,7 @@ pub fn initialize_arbos_state<J: JournalTr>(
         .map_err(|e| format!("[ARBITRUM] failed to add genesis chain owner: {e}"))?;
 
     // addressTable / sendMerkle / blockhashes / nativeTokenOwners / transactionFilterers all
-    // initialize by writing 0 to offset 0 — SSTORE no-ops on a fresh trie; nothing to do.
+    // initialize by writing 0 to offset 0, SSTORE no-ops on a fresh trie; nothing to do.
 
     // 8. Run the per-version migration cascade up to the target version (Nitro's
     //    UpgradeArbosVersion(desired, firstTime=true)). See the module note on Stylus state.
@@ -582,9 +582,9 @@ pub fn initialize_arbos_state<J: JournalTr>(
     // 9. firstTime block (Nitro arbosState.go UpgradeArbosVersion lines 519-526): runs ONCE
     //    after the cascade, at genesis only (firstTime=true), when the target version >= 6.
     //    It overrides L1 equilibration units and L2 speed-limit / per-block gas-limit with the
-    //    V6 constants — the V0 values written by InitializeL1/L2PricingState are only correct for
+    //    V6 constants, the V0 values written by InitializeL1/L2PricingState are only correct for
     //    a genesis below v6. This is firstTime-ONLY: a *runtime* v6 upgrade does NOT apply it,
-    //    which is why `upgrade_arbos_version` omits it (and why mid-chain replay never needs it —
+    //    which is why `upgrade_arbos_version` omits it (and why mid-chain replay never needs it
     //    that state is already past v6). Validated slot-for-slot against the nitro-testnode genesis
     //    (ArbOS v40): equilibrationUnits=160e6, speedLimit=7e6, perBlockGasLimit=32e6.
     if config.initial_arbos_version >= 6 {
@@ -802,7 +802,7 @@ mod tests {
             state.l1_pricing.amortized_cost_cap_bips.get(j).unwrap(),
             0_u64
         );
-        // brotli upgrade is v20 — still 0 at v11.
+        // brotli upgrade is v20, still 0 at v11.
         assert_eq!(state.brotli_compression_level.get(j).unwrap(), 0_u64);
     }
 

@@ -6,7 +6,7 @@ use revm::interpreter::InterpreterResult;
 /// Nitro reference: params.ArbosVersion_TransactionFiltering = ArbosVersion_60 = 60.
 const ARBOS_VERSION_TRANSACTION_FILTERING: u64 = 60;
 
-/// ArbFilteredTransactionsManager — filtered tx list management for authorised callers.
+/// ArbFilteredTransactionsManager, filtered tx list management for authorised callers.
 ///
 /// Active from ArbOS v60.  Before that version Nitro returns empty bytes (the
 /// precompile "doesn't exist yet").  After activation, full implementation is

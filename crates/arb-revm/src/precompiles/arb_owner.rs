@@ -385,7 +385,7 @@ where
             gas_limit,
             "ArbOwner: releaseL1PricerSurplusFunds not yet implemented",
         ),
-        // Stylus / WASM settings — stored as packed bytes in a single 32-byte
+        // Stylus / WASM settings, stored as packed bytes in a single 32-byte
         // storage word at index 0 of the programs.params subspace.
         // Each setter performs a read-modify-write on the packed word.
         // Nitro reference: arbos/programs/params.go Save() / Params().

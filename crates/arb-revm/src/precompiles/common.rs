@@ -59,7 +59,7 @@ pub(super) fn empty_active_result(gas_limit: u64) -> InterpreterResult {
 
 /// A call to an ArbOS precompile method that does not exist at the current ArbOS version
 /// (selector too short, method below its `arbosVersion`, or above its `maxArbosVersion`).
-/// Nitro returns `ErrExecutionReverted` with `gasLeft = 0` — a revert that consumes ALL the
+/// Nitro returns `ErrExecutionReverted` with `gasLeft = 0`, a revert that consumes ALL the
 /// supplied gas (unlike a normal business-logic revert, which keeps the remaining gas).
 #[inline]
 pub(super) fn gated_revert_result(gas_limit: u64) -> InterpreterResult {
