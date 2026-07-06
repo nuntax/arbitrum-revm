@@ -38,20 +38,13 @@ arb_sequencer_network = { package = "arb-sequencer-network", path = "../../../ar
 arb_alloy_precompiles = { package = "arb-alloy-precompiles", path = "../../../arb-alloy/crates/precompiles" }
 arb_alloy_rpc_types = { package = "arb-alloy-rpc-types", path = "../../../arb-alloy/crates/rpc-types" }
 arb_alloy_network = { package = "arb-alloy-network", path = "../../../arb-alloy/crates/network" }
-brotli = { path = "../../../nitro/crates/brotli", features = ["cc_brotli"] }
+brotli = { path = "../../vendor/brotli/crates/brotli", features = ["cc_brotli"] }
 
-# Stylus WASM execution. Feature-gated ("stylus"; pulls Nitro's forked wasmer, heavy
-# build). Uses the CANONICAL local Nitro crates (exact runtime the real chain runs = best
-# parity; fork-in-place if we ever need to change them). arbos-revm is the integration
-# blueprint, but the runtime is upstream Nitro (its arbutil exposes the same API).
-stylus = { path = "../../../nitro/crates/stylus", features = ["cc_brotli"], optional = true }
-arbutil = { path = "../../../nitro/crates/arbutil", optional = true }
-wasmer-types = { path = "../../../nitro/crates/tools/wasmer/lib/types", optional = true }
-wasm-encoder = { version = "0.244.0", optional = true }
-wasmparser = { version = "0.244.0", optional = true }
-wasmprinter = { version = "0.244.0", optional = true }
-lru = { version = "0.16.3", optional = true }
-lazy_static = { version = "1.5.0", optional = true }
+# Stylus WASM execution is deferred for the standalone build: it needs Nitro's forked
+# wasmer (crates/stylus, arbutil, wasmer-types), which is not packaged standalone and would
+# pull a second copy of `brotli` that collides with the vendored one. The `src/stylus`
+# module stays in-tree but is compiled only under the `stylus` feature, which currently has
+# no backing dependencies (enabling it will not build until they are restored).
 
 [features]
-stylus = ["dep:stylus", "dep:arbutil", "dep:wasmer-types", "dep:wasm-encoder", "dep:wasmparser", "dep:wasmprinter", "dep:lru", "dep:lazy_static"]
+stylus = []
