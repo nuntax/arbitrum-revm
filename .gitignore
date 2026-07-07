@@ -1,5 +1,10 @@
 /target
-/testdata
+# Ignore all testdata (large replay fixtures) except the small digest test fixtures.
+/testdata/*
+!/testdata/fixtures/
+/testdata/fixtures/*
+!/testdata/fixtures/deposit_message_only.json
+!/testdata/fixtures/submit_retryable_message_only.json
 Cargo.lock
 *.pyc
 .DS_Store
