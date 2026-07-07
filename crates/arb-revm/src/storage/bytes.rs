@@ -1,10 +1,8 @@
 use eyre::Result;
-use revm::{
-    context_interface::JournalTr,
-    primitives::{FixedBytes, U256},
-};
+use revm::primitives::{FixedBytes, U256};
 
 use super::StorageSpace;
+use crate::arb_journal::ArbJournal;
 
 /// Nitro-style byte blob encoding in ArbOS storage:
 /// - slot 0: length
@@ -21,7 +19,7 @@ impl StorageBytes {
         }
     }
 
-    pub fn size<J: JournalTr>(&self, journal: &mut J) -> Result<u64> {
+    pub fn size<J: ArbJournal>(&self, journal: &mut J) -> Result<u64> {
         Ok(self
             .storage
             .get_u256(U256::ZERO, journal)?
@@ -29,7 +27,7 @@ impl StorageBytes {
             .try_into()?)
     }
 
-    pub fn get<J: JournalTr>(&self, journal: &mut J) -> Result<Vec<u8>> {
+    pub fn get<J: ArbJournal>(&self, journal: &mut J) -> Result<Vec<u8>> {
         let mut bytes_left = self.size(journal)?;
         if bytes_left == 0 {
             return Ok(Vec::new());
@@ -52,7 +50,7 @@ impl StorageBytes {
         Ok(out)
     }
 
-    pub fn clear<J: JournalTr>(&self, journal: &mut J) -> Result<()> {
+    pub fn clear<J: ArbJournal>(&self, journal: &mut J) -> Result<()> {
         let mut bytes_left = self.size(journal)?;
         let mut offset = 1_u64;
         while bytes_left > 0 {
@@ -72,7 +70,7 @@ impl StorageBytes {
         Ok(())
     }
 
-    pub fn set<J: JournalTr>(&self, value: &[u8], journal: &mut J) -> Result<()> {
+    pub fn set<J: ArbJournal>(&self, value: &[u8], journal: &mut J) -> Result<()> {
         self.clear(journal)?;
         self.set_fresh(value, journal)
     }
@@ -81,7 +79,7 @@ impl StorageBytes {
     ///
     /// This avoids an initial length read, which is useful for protocol paths
     /// that create new objects in empty subspaces.
-    pub fn set_fresh<J: JournalTr>(&self, value: &[u8], journal: &mut J) -> Result<()> {
+    pub fn set_fresh<J: ArbJournal>(&self, value: &[u8], journal: &mut J) -> Result<()> {
         self.storage.set(
             FixedBytes::from(U256::ZERO.to_be_bytes()),
             U256::from(value.len()),

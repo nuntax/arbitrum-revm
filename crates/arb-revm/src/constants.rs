@@ -17,6 +17,14 @@ pub const L1_PRICER_FUNDS_POOL_ADDRESS: Address =
 pub const ARB_RETRYABLE_TX_ADDRESS: Address =
     address!("0x000000000000000000000000000000000000006e");
 
+/// Transient-storage (EIP-1153) slot ArbOS uses to carry the current transaction's L1 poster fee
+/// from the gas-charging handler to `ArbGasInfo.getCurrentTxL1GasFees`. This is NOT consensus state
+/// (transient storage is per-tx and never enters the state root); the address/key are internal and
+/// collision-free because no EVM bytecode executes at the ArbGasInfo precompile address, so nothing
+/// else can TSTORE here. Mirrors Nitro returning `txProcessor.PosterFee` (a Go field), which the
+/// node-path `EvmInternals` handle cannot otherwise expose to a precompile.
+pub const CURRENT_TX_L1_FEE_ADDR: Address = address!("0x000000000000000000000000000000000000006C");
+
 /// EIP-2935 history storage contract address.
 pub const HISTORY_STORAGE_ADDRESS: Address = address!("0x0000F90827F1C53a10cb7A02335B175320002935");
 

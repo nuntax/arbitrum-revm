@@ -12,7 +12,7 @@ const PRECOMPILE_BASE_GAS: u64 = 0;
 #[inline]
 pub(super) fn ok_result(gas_limit: u64, output: Vec<u8>) -> InterpreterResult {
     let mut gas = Gas::new(gas_limit);
-    let _ = gas.record_cost(PRECOMPILE_BASE_GAS);
+    let _ = gas.record_regular_cost(PRECOMPILE_BASE_GAS);
     InterpreterResult {
         result: InstructionResult::Return,
         gas,
@@ -42,6 +42,31 @@ pub(super) fn revert_result(gas_limit: u64, msg: &str) -> InterpreterResult {
         result: InstructionResult::Revert,
         gas: Gas::new(gas_limit),
         output: Bytes::from(output),
+    }
+}
+
+/// A call to an ArbOS precompile that is not yet active at the current ArbOS version.
+/// Nitro (`precompile.go` Call, `arbosVersion < p.arbosVersion`) treats this exactly like a
+/// call to an account with no code: empty return, success, and **no gas consumed**.
+#[inline]
+pub(super) fn empty_active_result(gas_limit: u64) -> InterpreterResult {
+    InterpreterResult {
+        result: InstructionResult::Return,
+        gas: Gas::new(gas_limit),
+        output: Bytes::new(),
+    }
+}
+
+/// A call to an ArbOS precompile method that does not exist at the current ArbOS version
+/// (selector too short, method below its `arbosVersion`, or above its `maxArbosVersion`).
+/// Nitro returns `ErrExecutionReverted` with `gasLeft = 0`, a revert that consumes ALL the
+/// supplied gas (unlike a normal business-logic revert, which keeps the remaining gas).
+#[inline]
+pub(super) fn gated_revert_result(gas_limit: u64) -> InterpreterResult {
+    InterpreterResult {
+        result: InstructionResult::Revert,
+        gas: Gas::new_spent_with_reservoir(gas_limit, 0),
+        output: Bytes::new(),
     }
 }
 

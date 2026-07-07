@@ -1,4 +1,7 @@
-use crate::{ArbSpecId, api::exec::ArbContextTr, chain::ArbChainContext, precompiles::ArbPrecompiles};
+use crate::{
+    ArbSpecId, api::exec::ArbContextTr, chain::ArbChainContext, precompiles::ArbPrecompiles,
+    storage::ArbosState,
+};
 use revm::{
     Database, Inspector,
     bytecode::opcode,
@@ -11,9 +14,10 @@ use revm::{
     },
     inspector::{InspectorEvmTr, JournalExt},
     interpreter::{
-        Host, Instruction, InstructionContext, InterpreterResult, interpreter::EthInterpreter,
+        Host, Instruction, InstructionContext, InstructionExecResult, InstructionResult,
+        InterpreterResult, interpreter::EthInterpreter,
     },
-    primitives::U256,
+    primitives::{B256, U256},
 };
 
 /// Arbitrum `NUMBER` opcode: returns the L1 block number, not the L2 block number.
@@ -21,14 +25,40 @@ use revm::{
 /// Mirrors Nitro's patched `opNumber` (`go-ethereum/core/vm/instructions.go`), which
 /// reads `ProcessingHook.L1BlockNumber` rather than `BlockContext.BlockNumber`. The
 /// value is carried block-scoped in [`ArbChainContext::l1_block_number`].
-fn arb_block_number<CTX>(ctx: InstructionContext<'_, CTX, EthInterpreter>)
+fn arb_block_number<CTX>(ctx: InstructionContext<'_, CTX, EthInterpreter>) -> InstructionExecResult
 where
     CTX: ContextTr<Chain = ArbChainContext> + Host,
 {
     let l1_block_number = ctx.host.chain().l1_block_number;
     if !ctx.interpreter.stack.push(U256::from(l1_block_number)) {
-        ctx.interpreter.halt_overflow();
+        return Err(revm::interpreter::InstructionResult::StackOverflow);
     }
+    Ok(())
+}
+
+/// Arbitrum `BLOCKHASH` opcode: returns the hash of an **L1** block from the ArbOS
+/// block-hash ring buffer, not an L2 header hash.
+///
+/// Mirrors Nitro's patched `GetHashFn` (`go-ethereum`), which reads `state.blockhashes`
+/// (the last 256 L1 block hashes recorded by `Blockhashes.RecordNewL1Block`). The stock
+/// revm instruction compares the requested number against the **L2** block number and so
+/// returns 0 for any L1 number, diverging the first time a tx reads `BLOCKHASH(l1Num)`. The internal
+/// ArbOS-storage read is unmetered (matching geth's free `GetHashFn`); only the fixed
+/// 20-gas table cost applies.
+fn arb_block_hash<CTX>(ctx: InstructionContext<'_, CTX, EthInterpreter>) -> InstructionExecResult
+where
+    CTX: ContextTr<Chain = ArbChainContext> + Host,
+{
+    let Some(([], number)) = ctx.interpreter.stack.popn_top::<0>() else {
+        return Err(InstructionResult::StackUnderflow);
+    };
+    let requested = u64::try_from(*number).unwrap_or(u64::MAX);
+    let hash = ArbosState::open()
+        .block_hashes
+        .block_hash(requested, ctx.host.journal_mut())
+        .unwrap_or(B256::ZERO);
+    *number = U256::from_be_bytes(hash.0);
+    Ok(())
 }
 
 /// Arbitrum EVM wrapper over revm's generic [`Evm`] type.
@@ -49,8 +79,10 @@ where
     pub fn new(ctx: CTX, inspector: INSP) -> Self {
         let spec: ArbSpecId = ctx.cfg().spec().into();
         let mut instruction = EthInstructions::new_mainnet_with_spec(spec.into());
-        // Arbitrum overrides only the NUMBER opcode to return the L1 block number.
-        instruction.insert_instruction(opcode::NUMBER, Instruction::new(arb_block_number::<CTX>, 2));
+        // Arbitrum overrides NUMBER (returns the L1 block number) and BLOCKHASH (returns the
+        // ArbOS-stored L1 block hash).
+        instruction.insert_instruction(opcode::NUMBER, Instruction::new(arb_block_number::<CTX>), 2);
+        instruction.insert_instruction(opcode::BLOCKHASH, Instruction::new(arb_block_hash::<CTX>), 20);
         Self(Evm {
             ctx,
             inspector,

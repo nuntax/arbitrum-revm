@@ -1,6 +1,5 @@
 use super::*;
-use revm::context_interface::{Block, journaled_state::account::JournaledAccountTr};
-use revm::interpreter::CallInputs;
+use crate::arb_journal::{ArbCall, ArbJournal, ArbPrecompileCtx, MeteredJournal};
 use revm::primitives::{Address, B256, Bytes, Log, keccak256};
 
 const ARBOS_VERSION_WITH_NATIVE_TOKEN_OWNERS_SEND_RESTRICTION: u64 = 41;
@@ -14,10 +13,10 @@ pub(super) fn run_arb_sys<CTX>(
     ctx: &mut CTX,
     input: &[u8],
     gas_limit: u64,
-    call_inputs: &CallInputs,
+    call_inputs: &ArbCall,
 ) -> InterpreterResult
 where
-    CTX: ContextTr<Journal: JournalTr>,
+    CTX: ArbPrecompileCtx,
 {
     let call = match ArbSys::ArbSysCalls::abi_decode(input) {
         Ok(c) => c,
@@ -29,7 +28,7 @@ where
     match call {
         ArbSys::ArbSysCalls::arbBlockNumber(_) => {
             // L2 block number is stored as the EVM block number.
-            let num: u64 = ctx.block().number().try_into().unwrap_or(u64::MAX);
+            let num: u64 = ctx.block_number();
             ok_result(
                 gas_limit,
                 alloy_core::sol_types::SolValue::abi_encode(&(U256::from(num),)),
@@ -37,7 +36,7 @@ where
         }
         ArbSys::ArbSysCalls::arbBlockHash(call) => {
             let target: u64 = call.arbBlockNum.try_into().unwrap_or(u64::MAX);
-            let current: u64 = ctx.block().number().try_into().unwrap_or(u64::MAX);
+            let current: u64 = ctx.block_number();
             if target >= current || target.saturating_add(256) < current {
                 return revert_result(gas_limit, "ArbSys: invalid block number");
             }
@@ -77,7 +76,7 @@ where
             )
         }
         ArbSys::ArbSysCalls::isTopLevelCall(_) => {
-            let depth = ctx.journal().depth();
+            let depth = ctx.call_depth();
             ok_result(
                 gas_limit,
                 alloy_core::sol_types::SolValue::abi_encode(&(depth <= 2,)),
@@ -133,7 +132,7 @@ where
             gas_limit,
             call_inputs.bytecode_address,
             call_inputs.caller,
-            call_inputs.call_value(),
+            call_inputs.value,
             call.destination,
             call.data.as_ref(),
         ),
@@ -142,7 +141,7 @@ where
             gas_limit,
             call_inputs.bytecode_address,
             call_inputs.caller,
-            call_inputs.call_value(),
+            call_inputs.value,
             call.destination,
             &[],
         ),
@@ -159,11 +158,11 @@ fn apply_send_tx_to_l1<CTX>(
     calldata_for_l1: &[u8],
 ) -> InterpreterResult
 where
-    CTX: ContextTr<Journal: JournalTr>,
+    CTX: ArbPrecompileCtx,
 {
     let state = ArbosState::open();
-    let arb_block_num = U256::from(ctx.block().number());
-    let timestamp = U256::from(ctx.block().timestamp());
+    let arb_block_num = U256::from(ctx.block_number());
+    let timestamp = U256::from(ctx.block_timestamp());
     let l1_block_num;
     let arbos_version;
 
@@ -195,77 +194,90 @@ where
     }
 
     let l1_block_num_u256 = U256::from(l1_block_num);
-    let send_hash = compute_l2_to_l1_send_hash(
-        caller,
-        destination,
-        arb_block_num,
-        l1_block_num_u256,
-        timestamp,
-        callvalue,
-        calldata_for_l1,
-    );
 
-    let leaf_num;
-    let update_events;
-    {
-        let journal = ctx.journal_mut();
-        update_events = match state.send_merkle.append(send_hash, journal) {
-            Ok(v) => v,
-            Err(e) => return revert_result(gas_limit, &format!("ArbSys: merkle error: {e}")),
-        };
-        let size = match state.send_merkle.size(journal) {
-            Ok(v) => v,
-            Err(e) => return revert_result(gas_limit, &format!("ArbSys: merkle error: {e}")),
-        };
-        leaf_num = size.saturating_sub(1);
+    // From here on, the storage writes, keccaks, and event emits are metered the way Nitro's
+    // precompile burner bills them (flat 800/read, 20000/write, 30+6*words/keccak, LOG gas) and
+    // folded into the call's gas. The version + L1-block reads above are intentionally OUTSIDE the
+    // metered scope: Nitro caches the ArbOS version (charged once via the makeContext state-open
+    // already in `arbos_call_extra_gas`) and sources the L1 block from the tx processor, neither
+    // billed to the method body. The callvalue burn (`debit_balance`) is also unmetered, Nitro's
+    // `util.BurnBalance` touches the state DB directly, not the burner.
+    let mut journal = MeteredJournal::new(ctx.journal_mut());
 
-        if callvalue > U256::ZERO {
-            let mut account = match journal
-                .load_account_mut_skip_cold_load(precompile_address, false)
-            {
-                Ok(acc) => acc,
-                Err(e) => return revert_result(gas_limit, &format!("ArbSys: storage error: {e}")),
-            };
-            if !account.data.decr_balance(callvalue) {
-                return revert_result(gas_limit, "ArbSys: insufficient balance for L2->L1 burn");
-            }
+    // sendHash = arbosState.KeccakHash(...), charged through the metered journal.
+    let send_hash = {
+        let arb = arb_block_num.to_be_bytes::<32>();
+        let l1 = l1_block_num_u256.to_be_bytes::<32>();
+        let ts = timestamp.to_be_bytes::<32>();
+        let cv = callvalue.to_be_bytes::<32>();
+        journal.keccak(&[
+            caller.as_slice(),
+            destination.as_slice(),
+            &arb,
+            &l1,
+            &ts,
+            &cv,
+            calldata_for_l1,
+        ])
+    };
+
+    let update_events = match state.send_merkle.append(send_hash, &mut journal) {
+        Ok(v) => v,
+        Err(e) => return revert_result(gas_limit, &format!("ArbSys: merkle error: {e}")),
+    };
+    let size = match state.send_merkle.size(&mut journal) {
+        Ok(v) => v,
+        Err(e) => return revert_result(gas_limit, &format!("ArbSys: merkle error: {e}")),
+    };
+    let leaf_num = size.saturating_sub(1);
+
+    if callvalue > U256::ZERO {
+        let sufficient = match journal.debit_balance(precompile_address, callvalue) {
+            Ok(ok) => ok,
+            Err(e) => return revert_result(gas_limit, &format!("ArbSys: storage error: {e}")),
+        };
+        if !sufficient {
+            return revert_result(gas_limit, "ArbSys: insufficient balance for L2->L1 burn");
         }
     }
 
-    {
-        let journal = ctx.journal_mut();
-        for update in &update_events {
-            let position = (U256::from(update.level) << 192) + U256::from(update.num_leaves);
-            journal.log(Log::new_unchecked(
-                precompile_address,
-                vec![
-                    keccak256(SEND_MERKLE_UPDATE_EVENT_SIGNATURE),
-                    u256_to_b256(U256::ZERO),
-                    update.hash,
-                    u256_to_b256(position),
-                ],
-                Bytes::new(),
-            ));
-        }
-
-        journal.log(Log::new_unchecked(
+    for update in &update_events {
+        let position = (U256::from(update.level) << 192) + U256::from(update.num_leaves);
+        journal.emit_log(Log::new_unchecked(
             precompile_address,
             vec![
-                keccak256(L2_TO_L1_TX_EVENT_SIGNATURE),
-                address_to_topic(destination),
-                send_hash,
-                u256_to_b256(U256::from(leaf_num)),
+                keccak256(SEND_MERKLE_UPDATE_EVENT_SIGNATURE),
+                u256_to_b256(U256::ZERO),
+                update.hash,
+                u256_to_b256(position),
             ],
-            Bytes::from(alloy_core::sol_types::SolValue::abi_encode(&(
-                caller,
-                arb_block_num,
-                l1_block_num_u256,
-                timestamp,
-                callvalue,
-                calldata_for_l1.to_vec(),
-            ))),
+            Bytes::new(),
         ));
     }
+
+    journal.emit_log(Log::new_unchecked(
+        precompile_address,
+        vec![
+            keccak256(L2_TO_L1_TX_EVENT_SIGNATURE),
+            address_to_topic(destination),
+            send_hash,
+            u256_to_b256(U256::from(leaf_num)),
+        ],
+        // Event data is ABI parameter-encoded (head/tail), NOT a single-value encoding:
+        // `abi_encode` would wrap this tuple, which ends in a dynamic `bytes`, in an extra
+        // outer offset word (0x20), but Solidity/geth emit the non-indexed args inline. Use
+        // `abi_encode_params` so the leading word is `caller`.
+        Bytes::from(alloy_core::sol_types::SolValue::abi_encode_params(&(
+            caller,
+            arb_block_num,
+            l1_block_num_u256,
+            timestamp,
+            callvalue,
+            calldata_for_l1.to_vec(),
+        ))),
+    ));
+
+    let burned = journal.burned;
 
     let unique_id = if arbos_version >= ARBOS_VERSION_RETURNS_SEND_INDEX {
         U256::from(leaf_num)
@@ -273,30 +285,16 @@ where
         U256::from_be_bytes(send_hash.0)
     };
 
-    ok_result(
+    let mut result = ok_result(
         gas_limit,
         alloy_core::sol_types::SolValue::abi_encode(&(unique_id,)),
-    )
-}
-
-fn compute_l2_to_l1_send_hash(
-    caller: Address,
-    destination: Address,
-    arb_block_num: U256,
-    l1_block_num: U256,
-    timestamp: U256,
-    callvalue: U256,
-    calldata_for_l1: &[u8],
-) -> B256 {
-    let mut preimage = Vec::with_capacity(20 + 20 + (32 * 4) + 32 + calldata_for_l1.len());
-    preimage.extend_from_slice(caller.as_slice());
-    preimage.extend_from_slice(destination.as_slice());
-    preimage.extend_from_slice(&arb_block_num.to_be_bytes::<32>());
-    preimage.extend_from_slice(&l1_block_num.to_be_bytes::<32>());
-    preimage.extend_from_slice(&timestamp.to_be_bytes::<32>());
-    preimage.extend_from_slice(&callvalue.to_be_bytes::<32>());
-    preimage.extend_from_slice(calldata_for_l1);
-    keccak256(preimage)
+    );
+    // Fold the burner total into the call's gas (Nitro bills these per-op through the burner).
+    if !result.gas.record_regular_cost(burned) {
+        result.result = revm::interpreter::InstructionResult::OutOfGas;
+        result.output = Bytes::new();
+    }
+    result
 }
 
 #[inline]

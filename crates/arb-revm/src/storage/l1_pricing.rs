@@ -1,7 +1,6 @@
 use eyre::{Result, eyre};
 use revm::{
     context_interface::{
-        JournalTr,
         context::SStoreResult,
         journaled_state::{StateLoad, TransferError},
     },
@@ -9,6 +8,7 @@ use revm::{
 };
 
 use super::{BatchPosterTable, L1PricingOffset, StorageBacked, StorageSpace};
+use crate::arb_journal::ArbJournal;
 use crate::constants::L1_PRICER_FUNDS_POOL_ADDRESS;
 
 const ONE_IN_BIPS: u64 = 10_000;
@@ -68,7 +68,7 @@ impl L1Pricing {
         }
     }
 
-    pub fn get_l1_pricing_surplus<J: JournalTr>(&self, journal: &mut J) -> Result<I256> {
+    pub fn get_l1_pricing_surplus<J: ArbJournal>(&self, journal: &mut J) -> Result<I256> {
         let refunds_due = self.batch_poster_table.total_funds_due(journal)?;
         let rewards_due = self.funds_due_for_rewards.get(journal)?;
         let available = self.l1_fees_available.get(journal)?;
@@ -80,7 +80,7 @@ impl L1Pricing {
             .ok_or_else(|| eyre!("underflow calculating ArbOS L1 pricing surplus"))
     }
 
-    pub fn add_to_l1_fees_available<J: JournalTr>(
+    pub fn add_to_l1_fees_available<J: ArbJournal>(
         &self,
         delta: U256,
         journal: &mut J,
@@ -92,7 +92,7 @@ impl L1Pricing {
         self.l1_fees_available.set(next, journal)
     }
 
-    pub fn update_for_batch_poster_spending<J: JournalTr>(
+    pub fn update_for_batch_poster_spending<J: ArbJournal>(
         &self,
         arbos_version: u64,
         update_time: u64,
@@ -288,7 +288,7 @@ impl L1Pricing {
         Ok(())
     }
 
-    pub fn apply_batch_posting_report<J: JournalTr>(
+    pub fn apply_batch_posting_report<J: ArbJournal>(
         &self,
         arbos_version: u64,
         batch_timestamp: u64,
@@ -314,7 +314,7 @@ impl L1Pricing {
         )
     }
 
-    pub fn apply_batch_posting_report_v2<J: JournalTr>(
+    pub fn apply_batch_posting_report_v2<J: ArbJournal>(
         &self,
         arbos_version: u64,
         batch_timestamp: u64,
@@ -360,12 +360,11 @@ impl L1Pricing {
     }
 }
 
-fn pool_balance<J: JournalTr>(journal: &mut J) -> Result<U256> {
-    let account = journal.load_account(L1_PRICER_FUNDS_POOL_ADDRESS)?;
-    Ok(account.info.balance)
+fn pool_balance<J: ArbJournal>(journal: &mut J) -> Result<U256> {
+    Ok(journal.account_balance(L1_PRICER_FUNDS_POOL_ADDRESS)?)
 }
 
-fn transfer_from_pool<J: JournalTr>(
+fn transfer_from_pool<J: ArbJournal>(
     recipient: Address,
     amount: U256,
     journal: &mut J,

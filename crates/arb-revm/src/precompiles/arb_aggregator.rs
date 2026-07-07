@@ -1,6 +1,6 @@
 use super::*;
+use crate::arb_journal::ArbPrecompileCtx;
 use crate::constants::BATCH_POSTER_ADDRESS;
-use revm::context_interface::Transaction;
 
 pub(super) fn run_arb_aggregator<CTX>(
     ctx: &mut CTX,
@@ -8,7 +8,7 @@ pub(super) fn run_arb_aggregator<CTX>(
     gas_limit: u64,
 ) -> InterpreterResult
 where
-    CTX: ContextTr<Journal: JournalTr>,
+    CTX: ArbPrecompileCtx,
 {
     let call = match ArbAggregator::ArbAggregatorCalls::abi_decode(input) {
         Ok(c) => c,
@@ -71,7 +71,7 @@ where
             alloy_core::sol_types::SolValue::abi_encode(&(U256::ZERO,)),
         ),
         ArbAggregator::ArbAggregatorCalls::addBatchPoster(c) => {
-            let caller = ctx.tx().caller();
+            let caller = ctx.tx_caller();
             let caller_is_owner = match state.chain_owners.is_member(caller, ctx.journal_mut()) {
                 Ok(v) => v,
                 Err(e) => {
@@ -125,7 +125,7 @@ where
                 Ok(a) => a,
                 Err(e) => return revert_result(gas_limit, &format!("ArbAggregator: error: {e}")),
             };
-            let caller = ctx.tx().caller();
+            let caller = ctx.tx_caller();
             if caller != c.batchPoster && caller != old_fee_collector {
                 let caller_is_owner = match state.chain_owners.is_member(caller, ctx.journal_mut())
                 {

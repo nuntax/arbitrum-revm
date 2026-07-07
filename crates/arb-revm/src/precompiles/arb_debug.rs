@@ -1,8 +1,9 @@
 use super::*;
+use crate::arb_journal::ArbPrecompileCtx;
 
 pub(super) fn run_arb_debug<CTX>(_ctx: &mut CTX, input: &[u8], gas_limit: u64) -> InterpreterResult
 where
-    CTX: ContextTr<Journal: JournalTr>,
+    CTX: ArbPrecompileCtx,
 {
     let call = match ArbDebug::ArbDebugCalls::abi_decode(input) {
         Ok(c) => c,

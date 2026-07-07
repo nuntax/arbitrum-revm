@@ -4,7 +4,7 @@ use crate::{
     constants::{
         ARB_RETRYABLE_TX_ADDRESS, ARBITRUM_DEPOSIT_TX_TYPE, ARBITRUM_INTERNAL_TX_TYPE,
         ARBITRUM_RETRY_TX_TYPE, ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE, ARBOS_ACTS_ADDRESS,
-        BATCH_POSTER_ADDRESS, L1_PRICER_FUNDS_POOL_ADDRESS,
+        BATCH_POSTER_ADDRESS, CURRENT_TX_L1_FEE_ADDR, L1_PRICER_FUNDS_POOL_ADDRESS,
     },
     deposit_tx, internal_tx,
     l1_cost::{compute_poster_info, encode_tx_bytes},
@@ -130,15 +130,17 @@ where
                     ctx.tx(),
                     spec,
                     ctx.cfg().is_eip7623_disabled(),
+                    ctx.cfg().is_amsterdam_eip8037_enabled(),
+                    ctx.cfg().tx_gas_limit_cap(),
                 )?
             };
-            evm.ctx_mut().chain_mut().intrinsic_gas = init_and_floor.initial_gas;
+            evm.ctx_mut().chain_mut().intrinsic_gas = init_and_floor.initial_total_gas();
             return Ok(init_and_floor);
         }
         let result = self.mainnet.validate(evm)?;
         // Store intrinsic gas for use in pre_execution (gas limit enforcement)
         // and reward_beneficiary (reconstructing Nitro's computeGas).
-        evm.ctx_mut().chain_mut().intrinsic_gas = result.initial_gas;
+        evm.ctx_mut().chain_mut().intrinsic_gas = result.initial_total_gas();
         Ok(result)
     }
 
@@ -204,16 +206,39 @@ where
         self.mainnet.validate_env(evm)
     }
 
-    fn pre_execution(&self, evm: &mut Self::Evm) -> Result<u64, Self::Error> {
+    fn pre_execution(
+        &self,
+        evm: &mut Self::Evm,
+        init_and_floor_gas: &mut InitialAndFloorGas,
+    ) -> Result<u64, Self::Error> {
         if is_protocol_env_bypass_tx(evm) {
+            // Protocol txs (internal/deposit/submit-retryable/retry) carry no L1 poster cost and
+            // skip the GasChargingHook below, but they still execute EVM and must obey EIP-2929.
+            // `load_accounts` is what pre-warms the precompile addresses (revm pre_execution.rs)
+            // Nitro's geth runs `Prepare` (which warms all active precompiles) for EVERY tx type, so
+            // skipping it here charged a COLD (2600) access instead of WARM (100) the first time a
+            // protocol tx touches a precompile. Warm accounts (precompiles + set journal spec)
+            // before returning; we still skip caller-deduction + GasChargingHook (protocol txs are
+            // gas-prepaid and poster-cost-free).
+            self.load_accounts(evm)?;
+            evm.ctx_mut().chain_mut().reset_poster_state();
+            // Protocol txs carry no L1 poster fee; publish 0 so a getCurrentTxL1GasFees call within
+            // this tx reads 0 rather than a value leaked from a prior tx (belt-and-braces: revm also
+            // clears transient storage per tx).
+            JournalTr::tstore(
+                evm.ctx_mut().journal_mut(),
+                CURRENT_TX_L1_FEE_ADDR,
+                U256::ZERO,
+                U256::ZERO,
+            );
             return Ok(0);
         }
 
         // Run the standard pre-execution steps, but through this handler so our
         // overridden validate_against_state_and_deduct_caller logic is applied.
-        self.validate_against_state_and_deduct_caller(evm)?;
+        self.validate_against_state_and_deduct_caller(evm, init_and_floor_gas)?;
         self.load_accounts(evm)?;
-        let mainnet_cost = self.apply_eip7702_auth_list(evm)?;
+        let mainnet_cost = self.apply_eip7702_auth_list(evm, init_and_floor_gas)?;
 
         // --- GasChargingHook (Nitro: tx_processor.go GasChargingHook) ---
         // Two-phase approach to avoid simultaneous mutable+immutable borrows:
@@ -320,6 +345,16 @@ where
             ctx.chain_mut().poster_gas = info.poster_gas;
             ctx.chain_mut().poster_fee = info.poster_fee;
             ctx.chain_mut().hold_gas = hold_gas;
+
+            // Publish the current tx's L1 poster fee for ArbGasInfo.getCurrentTxL1GasFees (Nitro:
+            // txProcessor.PosterFee). Transient storage is the only channel the node-path precompile
+            // (over EvmInternals, which hides the chain context) can read; not consensus state.
+            JournalTr::tstore(
+                ctx.journal_mut(),
+                CURRENT_TX_L1_FEE_ADDR,
+                U256::ZERO,
+                info.poster_fee,
+            );
         }
 
         // In revm, pre_execution's return value is interpreted as an EIP-7702 refund delta,
@@ -335,31 +370,40 @@ where
     ) -> Result<FrameResult, Self::Error> {
         if is_internal_tx(evm) {
             internal_tx::apply_internal_tx(evm.ctx_mut())
-                .map_err(|msg| ERROR::from_string(msg.into()))?;
+                .map_err(|msg| ERROR::from_string(msg))?;
             return Ok(internal_success_frame_result());
         }
         if is_deposit_tx(evm) {
             deposit_tx::apply_deposit_tx(evm.ctx_mut())
-                .map_err(|msg| ERROR::from_string(msg.into()))?;
+                .map_err(|msg| ERROR::from_string(msg))?;
             return Ok(internal_success_frame_result());
         }
         if is_submit_retryable_tx(evm) {
-            submit_retryable_tx::apply_submit_retryable_tx(evm.ctx_mut())
-                .map_err(|msg| ERROR::from_string(msg.into()))?;
-            return Ok(submit_retryable_success_frame_result(
-                evm.ctx().tx().gas_limit(),
-            ));
+            let outcome = submit_retryable_tx::apply_submit_retryable_tx(evm.ctx_mut())
+                .map_err(|msg| ERROR::from_string(msg))?;
+            return Ok(match outcome {
+                // Ticket created: success receipt. gasUsed is `usergas` only when the auto-redeem
+                // was scheduled, else 0 (Nitro `StartTxHook`); the outcome carries the value.
+                submit_retryable_tx::SubmitRetryableOutcome::Created { gas_used } => {
+                    submit_retryable_success_frame_result(gas_used)
+                }
+                // Funds check failed: Nitro records a failed tx (status 0, gasUsed 0) and
+                // keeps the partial state (deposit mint, fee refunds) instead of halting.
+                submit_retryable_tx::SubmitRetryableOutcome::Failed => {
+                    submit_retryable_failed_frame_result()
+                }
+            });
         }
         if is_retry_tx(evm) {
             retry_tx::apply_retry_tx_pre_execution(evm.ctx_mut())
-                .map_err(|msg| ERROR::from_string(msg.into()))?;
+                .map_err(|msg| ERROR::from_string(msg))?;
             return self.mainnet.execution(evm, init_and_floor_gas);
         }
 
         // Nitro charges poster gas before EVM compute starts, and caps the compute gas
         // at the per-block/per-tx limit by withholding `hold_gas`. In revm both are
         // expressed by reducing the initial frame gas limit. Crucially, `hold_gas` is
-        // only a *cap* — Nitro returns whatever the tx doesn't actually use — so it must
+        // only a *cap*, Nitro returns whatever the tx doesn't actually use, so it must
         // not end up in `gasUsed`. (poster_gas IS charged and stays.)
         let (tx_gas_limit, poster_gas, hold_gas) = {
             let ctx = evm.ctx();
@@ -370,7 +414,7 @@ where
             )
         };
         let total_initial = init_and_floor_gas
-            .initial_gas
+            .initial_total_gas()
             .saturating_add(poster_gas)
             .saturating_add(hold_gas);
         if total_initial > tx_gas_limit {
@@ -383,9 +427,9 @@ where
 
         let first_frame_input = self
             .mainnet
-            .first_frame_input(evm, tx_gas_limit.saturating_sub(total_initial))?;
+            .first_frame_input(evm, tx_gas_limit.saturating_sub(total_initial), 0)?;
         let mut frame_result = self.mainnet.run_exec_loop(evm, first_frame_input)?;
-        self.mainnet.last_frame_result(evm, &mut frame_result)?;
+        self.mainnet.last_frame_result(evm, 0, &mut frame_result)?;
         // Return the withheld cap gas: it bounded compute but is not part of gasUsed.
         // (frame gas.spent() = intrinsic + poster + hold + compute; this removes hold.)
         frame_result.gas_mut().erase_cost(hold_gas);
@@ -395,6 +439,7 @@ where
     fn validate_against_state_and_deduct_caller(
         &self,
         evm: &mut Self::Evm,
+        _init_and_floor_gas: &mut InitialAndFloorGas,
     ) -> Result<(), Self::Error> {
         if is_protocol_env_bypass_tx(evm) {
             // Nitro internal/deposit/submit-retryable/retry txs are protocol actions,
@@ -490,25 +535,24 @@ where
     fn last_frame_result(
         &mut self,
         evm: &mut Self::Evm,
+        original_reservoir: u64,
         frame_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
     ) -> Result<(), Self::Error> {
         if is_protocol_short_circuit_tx(evm) {
             let status = frame_result.interpreter_result().result;
-            if !status.is_ok() {
-                let label = if is_internal_tx(evm) {
-                    "internal"
-                } else if is_submit_retryable_tx(evm) {
-                    "submit-retryable"
-                } else {
-                    "deposit"
-                };
+            // A submit-retryable may legitimately fail its funds checks: Nitro records it as
+            // a failed tx (status 0, gasUsed 0) and continues the block, so a non-ok result
+            // here is expected, not fatal. Internal and deposit txs are protocol-guaranteed
+            // and must never fail, a non-ok result for those is a real bug.
+            if !status.is_ok() && !is_submit_retryable_tx(evm) {
+                let label = if is_internal_tx(evm) { "internal" } else { "deposit" };
                 return Err(ERROR::from_string(
-                    format!("[ARBITRUM] {label} transaction execution failed").into(),
+                    format!("[ARBITRUM] {label} transaction execution failed"),
                 ));
             }
             return Ok(());
         }
-        self.mainnet.last_frame_result(evm, frame_result)
+        self.mainnet.last_frame_result(evm, original_reservoir, frame_result)
     }
 
     fn reimburse_caller(
@@ -552,9 +596,15 @@ where
     ) {
         // Nitro caps SSTORE-style refunds against (gasUsed - posterGas), where poster gas is
         // nonrefundable. Revm's default cap uses gasUsed only, so we specialize it here.
+        // Use tx-level total_gas_spent (which includes intrinsic, unlike frame-level).
         let gas = frame_result.gas_mut();
         gas.record_refund(eip7702_refund);
 
+        let tx_gas_spent = {
+            let tx_limit = evm.ctx().tx().gas_limit();
+            let remaining = gas.remaining();
+            tx_limit.saturating_sub(remaining)
+        };
         let spec: SpecId = evm.ctx().cfg().spec().into();
         let max_refund_quotient = if spec.is_enabled_in(SpecId::LONDON) {
             5
@@ -562,7 +612,7 @@ where
             2
         };
         let nonrefundable = evm.ctx().chain().poster_gas;
-        let refundable_spent = gas.spent().saturating_sub(nonrefundable);
+        let refundable_spent = tx_gas_spent.saturating_sub(nonrefundable);
         let max_refund = refundable_spent / max_refund_quotient;
         let current_refund = gas.refunded().max(0) as u64;
         gas.set_refund(current_refund.min(max_refund) as i64);
@@ -602,7 +652,13 @@ where
         // AddToL1FeesAvailable(posterFee) is called when ArbOS >= 10.
         // GrowBacklog grows by computeGas only (not gasUsed).
         let gas = frame_result.interpreter_result().gas;
-        let gas_used = gas.spent_sub_refunded();
+        let tx_gas_limit = {
+            let ctx = evm.ctx();
+            ctx.tx().gas_limit()
+        };
+        let remaining = gas.remaining();
+        let refund = gas.refunded().max(0) as u64;
+        let gas_used = tx_gas_limit.saturating_sub(remaining).saturating_sub(refund);
         // gas.refunded() is the capped EIP-3529 refund that reimburse_caller returns to the
         // caller. Nitro's gasUsed = GasLimit - gasLeft (where gasLeft includes the refund),
         // which maps to revm's spent_sub_refunded() at this stage.
@@ -645,8 +701,8 @@ where
 
         // Split compute cost between the infra and network fee accounts.
         //
-        // Nitro (tx_processor.go EndTxHook) carves out the infra portion — both the
-        // mint AND the `computeCost -= infraComputeCost` subtraction — *only* when an
+        // Nitro (tx_processor.go EndTxHook) carves out the infra portion, both the
+        // mint AND the `computeCost -= infraComputeCost` subtraction, *only* when an
         // infra fee account is configured. When it is unset (e.g. infraFeeAccount == 0),
         // the entire compute cost goes to the network fee account. Subtracting the infra
         // portion unconditionally (as before) silently burned it and under-credited the
@@ -717,7 +773,7 @@ where
             .l2_pricing
             .grow_backlog(compute_gas, arbos_version, journal);
 
-        // Do NOT call mainnet.reward_beneficiary — Arbitrum replaces that entire path.
+        // Do NOT call mainnet.reward_beneficiary, Arbitrum replaces that entire path.
         Ok(())
     }
 }
@@ -754,6 +810,7 @@ where
         let tx_gas_limit: u64;
         let effective_base_fee: U256;
         let refund_to: Address;
+        let from: Address;
         let max_refund: U256;
         let submission_fee_refund: U256;
         {
@@ -761,6 +818,9 @@ where
             let tx = ctx.tx();
             tx_gas_limit = tx.gas_limit();
             effective_base_fee = U256::from(tx.gas_price());
+            // `from` is the retryable's sender: any refund beyond the L1-deposit budget
+            // (`max_refund`) goes here rather than to `refund_to` (Nitro `refund()` helper).
+            from = tx.caller();
             let retry_meta = tx.retry_meta().ok_or_else(|| {
                 ERROR::from_string("[ARBITRUM] retry EndTxHook: missing retry metadata".into())
             })?;
@@ -768,7 +828,13 @@ where
             max_refund = retry_meta.max_refund;
             submission_fee_refund = retry_meta.submission_fee_refund;
         }
-        let gas_used = gas.spent_sub_refunded();
+        // Nitro: gasUsed = gasLimit - gasLeft (where gasLeft = remaining + refund).
+        // Frame-level `spent_sub_refunded()` misses intrinsic because
+        // `first_frame_input` subtracts it from the budget. We reconstruct the
+        // tx-level gas directly from the raw gas tracker fields.
+        let remaining = gas.remaining();
+        let refund = gas.refunded().max(0) as u64;
+        let gas_used = tx_gas_limit.saturating_sub(remaining).saturating_sub(refund);
         let gas_left = tx_gas_limit.saturating_sub(gas_used);
 
         let arbos_state = ArbosState::open();
@@ -791,60 +857,50 @@ where
             .get(journal)
             .unwrap_or_default();
 
-        // Track remaining refund budget.
+        // Track remaining refund budget (the L1 deposit still available to reimburse `refund_to`).
         let mut remaining_refund = max_refund;
 
         if success {
-            // Refund submission_fee_refund from networkFeeAccount → refund_to.
-            let sub_fee_refund = submission_fee_refund.min(remaining_refund);
-            if sub_fee_refund > U256::ZERO && net_account != Address::ZERO {
-                let actual = available_balance(journal, net_account, sub_fee_refund);
-                if actual > U256::ZERO {
-                    let _ = journal.transfer(net_account, refund_to, actual);
-                }
-            }
-            remaining_refund = remaining_refund.saturating_sub(submission_fee_refund);
+            // Refund the submission fee from the network fee account (see `retry_fee_refund`).
+            retry_fee_refund(
+                journal,
+                net_account,
+                submission_fee_refund,
+                refund_to,
+                from,
+                &mut remaining_refund,
+            );
         } else {
-            // No submission fee refund on failure; just deduct from budget.
+            // The submission fee is still taken from the L1 deposit, just not refunded.
             remaining_refund = remaining_refund.saturating_sub(submission_fee_refund);
         }
 
-        // Deduct single-gas cost (execution cost) from remaining refund.
+        // Deduct single-gas cost (execution cost) from the deposit budget (no transfer).
         let single_gas_cost = effective_base_fee.saturating_mul(U256::from(gas_used));
         remaining_refund = remaining_refund.saturating_sub(single_gas_cost);
 
-        // Refund unused gas from fee accounts → refund_to (bounded by remaining_refund).
-        let gas_refund = effective_base_fee.saturating_mul(U256::from(gas_left));
-        let gas_refund = gas_refund.min(remaining_refund);
+        // Refund the unused gas. Nitro carves the infra share out of the gas bucket first, then
+        // refunds infra and network buckets separately, each via `refund()` (deposit cap +
+        // excess to `from`). Not pre-capped by the budget; `retry_fee_refund` applies the cap.
+        let mut network_refund = effective_base_fee.saturating_mul(U256::from(gas_left));
 
-        if gas_refund > U256::ZERO {
-            // Nitro retry refund split:
-            //   1) start with full unused-gas refund in network bucket
-            //   2) if infra account exists, carve out infra share from that bucket
-            //   3) refund carved infra share from infra account
-            //   4) refund remaining bucket from network account
-            let mut network_refund = gas_refund;
-
-            if spec.is_enabled_in(ArbSpecId::ARBOS_5) && infra_account != Address::ZERO {
-                let infra_fee = min_base_fee.min(effective_base_fee);
-                let infra_refund = infra_fee
-                    .saturating_mul(U256::from(gas_left))
-                    .min(network_refund);
-                network_refund = network_refund.saturating_sub(infra_refund);
-
-                let actual = available_balance(journal, infra_account, infra_refund);
-                if actual > U256::ZERO {
-                    let _ = journal.transfer(infra_account, refund_to, actual);
-                }
-            }
-
-            if network_refund > U256::ZERO && net_account != Address::ZERO {
-                let actual = available_balance(journal, net_account, network_refund);
-                if actual > U256::ZERO {
-                    let _ = journal.transfer(net_account, refund_to, actual);
-                }
-            }
+        if spec.is_enabled_in(ArbSpecId::ARBOS_5) && infra_account != Address::ZERO {
+            let infra_fee = min_base_fee.min(effective_base_fee);
+            let infra_refund = infra_fee
+                .saturating_mul(U256::from(gas_left))
+                .min(network_refund);
+            network_refund = network_refund.saturating_sub(infra_refund);
+            retry_fee_refund(
+                journal,
+                infra_account,
+                infra_refund,
+                refund_to,
+                from,
+                &mut remaining_refund,
+            );
         }
+
+        retry_fee_refund(journal, net_account, network_refund, refund_to, from, &mut remaining_refund);
 
         // GrowBacklog by gas_used (Nitro retry path: gasLimit - gasLeft), using the
         // active L2 pricing model.
@@ -856,9 +912,47 @@ where
         // EndTxHook because execution delegates to `mainnet.execution`, which does not call
         // `ArbHandler::last_frame_result`.
         retry_tx::apply_retry_tx_post_execution(evm.ctx_mut(), success)
-            .map_err(|msg| ERROR::from_string(msg.into()))?;
+            .map_err(|msg| ERROR::from_string(msg))?;
 
         Ok(())
+    }
+}
+
+/// Nitro's retryable `refund()` helper (`arbos/tx_processor.go`): move the full `amount` out of
+/// `refund_from`, split between `refund_to` and `from`.
+///
+/// `budget` is the remaining L1-deposit allowance: `min(amount, budget)` is reimbursed to
+/// `refund_to` (and decrements `budget`), while the EXCESS, which can't be charged against the
+/// deposit, is returned to `from` (the retryable's sender). Both transfers come from
+/// `refund_from` (a fee account). Balances are read first to avoid `OutOfFunds`.
+fn retry_fee_refund<J: JournalTr>(
+    journal: &mut J,
+    refund_from: Address,
+    amount: U256,
+    refund_to: Address,
+    from: Address,
+    budget: &mut U256,
+) {
+    if amount == U256::ZERO {
+        return;
+    }
+    let to_refund_addr = amount.min(*budget);
+    *budget = budget.saturating_sub(to_refund_addr);
+    if refund_from == Address::ZERO {
+        return;
+    }
+    if to_refund_addr > U256::ZERO {
+        let actual = available_balance(journal, refund_from, to_refund_addr);
+        if actual > U256::ZERO {
+            let _ = journal.transfer(refund_from, refund_to, actual);
+        }
+    }
+    let excess = amount.saturating_sub(to_refund_addr);
+    if excess > U256::ZERO {
+        let actual = available_balance(journal, refund_from, excess);
+        if actual > U256::ZERO {
+            let _ = journal.transfer(refund_from, from, actual);
+        }
     }
 }
 
@@ -880,13 +974,24 @@ fn internal_success_frame_result() -> FrameResult {
     ))
 }
 
-fn submit_retryable_success_frame_result(gas_limit: u64) -> FrameResult {
+fn submit_retryable_success_frame_result(gas_used: u64) -> FrameResult {
     FrameResult::Call(CallOutcome::new(
         InterpreterResult::new(
             InstructionResult::Stop,
             Bytes::new(),
-            Gas::new_spent(gas_limit),
+            Gas::new_spent_with_reservoir(gas_used, 0),
         ),
+        0..0,
+    ))
+}
+
+/// Frame result for a submit-retryable that failed a funds check: a reverted (status-0)
+/// receipt with zero gas, mirroring Nitro's `return true, ZeroGas, err, nil`. The state
+/// changes already applied in `apply_submit_retryable_tx` are not reverted (there is no
+/// frame checkpoint to unwind), matching Nitro keeping the deposit mint on failure.
+fn submit_retryable_failed_frame_result() -> FrameResult {
+    FrameResult::Call(CallOutcome::new(
+        InterpreterResult::new(InstructionResult::Revert, Bytes::new(), Gas::new(0)),
         0..0,
     ))
 }
@@ -901,6 +1006,70 @@ where
     ERROR: EvmTrError<EVM> + FromStringError,
 {
     type IT = EthInterpreter;
+
+    /// Mirror [`ArbHandler::execution`] (protocol short-circuits + poster/hold gas
+    /// reservation) but drive the **inspecting** frame loop. The default
+    /// `inspect_execution` skips the poster-gas reservation, so the inspector path would
+    /// otherwise leave `posterGas` in the EVM gas pool, inflating the `GAS` opcode and
+    /// diverging gas-sensitive contracts from the non-inspect `transact` path.
+    fn inspect_execution(
+        &mut self,
+        evm: &mut Self::Evm,
+        init_and_floor_gas: &InitialAndFloorGas,
+    ) -> Result<FrameResult, Self::Error> {
+        if is_internal_tx(evm) {
+            internal_tx::apply_internal_tx(evm.ctx_mut())
+                .map_err(|msg| ERROR::from_string(msg))?;
+            return Ok(internal_success_frame_result());
+        }
+        if is_deposit_tx(evm) {
+            deposit_tx::apply_deposit_tx(evm.ctx_mut())
+                .map_err(|msg| ERROR::from_string(msg))?;
+            return Ok(internal_success_frame_result());
+        }
+        if is_submit_retryable_tx(evm) {
+            let outcome = submit_retryable_tx::apply_submit_retryable_tx(evm.ctx_mut())
+                .map_err(|msg| ERROR::from_string(msg))?;
+            return Ok(match outcome {
+                submit_retryable_tx::SubmitRetryableOutcome::Created { gas_used } => {
+                    submit_retryable_success_frame_result(gas_used)
+                }
+                submit_retryable_tx::SubmitRetryableOutcome::Failed => {
+                    submit_retryable_failed_frame_result()
+                }
+            });
+        }
+        if is_retry_tx(evm) {
+            retry_tx::apply_retry_tx_pre_execution(evm.ctx_mut())
+                .map_err(|msg| ERROR::from_string(msg))?;
+        }
+
+        // poster_gas/hold_gas are 0 for retry txs (they bypass the GasChargingHook), so the
+        // same reservation formula covers them; reservoir is 0 at our specs (no EIP-7623).
+        let (tx_gas_limit, poster_gas, hold_gas) = {
+            let ctx = evm.ctx();
+            (ctx.tx().gas_limit(), ctx.chain().poster_gas, ctx.chain().hold_gas)
+        };
+        let total_initial = init_and_floor_gas
+            .initial_total_gas()
+            .saturating_add(poster_gas)
+            .saturating_add(hold_gas);
+        if total_initial > tx_gas_limit {
+            return Err(InvalidTransaction::CallGasCostMoreThanGasLimit {
+                initial_gas: total_initial,
+                gas_limit: tx_gas_limit,
+            }
+            .into());
+        }
+
+        let first_frame_input = self
+            .mainnet
+            .first_frame_input(evm, tx_gas_limit.saturating_sub(total_initial), 0)?;
+        let mut frame_result = self.inspect_run_exec_loop(evm, first_frame_input)?;
+        self.mainnet.last_frame_result(evm, 0, &mut frame_result)?;
+        frame_result.gas_mut().erase_cost(hold_gas);
+        Ok(frame_result)
+    }
 }
 
 #[cfg(test)]
@@ -936,13 +1105,10 @@ mod tests {
 
     fn make_evm(
         db: InMemoryDB,
-    ) -> impl ExecuteEvm<
-        Tx = ArbTransaction<TxEnv>,
-        Error = EVMError<
+    ) -> impl ExecuteCommitEvm<Tx = ArbTransaction<TxEnv>, Error = EVMError<
             <InMemoryDB as revm::Database>::Error,
             revm::context_interface::result::InvalidTransaction,
-        >,
-    > + ExecuteCommitEvm {
+        >> {
         let cfg = CfgEnv::new_with_spec(ArbSpecId::NITRO)
             .with_chain_id(42161)
             .with_disable_priority_fee_check(true);
@@ -1123,7 +1289,7 @@ mod tests {
         out.extend_from_slice(data);
         let remainder = data.len() % 32;
         if remainder != 0 {
-            out.extend(core::iter::repeat(0_u8).take(32 - remainder));
+            out.extend(std::iter::repeat_n(0_u8, 32 - remainder));
         }
         out.into()
     }
@@ -1401,9 +1567,9 @@ mod tests {
             "submit-retryable should refund excess submission fee plus gas-price refund"
         );
         assert_eq!(
-            out.result.gas_used(),
-            250_000,
-            "submit-retryable receipts should consume the user-specified gas limit"
+            out.result.tx_gas_used(),
+            0,
+            "submit-retryable with no scheduled auto-redeem reports gasUsed 0 (Nitro ZeroGas)"
         );
         assert_eq!(
             out.result.logs().len(),
@@ -1422,6 +1588,62 @@ mod tests {
             })
             .expect("submit-retryable should emit TicketCreated");
         assert_eq!(ticket_created.topics()[1], ticket_id);
+    }
+
+    #[test]
+    fn submit_retryable_tx_with_underfunded_submission_fee_fails_without_halting() {
+        // Nitro `tx_processor.go:258`: when the deposit mint can't cover the max submission
+        // fee, the tx is recorded as failed (status 0, gasUsed 0) and the block continues,
+        // keeping the deposit mint. It must NOT surface as a fatal EVM error (which would
+        // halt the driver, the real Arbitrum One batch-1 retryable 0xff56fb78… hits this).
+        let cfg = CfgEnv::new_with_spec(ArbSpecId::NITRO)
+            .with_chain_id(42161)
+            .with_disable_priority_fee_check(true);
+        let ctx = Context::mainnet()
+            .with_tx(ArbTransaction::<TxEnv>::default())
+            .with_cfg(cfg)
+            .with_chain(ArbChainContext::default())
+            .with_db(InMemoryDB::default());
+        let mut evm = ctx.build_arb();
+
+        let caller = Address::with_last_byte(0x71);
+        // deposit_value (1_000) < max_submission_fee (2_000); the caller starts at 0, so the
+        // balance after the mint is exactly the deposit and falls short of the fee.
+        let call = SubmitRetryableCall {
+            request_id: B256::with_last_byte(0x72),
+            l1_base_fee: U256::from(1_u64),
+            deposit_value: U256::from(1_000_u64),
+            retry_value: U256::from(5_u64),
+            gas_fee_cap: U256::from(1_u64),
+            gas_limit: 250_000,
+            max_submission_fee: U256::from(2_000_u64),
+            fee_refund_address: Address::with_last_byte(0x73),
+            beneficiary: Address::with_last_byte(0x74),
+            retry_to: Some(Address::with_last_byte(0x75)),
+            retry_data: revm::primitives::bytes!("deadbeef"),
+        };
+        let ticket_id = compute_submit_retryable_ticket_id(42161, caller, &call);
+        let tx = make_submit_retryable_tx(caller, call);
+        let out = evm.transact(tx).expect("under-funded submit-retryable must not be a fatal error");
+
+        assert!(!out.result.is_success(), "receipt status must be failure");
+        assert_eq!(out.result.tx_gas_used(), 0, "failed submit-retryable consumes zero gas");
+        assert!(out.result.logs().is_empty(), "no TicketCreated on a failed submission");
+
+        // The deposit mint is kept (Nitro does not revert it on this failure path).
+        let caller_account =
+            out.state.get(&caller).expect("caller account present in state diff");
+        assert_eq!(caller_account.info.balance, U256::from(1_000_u64));
+
+        // No retryable record was created: its numTries slot is unwritten.
+        let arbos_state = ArbosState::open();
+        let (_, num_tries_slot) = arbos_state.retryables.retryable(ticket_id).num_tries.account_and_key();
+        let unwritten = out
+            .state
+            .get(&ARBOS_STATE_ADDRESS)
+            .and_then(|acct| acct.storage.get(&U256::from_be_bytes(num_tries_slot.0)))
+            .is_none();
+        assert!(unwritten, "failed submission must not create a retryable record");
     }
 
     #[test]
@@ -1480,6 +1702,11 @@ mod tests {
                     && log.topics()[1] == ticket_id
             }),
             "missing RedeemScheduled log"
+        );
+        assert_eq!(
+            out.result.tx_gas_used(),
+            21_000,
+            "submit-retryable with a scheduled auto-redeem charges the reserved usergas as gasUsed"
         );
     }
 

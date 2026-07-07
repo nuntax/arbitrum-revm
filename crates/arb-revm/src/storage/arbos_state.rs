@@ -1,10 +1,37 @@
-use revm::primitives::{Address, U256};
+use revm::primitives::{Address, B256, U256};
 
 use super::{
     AddressSet, AddressTable, ArbFeatures, ArbosMetadataOffset, ArbosPrograms, BlockHashes,
     ChainConfig, L1Pricing, L2Pricing, Retryables, SendMerkle, StorageBacked, StorageSpace,
     Subspace,
 };
+use crate::arb_journal::ArbJournal;
+
+/// Post-execution ArbOS values that feed an Arbitrum block header
+/// (`HeaderInfo` + nonce/base-fee), read from state after a block is processed.
+///
+/// Mirrors what Nitro's `FinalizeBlock` / `createNewHeader` pull from `arbosState`:
+/// the send-Merkle root + size (→ `extra_data` / `mix_hash`), the (possibly
+/// upgraded) ArbOS version (→ `mix_hash`), and the L2 base fee (→ `base_fee_per_gas`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ArbBlockHeaderInfo {
+    /// Merkle root of the delayed send queue (Nitro `SendRoot` → header `extra_data`).
+    pub send_root: B256,
+    /// Number of sends accumulated so far (Nitro `SendCount` → `mix_hash[0..8]`).
+    pub send_count: u64,
+    /// ArbOS format version after this block (→ `mix_hash[16..24]`).
+    pub arbos_version: u64,
+    /// L1 block number ArbOS recorded for this block (Nitro `Blockhashes().L1BlockNumber()`,
+    /// → `mix_hash[8..16]`). This is the value set by the start-block internal tx, which may
+    /// differ from the raw message `l1BlockNumber` (version shims / no-advance blocks).
+    pub l1_block_number: u64,
+    /// Raw chain-wide tip-collection setting (Nitro `CollectTips()`). The block-level flag in
+    /// `mix_hash[25]` additionally requires the coinbase to be the batch poster, applied by the
+    /// caller, which knows the block coinbase.
+    pub collect_tips: bool,
+    /// L2 base fee in wei after start-of-block pricing (→ header `base_fee_per_gas`).
+    pub base_fee_wei: U256,
+}
 
 /// Root typed ArbOS state view.
 pub struct ArbosState {
@@ -83,6 +110,26 @@ impl ArbosState {
             collect_tips: root.storage_backed(ArbosMetadataOffset::CollectTips as u8),
             root,
         }
+    }
+
+    /// Reads the post-execution header-info values ([`ArbBlockHeaderInfo`]) through a journal.
+    ///
+    /// Called after all of a block's transactions have been committed (the journal then
+    /// loads the committed values straight from the underlying state), so the send-Merkle
+    /// root/size, the (possibly upgraded) ArbOS version, and the L2 base fee all reflect the
+    /// finalized block, exactly the inputs Nitro feeds into the block header.
+    pub fn read_block_header_info<J: ArbJournal>(
+        journal: &mut J,
+    ) -> eyre::Result<ArbBlockHeaderInfo> {
+        let state = Self::open();
+        Ok(ArbBlockHeaderInfo {
+            send_root: state.send_merkle.root(journal)?,
+            send_count: state.send_merkle.size(journal)?,
+            arbos_version: state.arbos_version.get(journal)?,
+            l1_block_number: state.block_hashes.l1_block_number(journal)?,
+            collect_tips: state.collect_tips.get(journal)? != 0,
+            base_fee_wei: state.l2_pricing.base_fee_wei.get(journal)?,
+        })
     }
 
     /// `(account, slot)` of the on-chain ArbOS version word.

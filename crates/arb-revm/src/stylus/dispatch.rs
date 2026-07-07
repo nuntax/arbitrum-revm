@@ -24,7 +24,8 @@ use revm::{
         InstructionResult, InterpreterAction, InterpreterResult, interpreter::EthInterpreter,
         interpreter_action::FrameInit,
     },
-    primitives::{Address, Bytes, U256},
+    primitives::{Address, Bytes, KECCAK_EMPTY, U256},
+    state::Bytecode,
 };
 use stylus::prover::programs::config::{CompileConfig, StylusConfig};
 
@@ -89,7 +90,7 @@ where
             let params = StylusParams::from_word(&params_word);
             let arbos_version = ctx.cfg().spec().arbos_version();
 
-            // Stored program metadata — Nitro's source of truth for init/page gas, set at
+            // Stored program metadata, Nitro's source of truth for init/page gas, set at
             // activation. We still compile/activate below for the executable module, but charge
             // gas from these stored values (re-deriving from the WASM can differ by a few units).
             let program = ArbosState::open()
@@ -154,7 +155,7 @@ where
                     params.init_cost_scalar,
                 );
             }
-            if !gas.record_cost(page_cost.saturating_add(init_cost)) {
+            if !gas.record_regular_cost(page_cost.saturating_add(init_cost)) {
                 return Some(InterpreterAction::Return(InterpreterResult {
                     result: InstructionResult::OutOfGas,
                     output: Bytes::new(),
@@ -305,21 +306,39 @@ where
             .load_account(bytecode_address)
             .map(|acc| acc.is_cold)
             .unwrap_or(true);
-        if !gas.record_cost(if is_cold { 2600 } else { 100 }) {
-            return fail(gas.spent());
+        if !gas.record_regular_cost(if is_cold { 2600 } else { 100 }) {
+            return fail(gas.total_gas_spent());
         }
+
+        // Load the bytecode + hash for `bytecode_address` so revm's sub-frame executes
+        // the correct code. Mirrors revm 41's CALL opcode (contract.rs: load_acc_and_calc_gas
+        // → known_bytecode: (bytecode_hash, bytecode)). Uses load_account_with_code to ensure
+        // the bytecode is fetched from the database and stored in the journal cache; then takes
+        // `code` directly from the account info (it is Some after load_account_with_code).
+        let (kb_hash, kb_bytecode) = {
+            match self.0.ctx.journal_mut().load_account_with_code(bytecode_address) {
+                Ok(acc) => {
+                    let hash = acc.info.code_hash;
+                    let bytecode = acc.info.code.clone().unwrap_or_default();
+                    (hash, bytecode)
+                }
+                Err(_) => (KECCAK_EMPTY, Bytecode::default()),
+            }
+        };
 
         let frame_input = FrameInput::Call(Box::new(CallInputs {
             input: CallInput::Bytes(calldata),
             return_memory_offset: 0..0,
             gas_limit: gas.remaining(),
+            reservoir: 0,
             bytecode_address,
-            known_bytecode: None,
+            known_bytecode: (kb_hash, kb_bytecode),
             target_address,
             caller,
             value: CallValue::Transfer(value),
             scheme: CallScheme::Call,
             is_static,
+            charged_new_account_state_gas: false,
         }));
 
         // Initialize the sub-frame off the current (Stylus) frame, then run it in a fresh
@@ -350,10 +369,10 @@ where
                     EvmApiStatus::Failure
                 };
                 let output = outcome.output().to_vec();
-                return (vec![status as u8], VecReader::new(output), ArbGas(gas.spent()));
+                return (vec![status as u8], VecReader::new(output), ArbGas(gas.total_gas_spent()));
             }
         }
-        fail(gas.spent())
+        fail(gas.total_gas_spent())
     }
 
     /// Stylus `Create1`/`Create2` hostio: run a revm create sub-frame and return the result.
@@ -424,7 +443,7 @@ where
         // reported back to the WASM, then withhold the EIP-150 63/64 stipend; the remainder
         // funds the create frame. (revm charges the base in the CREATE opcode, which we bypass.)
         let mut gas = Gas::new(gas_remaining);
-        if !gas.record_cost(gas_cost) {
+        if !gas.record_regular_cost(gas_cost) {
             return (
                 [vec![0x00], b"out of gas".to_vec()].concat(),
                 empty(),
@@ -432,7 +451,7 @@ where
             );
         }
         let gas_stipend = gas.remaining() / 64;
-        let _ = gas.record_cost(gas_stipend);
+        let _ = gas.record_regular_cost(gas_stipend);
 
         let frame_input = FrameInput::Create(Box::new(CreateInputs::new(
             contract,
@@ -440,6 +459,7 @@ where
             value,
             init_code,
             gas.remaining(),
+            0, // reservoir: Arbitrum does not use EIP-8037 state-gas
         )));
         let frame_result: Result<_, ContextError<<<CTX as ContextTr>::Db as Database>::Error>> =
             self.0
@@ -462,19 +482,19 @@ where
             if let Ok(FrameResult::Create(outcome)) = result {
                 if *outcome.instruction_result() == InstructionResult::Revert {
                     let output = outcome.output().to_vec();
-                    return ([vec![0x00], output].concat(), empty(), ArbGas(gas.spent()));
+                    return ([vec![0x00], output].concat(), empty(), ArbGas(gas.total_gas_spent()));
                 }
                 if let Some(address) = outcome.address {
                     gas.erase_cost(outcome.gas().remaining() + gas_stipend);
                     return (
                         [vec![0x01], address.to_vec()].concat(),
                         empty(),
-                        ArbGas(gas.spent()),
+                        ArbGas(gas.total_gas_spent()),
                     );
                 }
             }
         }
-        fail_addr(gas.spent())
+        fail_addr(gas.total_gas_spent())
     }
 }
 

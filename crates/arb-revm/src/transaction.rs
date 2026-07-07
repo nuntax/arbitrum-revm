@@ -272,7 +272,15 @@ impl<T: Transaction> Transaction for ArbTransaction<T> {
     }
 
     fn effective_gas_price(&self, base_fee: u128) -> u128 {
-        self.base.effective_gas_price(base_fee)
+        // Arbitrum drops the priority tip unless on-chain tip collection is enabled
+        // (Nitro `state_transition.go`: `if !CollectTips() && msg.GasPrice > baseFee {
+        // msg.GasPrice = baseFee }`), so the EVM-visible effective price, what the
+        // GASPRICE opcode returns, is the L2 base fee. Standard revm returns the nominal
+        // gas price for a legacy tx (e.g. 1000 gwei), which diverges in contracts that
+        // compute with `gas()`. Arbitrum One does not collect tips, so clamp to the base
+        // fee. (Fee accounting already uses `chain().paid_gas_price`; tip-collecting chains
+        // are not modelled here.)
+        self.base.effective_gas_price(base_fee).min(base_fee)
     }
 
     fn authorization_list_len(&self) -> usize {

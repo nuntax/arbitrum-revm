@@ -16,16 +16,16 @@ mod send_merkle;
 mod slot;
 
 use revm::{
-    context_interface::{JournalTr, context::SStoreResult, journaled_state::StateLoad},
-    database_interface::Database,
+    context_interface::{context::SStoreResult, journaled_state::StateLoad},
     primitives::{Address, Bytes, FixedBytes, StorageValue, U256, keccak256},
 };
 
+use crate::arb_journal::ArbJournal;
 use crate::constants::ARBOS_STATE_ADDRESS;
 
 pub use address_set::AddressSet;
 pub use address_table::AddressTable;
-pub use arbos_state::ArbosState;
+pub use arbos_state::{ArbBlockHeaderInfo, ArbosState};
 pub use batch_poster_table::{BatchPosterState, BatchPosterTable};
 pub use block_hashes::BlockHashes;
 pub use bytes::StorageBytes;
@@ -76,7 +76,7 @@ impl StorageSpace {
 
     /// Opens a nested subspace using ArbOS's keyed keccak derivation.
     pub fn open_subspace(&self, id: Bytes) -> Self {
-        let derived = keccak256(&[self.key.as_ref(), id.as_ref()].concat());
+        let derived = keccak256([self.key.as_ref(), id.as_ref()].concat());
         Self {
             key: Bytes::from(derived.to_vec()),
             account: self.account,
@@ -91,7 +91,7 @@ impl StorageSpace {
     /// Maps an ArbOS logical key into the concrete storage slot used on-chain.
     pub fn slot_for_hash(&self, hash: FixedBytes<32>) -> FixedBytes<32> {
         let hash_bytes = hash.as_slice();
-        let derived = keccak256(&[self.key.as_ref(), &hash_bytes[..31]].concat());
+        let derived = keccak256([self.key.as_ref(), &hash_bytes[..31]].concat());
         let mut bytes = [0_u8; 32];
         bytes[..31].copy_from_slice(&derived[..31]);
         bytes[31] = hash_bytes[31];
@@ -111,37 +111,33 @@ impl StorageSpace {
     }
 
     /// Loads a storage value through a journal.
-    pub fn get<J: JournalTr>(
+    pub fn get<J: ArbJournal>(
         &self,
         hash: FixedBytes<32>,
         journal: &mut J,
-    ) -> Result<StateLoad<StorageValue>, <J::Database as Database>::Error> {
-        journal.load_account(self.account)?;
-        journal.sload(self.account, self.slot_for_hash(hash).into())
+    ) -> Result<StateLoad<StorageValue>, J::Error> {
+        journal.read_slot(self.account, self.slot_for_hash(hash).into())
     }
 
     /// Loads a storage value by integer key.
-    pub fn get_u256<J: JournalTr>(
+    pub fn get_u256<J: ArbJournal>(
         &self,
         key: U256,
         journal: &mut J,
-    ) -> Result<StateLoad<StorageValue>, <J::Database as Database>::Error> {
+    ) -> Result<StateLoad<StorageValue>, J::Error> {
         self.get(FixedBytes::from(key.to_be_bytes()), journal)
     }
 
     /// Stores a storage value through a journal.
-    pub fn set<J: JournalTr>(
+    pub fn set<J: ArbJournal>(
         &self,
         hash: FixedBytes<32>,
         value: StorageValue,
         journal: &mut J,
-    ) -> Result<StateLoad<SStoreResult>, <J::Database as Database>::Error> {
-        journal.load_account(self.account)?;
-        let result = journal.sstore(self.account, self.slot_for_hash(hash).into(), value)?;
-        // Touch the account so the write survives commit; revm's DatabaseCommit
-        // skips untouched accounts, which would discard storage-only changes.
-        journal.touch_account(self.account);
-        Ok(result)
+    ) -> Result<StateLoad<SStoreResult>, J::Error> {
+        // `write_slot` warms the account, stores the slot, and touches the account so the write
+        // survives commit (revm's `DatabaseCommit` skips untouched accounts).
+        journal.write_slot(self.account, self.slot_for_hash(hash).into(), value)
     }
 
     /// Creates an untyped storage slot accessor.

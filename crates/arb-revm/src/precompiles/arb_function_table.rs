@@ -1,4 +1,5 @@
 use super::*;
+use crate::arb_journal::ArbPrecompileCtx;
 
 pub(super) fn run_arb_function_table<CTX>(
     _ctx: &mut CTX,
@@ -6,7 +7,7 @@ pub(super) fn run_arb_function_table<CTX>(
     gas_limit: u64,
 ) -> InterpreterResult
 where
-    CTX: ContextTr<Journal: JournalTr>,
+    CTX: ArbPrecompileCtx,
 {
     let call = match ArbFunctionTable::ArbFunctionTableCalls::abi_decode(input) {
         Ok(c) => c,

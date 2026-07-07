@@ -6,10 +6,10 @@
 //! the transactions as received over RPC, and the values Nitro produced for them.
 //!
 //! The flow is:
-//!  * **record** — wrap a live state source in [`RecordingDb`] while replaying a block
+//!  * **record**, wrap a live state source in [`RecordingDb`] while replaying a block
 //!    so every account / storage slot / blockhash the block touches is logged, then
 //!    serialize the result with the transactions and Nitro's receipts.
-//!  * **replay** — [`replay_fixture`] seeds an in-memory DB from the snapshot, runs
+//!  * **replay**, [`replay_fixture`] seeds an in-memory DB from the snapshot, runs
 //!    each transaction through the same conversion + handler the binary uses, and
 //!    diffs the outcome against the recorded expectations.
 //!
@@ -52,7 +52,7 @@ pub struct ReplayFixture {
     pub transactions: Vec<RpcArbTransaction>,
     /// Per-transaction outcomes Nitro produced (the parity oracle).
     pub expected: Vec<ExpectedTx>,
-    /// Nitro's post-block state for every account/slot the engine wrote — the
+    /// Nitro's post-block state for every account/slot the engine wrote, the
     /// state-parity oracle. Captured at block `N` for exactly the accounts and
     /// slots our execution touched. Empty when not recorded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -168,7 +168,7 @@ impl ReplayReport {
 ///
 /// Because reads only miss through to the inner source on first access, and commits
 /// land in the outer cache rather than here, the recorded set is exactly the block's
-/// prestate — minimal and free of values produced during execution.
+/// prestate, minimal and free of values produced during execution.
 pub struct RecordingDb<DB> {
     inner: DB,
     recorded: RefCell<Recorded>,
@@ -423,7 +423,7 @@ struct AccountWrites {
 /// overwrite earlier ones), mirroring `replay_block`'s live accumulation.
 fn merge_state_writes(writes: &mut BTreeMap<Address, AccountWrites>, state: &EvmState) {
     for (address, account) in state {
-        let info_changed = account.info != *account.original_info
+        let info_changed = account.info != account.original_info()
             || account.is_created()
             || account.is_selfdestructed();
         let mut changed_slots = account.changed_storage_slots().peekable();
@@ -513,12 +513,12 @@ fn compare_tx(
             result.is_success()
         ));
     }
-    if result.gas_used() != expected.gas_used {
+    if result.tx_gas_used() != expected.gas_used {
         mismatches.push(format!(
             "tx[{idx}] {:#x}: gas_used mismatch: expected {}, got {}",
             expected.tx_hash,
             expected.gas_used,
-            result.gas_used()
+            result.tx_gas_used()
         ));
     }
     let actual_created = result.created_address();

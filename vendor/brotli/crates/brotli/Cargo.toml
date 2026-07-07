@@ -1,0 +1,29 @@
+# Vendored from OffchainLabs/nitro (crates/brotli) for byte-exact sequencer batch
+# (de)compression parity. Licensed under the Business Source License 1.1; it wraps the
+# Brotli C library, which is MIT (see ../../brotli/LICENSE). Change date 2030-12-31,
+# then Apache-2.0. See the arb-revm NOTICE. Standalone (own workspace) so it is not
+# pulled into the arb-revm workspace; the wasmer_traits feature was dropped (unused).
+[package]
+name = "brotli"
+version = "0.1.0"
+authors = ["Offchain Labs"]
+edition = "2024"
+license = "BUSL-1.1"
+publish = false
+repository = "https://github.com/OffchainLabs/nitro.git"
+rust-version = "1.93"
+
+[workspace]
+
+[dependencies]
+lazy_static = "1.4.0"
+num_enum = { version = "0.7.2", default-features = false }
+
+[build-dependencies]
+cc = { version = "1.0", optional = true }
+
+[lib]
+crate-type = ["lib"]
+
+[features]
+cc_brotli = ["dep:cc"]

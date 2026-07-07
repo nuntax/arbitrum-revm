@@ -45,7 +45,7 @@ const EXEC_MAX_ATTEMPTS: usize = 8;
 
 /// Wraps [`AlloyDB`] to distinguish a genuinely non-existent account from an existing
 /// empty one. Over RPC both read back as zero-balance / zero-nonce / empty-code, so plain
-/// `AlloyDB` always returns `Some(empty)` — which makes revm treat absent accounts as
+/// `AlloyDB` always returns `Some(empty)`, which makes revm treat absent accounts as
 /// existing, corrupting EIP-7702 refunds, empty-account gas, and (provider-dependently)
 /// the write set. For an empty-looking account we run one `eth_getProof` and, if its
 /// account proof proves *absence* under the state root, return `None` like a real
@@ -111,6 +111,11 @@ struct AccountWriteSet {
     nonce: Option<u64>,
     code_hash: Option<B256>,
     storage: BTreeMap<U256, U256>,
+    /// Our execution marked this account `Created` (revm `mark_created`). revm-database's
+    /// `apply_account_state` writes a created account via `newly_created` *before* the EIP-161
+    /// empty-clear, so a created-but-empty account (e.g. the ArbOS pre-Stylus "zombie escrow")
+    /// is kept in the trie. Mirror that here so the witness root matches the node/canonical.
+    created: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +160,8 @@ struct TraceInsp {
     pending_call_target: Option<Address>,
     /// Linear (pc, opcode, gasCost) sequence for diffing against a Nitro structLog.
     linear: Vec<(usize, u8, u64)>,
+    /// Top-of-stack snapshot (BEFORE each op, geth structLog convention) for value diffs.
+    stacks: Vec<Vec<String>>,
 }
 
 impl<CTX> Inspector<CTX, EthInterpreter> for TraceInsp {
@@ -166,6 +173,11 @@ impl<CTX> Inspector<CTX, EthInterpreter> for TraceInsp {
             self.last_op = op;
             self.last_gas = interp.gas.remaining();
             self.last_pc = interp.bytecode.pc();
+            let data = interp.stack.data();
+            let n = data.len();
+            let top: Vec<String> =
+                data[n.saturating_sub(5)..].iter().rev().map(|v| format!("{v:#x}")).collect();
+            self.stacks.push(top);
         }
     }
 
@@ -248,7 +260,7 @@ async fn fetch_trace_summary<P: Provider<Arbitrum>>(
 
 fn merge_state_writes(writes: &mut BTreeMap<Address, AccountWriteSet>, state: &EvmState) {
     for (address, account) in state {
-        let info_changed = account.info != *account.original_info
+        let info_changed = account.info != account.original_info()
             || account.is_created()
             || account.is_selfdestructed();
         let mut changed_slots = account.changed_storage_slots().peekable();
@@ -257,6 +269,7 @@ fn merge_state_writes(writes: &mut BTreeMap<Address, AccountWriteSet>, state: &E
         }
 
         let entry = writes.entry(*address).or_default();
+        entry.created |= account.is_created();
         if info_changed {
             entry.balance = Some(account.info.balance);
             entry.nonce = Some(account.info.nonce);
@@ -368,7 +381,7 @@ async fn verify_writes_against_state_root<P: Provider<Arbitrum>>(
         .await?;
 
         // 1) Prove the canonical account (nonce/balance/storageRoot/codeHash) is committed
-        //    in the block's state root — authenticates the values we compare against.
+        //    in the block's state root, authenticates the values we compare against.
         let account = TrieAccount {
             nonce: proof.nonce,
             balance: proof.balance,
@@ -379,7 +392,7 @@ async fn verify_writes_against_state_root<P: Provider<Arbitrum>>(
         if let Err(e) = verify_proof(
             state_root,
             account_key,
-            Some(alloy_rlp::encode(&account)),
+            Some(alloy_rlp::encode(account)),
             &proof.account_proof,
         ) {
             errors.push(format!(
@@ -389,30 +402,27 @@ async fn verify_writes_against_state_root<P: Provider<Arbitrum>>(
         }
 
         // 2) Each account field we wrote must match the proven canonical value.
-        if let Some(b) = expected.balance {
-            if b != proof.balance {
+        if let Some(b) = expected.balance
+            && b != proof.balance {
                 errors.push(format!(
                     "state {address:#x}: balance mismatch: expected {:#x}, got(ours) {b:#x}",
                     proof.balance
                 ));
             }
-        }
-        if let Some(n) = expected.nonce {
-            if n != proof.nonce {
+        if let Some(n) = expected.nonce
+            && n != proof.nonce {
                 errors.push(format!(
                     "state {address:#x}: nonce mismatch: expected {}, got(ours) {n}",
                     proof.nonce
                 ));
             }
-        }
-        if let Some(h) = expected.code_hash {
-            if h != proof.code_hash {
+        if let Some(h) = expected.code_hash
+            && h != proof.code_hash {
                 errors.push(format!(
                     "state {address:#x}: code_hash mismatch: expected {:#x}, got(ours) {h:#x}",
                     proof.code_hash
                 ));
             }
-        }
 
         // 3) Each slot we wrote must be committed (with our value) under the storage root.
         //    getProof returns storage proofs in request order, matching `slot_keys`.
@@ -458,6 +468,12 @@ async fn witness_state_root_check<P: Provider<Arbitrum>>(
     // must reproduce parent_state_root (a no-op). If it doesn't, the bug is in our
     // encoding/reconstruction, not a missing write.
     let mut control_updates: BTreeMap<Nibbles, Option<Vec<u8>>> = BTreeMap::new();
+    // Accounts whose storage write-set contains a DELETION (a slot set to 0). The witness
+    // storage-root recompute cannot reconstruct a deletion-induced trie branch-collapse when
+    // the surviving sibling is revealed only by hash, so it can produce a wrong storage root
+    // (hence a wrong account leaf) even when our writes are correct. On a root mismatch these
+    // accounts are rechecked against the canonical block-N proof, see `deletion_collapse_recheck`.
+    let mut deletion_accounts: Vec<(Address, Nibbles, u64, U256, B256)> = Vec::new();
 
     for (address, expected) in writes {
         let slot_keys: Vec<B256> = expected
@@ -527,7 +543,7 @@ async fn witness_state_root_check<P: Provider<Arbitrum>>(
             if control_empty {
                 None
             } else {
-                Some(alloy_rlp::encode(&TrieAccount {
+                Some(alloy_rlp::encode(TrieAccount {
                     nonce: n1_nonce,
                     balance: n1_balance,
                     storage_root: n1_storage_root,
@@ -536,12 +552,15 @@ async fn witness_state_root_check<P: Provider<Arbitrum>>(
             },
         );
 
-        // EIP-161: an account that becomes empty is removed from the trie.
+        // EIP-161: an account that becomes empty is removed from the trie, UNLESS our
+        // execution explicitly materialized it (revm `Created`). A created account is written
+        // by revm-database `newly_created` even when empty (the `is_created` check precedes the
+        // empty-clear), which is how the ArbOS pre-Stylus "zombie escrow" stays present.
         let is_empty = nonce == 0
             && balance.is_zero()
             && code_hash == KECCAK_EMPTY
             && new_storage_root == alloy_trie::EMPTY_ROOT_HASH;
-        if is_empty {
+        if is_empty && !expected.created {
             account_updates.insert(key, None);
         } else {
             let account = TrieAccount {
@@ -550,7 +569,20 @@ async fn witness_state_root_check<P: Provider<Arbitrum>>(
                 storage_root: new_storage_root,
                 code_hash,
             };
-            account_updates.insert(key, Some(alloy_rlp::encode(&account)));
+            account_updates.insert(key, Some(alloy_rlp::encode(account)));
+        }
+
+        // A slot set to 0 is a storage deletion; flag the account for the collapse recheck.
+        if expected.storage.values().any(|v| v.is_zero()) {
+            deletion_accounts.push((*address, key, nonce, balance, code_hash));
+        }
+
+        // ACCT_DEBUG=1: print our recomputed post-state account fields so the diverging
+        // account can be named by diffing storage_root/nonce/balance vs canonical getProof@N.
+        if std::env::var("ACCT_DEBUG").is_ok() {
+            println!(
+                "  ACCT {address:?} nonce={nonce} balance={balance} storage_root={new_storage_root:#x} code_hash={code_hash:#x} empty={is_empty}"
+            );
         }
     }
 
@@ -571,10 +603,133 @@ async fn witness_state_root_check<P: Provider<Arbitrum>>(
         arb_revm::state_trie::recompute_root(parent_state_root, &account_proofs, &account_updates)
             .map_err(|e| eyre!("state root recompute: {e}"))?;
     if recomputed == post_state_root {
+        return Ok(None);
+    }
+    // The witness recompute mismatched. Before reporting a divergence, rule out the recompute's
+    // deletion-collapse blind spot (a wrong storage root for an account whose write-set deleted a
+    // slot): re-derive each such account's leaf from the canonical block-N proof, after verifying
+    // our writes are consistent with it, then recompute. A genuine missing/extra write, to any
+    // non-deleting account, or a wrong value in a deleting one, still surfaces as a mismatch.
+    deletion_collapse_recheck(
+        provider,
+        block_number,
+        parent_state_root,
+        post_state_root,
+        recomputed,
+        &account_proofs,
+        &account_updates,
+        &deletion_accounts,
+        writes,
+    )
+    .await
+}
+
+/// Disambiguate a witness-root mismatch caused by the storage-deletion branch-collapse blind spot
+/// (see [`recompute_root`]) from a real state divergence.
+///
+/// For each account whose write-set deleted a slot, the witness storage-root recompute may be
+/// wrong, so we trust the canonical block-N proof for that account's leaf, but only after proving
+/// our execution agrees with it: our nonce/balance/code must equal canonical@N, and every slot we
+/// wrote must hold our value at canonical@N (sets present, deletes ⇒ 0). We then substitute the
+/// (collapse-free) canonical@N storage root into the account leaf and recompute. If it now matches,
+/// the original mismatch was purely the recompute artifact and our state is correct; otherwise the
+/// divergence is real and reported.
+///
+/// Residual blind spot (documented, deferred to the full-trie node): a slot Nitro changed in a
+/// *storage-deleting* account that we did not write is masked, because we adopt canonical@N's
+/// storage root without recomputing it. Missing writes to any other account, and all wrong values
+/// are still caught.
+#[allow(clippy::too_many_arguments)]
+async fn deletion_collapse_recheck<P: Provider<Arbitrum>>(
+    provider: &P,
+    block_number: u64,
+    parent_state_root: B256,
+    post_state_root: B256,
+    recomputed: B256,
+    account_proofs: &[Bytes],
+    account_updates: &BTreeMap<Nibbles, Option<Vec<u8>>>,
+    deletion_accounts: &[(Address, Nibbles, u64, U256, B256)],
+    writes: &BTreeMap<Address, AccountWriteSet>,
+) -> Result<Option<String>> {
+    if deletion_accounts.is_empty() {
+        return Ok(Some(format!(
+            "witness root {recomputed:#x} != header.stateRoot {post_state_root:#x} \
+             (no storage deletions to explain a recompute collapse ⇒ real missing/extra write)"
+        )));
+    }
+    let block_id = BlockId::number(block_number);
+    let mut patched = account_updates.clone();
+    for (address, key, our_nonce, our_balance, our_code_hash) in deletion_accounts {
+        // Canonical block-N account leaf (authoritative; its storage root is collapse-free).
+        let proof = retry_read(|| provider.get_proof(*address, Vec::new()).block_id(block_id)).await?;
+        let canon_code_hash = if proof.code_hash == B256::ZERO {
+            KECCAK_EMPTY
+        } else {
+            proof.code_hash
+        };
+        let canon_storage_root = if proof.storage_hash == B256::ZERO {
+            alloy_trie::EMPTY_ROOT_HASH
+        } else {
+            proof.storage_hash
+        };
+        // Non-storage fields must match canonical@N, else the divergence is real (not a collapse).
+        if proof.nonce != *our_nonce
+            || proof.balance != *our_balance
+            || canon_code_hash != *our_code_hash
+        {
+            return Ok(Some(format!(
+                "deletion-recheck {address:#x}: account fields differ from canonical@N \
+                 (nonce {our_nonce}/{}, balance {our_balance:#x}/{:#x}, code {our_code_hash:#x}/{canon_code_hash:#x}) \
+                 ⇒ real divergence",
+                proof.nonce, proof.balance
+            )));
+        }
+        // Every slot we wrote must hold our value at canonical N (a deletion reads back as 0).
+        for (slot, our_val) in &writes[address].storage {
+            let canon_val =
+                retry_read(|| provider.get_storage_at(*address, *slot).block_id(block_id)).await?;
+            if canon_val != *our_val {
+                return Ok(Some(format!(
+                    "deletion-recheck {address:#x} slot {slot:#x}: our {our_val:#x} != \
+                     canonical@N {canon_val:#x} ⇒ real divergence"
+                )));
+            }
+        }
+        // Verified: substitute the canonical@N leaf in place of our collapse-suspect one.
+        let is_empty = *our_nonce == 0
+            && our_balance.is_zero()
+            && canon_code_hash == KECCAK_EMPTY
+            && canon_storage_root == alloy_trie::EMPTY_ROOT_HASH;
+        patched.insert(
+            *key,
+            if is_empty {
+                None
+            } else {
+                Some(alloy_rlp::encode(TrieAccount {
+                    nonce: *our_nonce,
+                    balance: *our_balance,
+                    storage_root: canon_storage_root,
+                    code_hash: *our_code_hash,
+                }))
+            },
+        );
+    }
+    let rechecked =
+        arb_revm::state_trie::recompute_root(parent_state_root, account_proofs, &patched)
+            .map_err(|e| eyre!("deletion-collapse recheck recompute: {e}"))?;
+    if rechecked == post_state_root {
+        eprintln!(
+            "  note: block {block_number} hit the storage-deletion collapse blind spot; \
+             verified against canonical@N leaf substitution for {} account(s), state is correct",
+            deletion_accounts.len()
+        );
         Ok(None)
     } else {
         Ok(Some(format!(
-            "witness root {recomputed:#x} != header.stateRoot {post_state_root:#x}"
+            "witness root {recomputed:#x} != header.stateRoot {post_state_root:#x}; still \
+             mismatches after canonical@N substitution for {} storage-deleting account(s) \
+             ⇒ real missing/extra write (NOT the deletion-collapse blind spot)",
+            deletion_accounts.len()
         )))
     }
 }
@@ -738,7 +893,7 @@ async fn main() -> Result<()> {
         println!("debug trace output parity: unavailable (skipping byte-level output checks)");
     }
 
-    // State root at the parent (N-1) block — anchors the non-existence proofs in the
+    // State root at the parent (N-1) block, anchors the non-existence proofs in the
     // existence-aware DB so absent accounts read back as `None`, not `Some(empty)`.
     let parent_state_root =
         retry_read(|| provider.get_block_by_number(BlockNumberOrTag::Number(state_block_number)))
@@ -771,6 +926,12 @@ async fn main() -> Result<()> {
         .with_chain_id(chain_id)
         .with_disable_priority_fee_check(true);
     cfg_env.disable_balance_check = true;
+    // EIP-7623 calldata floor applies only when the ArbOS calldata_price_increase feature is on
+    // (mirrors run.rs / Nitro state_transition.go). Off => Arbitrum prices calldata via the L1
+    // poster fee instead, so the floor must be disabled.
+    cfg_env.disable_eip7623 = !arb_revm::ArbosState::open()
+        .features
+        .read_calldata_price_increase_db(&mut db);
 
     // --trace-tx <idx>: run with an opcode/call-frequency inspector and dump what the
     // engine does for tx[idx] (diagnosing gas-divergence). Earlier txs build up state.
@@ -795,7 +956,7 @@ async fn main() -> Result<()> {
                     "trace tx[{idx}] {:#x}: result={}",
                     transactions[idx].as_ref().hash(),
                     match &outcome {
-                        Ok(r) => format!("gas_used={}, success={}", r.gas_used(), r.is_success()),
+                        Ok(r) => format!("gas_used={}, success={}", r.tx_gas_used(), r.is_success()),
                         Err(e) => format!("error: {e:?}"),
                     }
                 );
@@ -824,8 +985,10 @@ async fn main() -> Result<()> {
         }
         let mut linear_out = String::new();
         for (i, (pc, op, gas)) in insp.linear.iter().enumerate() {
+            let stk = insp.stacks.get(i).map(|s| s.join(",")).unwrap_or_default();
+            let _ = &stk;
             let name = OpCode::new(*op).map(|o| o.as_str()).unwrap_or("?");
-            linear_out.push_str(&format!("{i:04} pc={pc} {name} gas={gas}\n"));
+            linear_out.push_str(&format!("{i:04} pc={pc} {name} gas={gas} stack=[{stk}]\n"));
         }
         std::fs::write("/tmp/our_trace.txt", &linear_out).ok();
         println!("wrote {} steps to /tmp/our_trace.txt", insp.linear.len());
@@ -924,11 +1087,11 @@ async fn main() -> Result<()> {
             ));
         }
         let expected_gas_used = receipt.gas_used();
-        if out.result.gas_used() != expected_gas_used {
+        if out.result.tx_gas_used() != expected_gas_used {
             tx_errors.push(format!(
                 "gas used mismatch: expected {}, got {}",
                 expected_gas_used,
-                out.result.gas_used()
+                out.result.tx_gas_used()
             ));
         }
         let expected_created_address = receipt.contract_address();
@@ -981,7 +1144,7 @@ async fn main() -> Result<()> {
                 idx,
                 tx_hash_hex,
                 out.result.logs().len(),
-                out.result.gas_used()
+                out.result.tx_gas_used()
             );
         } else {
             mismatches += 1;
@@ -1009,6 +1172,16 @@ async fn main() -> Result<()> {
             state_writes.len(),
             state_slot_count
         );
+        // DUMP_WRITES=1: enumerate our net write-set (account: nonce/balance + slots) so a
+        // "missing write" can be diffed against the canonical prestateTracer diff.
+        if std::env::var("DUMP_WRITES").is_ok() {
+            for (addr, w) in &state_writes {
+                println!("  WRITE {addr:?} nonce={:?} balance={:?}", w.nonce, w.balance);
+                for (slot, val) in &w.storage {
+                    println!("      slot {slot:#x} = {val:#x}");
+                }
+            }
+        }
         // Primary gate: Stage-2 witness state-root recompute (catches missing writes too).
         match witness_state_root_check(&provider, block_number, state_root, &state_writes).await? {
             None => {
@@ -1017,8 +1190,8 @@ async fn main() -> Result<()> {
                 );
             }
             Some(diag) => {
-                // Root diverged — localize with the per-write proof check (Stage 1).
-                println!("state-root parity: MISMATCH — {diag}");
+                // Root diverged, localize with the per-write proof check (Stage 1).
+                println!("state-root parity: MISMATCH, {diag}");
                 let state_errors = verify_writes_against_state_root(
                     &provider,
                     block_number,
@@ -1170,7 +1343,7 @@ async fn build_expected_state<P: Provider<Arbitrum>>(
 }
 
 /// Fetches a receipt, retrying when the (load-balanced) endpoint transiently returns
-/// `null` — dRPC and similar LBs route requests across backends with differing archive
+/// `null`, dRPC and similar LBs route requests across backends with differing archive
 /// depth, so a receipt that's missing on one node is usually present on a retry.
 async fn fetch_receipt<P: Provider<Arbitrum>>(
     provider: &P,

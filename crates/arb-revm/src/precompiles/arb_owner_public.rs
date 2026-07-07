@@ -1,4 +1,5 @@
 use super::*;
+use crate::arb_journal::ArbPrecompileCtx;
 use crate::storage::{stylus_param_layout as layout, unpack_uint};
 
 pub(super) fn run_arb_owner_public<CTX>(
@@ -7,7 +8,7 @@ pub(super) fn run_arb_owner_public<CTX>(
     gas_limit: u64,
 ) -> InterpreterResult
 where
-    CTX: ContextTr<Journal: JournalTr>,
+    CTX: ArbPrecompileCtx,
 {
     let call = match ArbOwnerPublic::ArbOwnerPublicCalls::abi_decode(input) {
         Ok(c) => c,

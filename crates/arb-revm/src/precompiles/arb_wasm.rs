@@ -1,4 +1,5 @@
 use super::*;
+use crate::arb_journal::ArbPrecompileCtx;
 use crate::storage::{stylus_param_layout as layout, unpack_uint};
 
 const MIN_INIT_GAS_UNITS: u64 = 128;
@@ -9,7 +10,7 @@ const ARBOS_VERSION_STYLUS_CHARGING_FIXES: u64 = 32;
 
 pub(super) fn run_arb_wasm<CTX>(ctx: &mut CTX, input: &[u8], gas_limit: u64) -> InterpreterResult
 where
-    CTX: ContextTr<Journal: JournalTr>,
+    CTX: ArbPrecompileCtx,
 {
     let call = match ArbWasm::ArbWasmCalls::abi_decode(input) {
         Ok(c) => c,

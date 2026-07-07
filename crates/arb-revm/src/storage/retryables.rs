@@ -1,10 +1,11 @@
 use eyre::Result;
 use revm::{
-    context_interface::{JournalTr, journaled_state::TransferError},
+    context_interface::journaled_state::TransferError,
     primitives::{Address, B256, Bytes, U256, keccak256},
 };
 
 use super::{StorageBacked, StorageBytes, StorageQueue, StorageSpace};
+use crate::arb_journal::ArbJournal;
 use crate::util::address_to_u256;
 
 const TIMEOUT_QUEUE_KEY: u8 = 0;
@@ -38,11 +39,11 @@ impl Retryables {
         }
     }
 
-    pub fn initialize<J: JournalTr>(&self, journal: &mut J) -> Result<()> {
+    pub fn initialize<J: ArbJournal>(&self, journal: &mut J) -> Result<()> {
         self.timeout_queue.initialize(journal)
     }
 
-    pub fn ensure_timeout_queue_initialized<J: JournalTr>(&self, journal: &mut J) -> Result<()> {
+    pub fn ensure_timeout_queue_initialized<J: ArbJournal>(&self, journal: &mut J) -> Result<()> {
         self.timeout_queue.ensure_initialized(journal)
     }
 
@@ -53,7 +54,7 @@ impl Retryables {
         RetryableRecord::open(id, &subspace)
     }
 
-    pub fn delete_retryable<J: JournalTr>(&self, id: B256, journal: &mut J) -> Result<bool> {
+    pub fn delete_retryable<J: ArbJournal>(&self, id: B256, journal: &mut J) -> Result<bool> {
         let retryable = self.retryable(id);
         let timeout = retryable.timeout.get(journal)?;
         if timeout == 0 {
@@ -62,7 +63,7 @@ impl Retryables {
 
         let beneficiary = retryable.beneficiary.get(journal)?;
         let escrow = retryable_escrow_address(id);
-        let escrow_balance = journal.load_account(escrow)?.info.balance;
+        let escrow_balance = journal.account_balance(escrow)?;
         if escrow_balance > U256::ZERO {
             let transfer_error = journal.transfer(escrow, beneficiary, escrow_balance)?;
             map_transfer_error(transfer_error, "retryable escrow release")?;
@@ -84,7 +85,7 @@ impl Retryables {
     ///
     /// Returns `Ok(true)` if an entry was consumed or modified, `Ok(false)` if no
     /// work was needed.
-    pub fn try_to_reap_one<J: JournalTr>(
+    pub fn try_to_reap_one<J: ArbJournal>(
         &self,
         current_timestamp: u64,
         journal: &mut J,
@@ -155,12 +156,12 @@ impl RetryableRecord {
         }
     }
 
-    pub fn exists<J: JournalTr>(&self, current_timestamp: u64, journal: &mut J) -> Result<bool> {
+    pub fn exists<J: ArbJournal>(&self, current_timestamp: u64, journal: &mut J) -> Result<bool> {
         let timeout = self.timeout.get(journal)?;
         Ok(timeout != 0 && timeout >= current_timestamp)
     }
 
-    pub fn to<J: JournalTr>(&self, journal: &mut J) -> Result<Option<Address>> {
+    pub fn to<J: ArbJournal>(&self, journal: &mut J) -> Result<Option<Address>> {
         let raw = self.to_raw.get(journal)?;
         if raw == nil_address_representation() {
             return Ok(None);
@@ -169,7 +170,7 @@ impl RetryableRecord {
         Ok(Some(Address::from_slice(&bytes[12..])))
     }
 
-    pub fn set_to<J: JournalTr>(&self, to: Option<Address>, journal: &mut J) -> Result<()> {
+    pub fn set_to<J: ArbJournal>(&self, to: Option<Address>, journal: &mut J) -> Result<()> {
         let raw = match to {
             Some(address) => address_to_u256(address),
             None => nil_address_representation(),
@@ -178,7 +179,7 @@ impl RetryableRecord {
         Ok(())
     }
 
-    pub fn timeout_with_windows<J: JournalTr>(&self, journal: &mut J) -> Result<u64> {
+    pub fn timeout_with_windows<J: ArbJournal>(&self, journal: &mut J) -> Result<u64> {
         let timeout = self.timeout.get(journal)?;
         let windows = self.timeout_windows_left.get(journal)?;
         Ok(timeout.saturating_add(windows.saturating_mul(RETRYABLE_LIFETIME_SECONDS)))

@@ -69,7 +69,15 @@ fn start_block_internal_tx(call: ArbSystemCall, chain_id: u64) -> ArbTransaction
     ArbTransaction::new(tx)
 }
 
-fn scheduled_retries_from_redeem_logs<CTX>(
+/// Derives the scheduled retry (auto-redeem) transactions implied by a transaction's
+/// `RedeemScheduled` logs, reading the retryable state from `ctx`.
+///
+/// This is the ArbOS "scheduled retry" mechanism: a successful `SubmitRetryable` (auto-redeem) or
+/// `ArbRetryableTx.redeem` precompile call emits a `RedeemScheduled` event, and ArbOS then runs the
+/// corresponding redeem transaction **within the same block**. [`execute_message`] uses this in its
+/// own loop; the reth node's block-builder loop ([`crate`] consumers) calls it after each committed
+/// tx so produced blocks include the same auto-redeem txs (and thus match Nitro's gas/state/roots).
+pub fn scheduled_retries_from_redeem_logs<CTX>(
     ctx: &mut CTX,
     logs: &[Log],
     chain_id: u64,
@@ -224,6 +232,10 @@ where
         .with_chain_id(cfg.chain_id)
         .with_disable_priority_fee_check(cfg.disable_priority_fee_check);
     cfg_env.disable_balance_check = cfg.disable_balance_check;
+    // EIP-7623 calldata floor is applied only when the ArbOS `calldata_price_increase` feature
+    // is enabled (Nitro state_transition.go: `IsPrague && IsCalldataPricingIncreaseEnabled()`).
+    // Arbitrum otherwise prices calldata via its own L1 poster fee, so the floor must be off.
+    cfg_env.disable_eip7623 = !ArbosState::open().features.read_calldata_price_increase_db(db);
 
     let context: ArbContext<&mut DB> = ArbContext::arb_with_chain_context(chain)
         .with_db(db)
@@ -303,7 +315,7 @@ where
         if commits_state {
             let start_block_result = evm.transact(start_block_tx)?;
             out.start_block_success = start_block_result.result.is_success();
-            out.start_block_gas_used = start_block_result.result.gas_used();
+            out.start_block_gas_used = start_block_result.result.tx_gas_used();
             evm.commit(start_block_result.state);
             out.writes.push(ArbWriteEffect {
                 stage: ArbWriteStage::StartBlockPrelude,
@@ -313,7 +325,7 @@ where
         } else {
             let start_block_result = evm.transact(start_block_tx)?.result;
             out.start_block_success = start_block_result.is_success();
-            out.start_block_gas_used = start_block_result.gas_used();
+            out.start_block_gas_used = start_block_result.tx_gas_used();
         }
     }
 
@@ -344,7 +356,7 @@ where
         out.executed = out.executed.saturating_add(1);
         out.txs.push(ArbTxExecution {
             tx_hash: queued.tx.hash(),
-            gas_used: result.gas_used(),
+            gas_used: result.tx_gas_used(),
             success: result.is_success(),
         });
         if commits_state {
@@ -354,7 +366,7 @@ where
                 tx_index: queued.tx_index,
                 target: ArbWriteTarget::StateDatabase,
             });
-            // Scheduled retries — including a submit-retryable's auto-redeem — are
+            // Scheduled retries, including a submit-retryable's auto-redeem, are
             // derived uniformly from the `RedeemScheduled` logs emitted during this
             // transaction. The submit path emits exactly that log when it auto-redeems,
             // so it must not be scheduled a second time here.

@@ -1,5 +1,5 @@
 use super::*;
-use revm::context_interface::Block;
+use crate::arb_journal::ArbPrecompileCtx;
 
 pub(super) fn run_arb_statistics<CTX>(
     ctx: &mut CTX,
@@ -7,7 +7,7 @@ pub(super) fn run_arb_statistics<CTX>(
     gas_limit: u64,
 ) -> InterpreterResult
 where
-    CTX: ContextTr<Journal: JournalTr>,
+    CTX: ArbPrecompileCtx,
 {
     let call = match ArbStatistics::ArbStatisticsCalls::abi_decode(input) {
         Ok(c) => c,
@@ -19,7 +19,7 @@ where
     match call {
         ArbStatistics::ArbStatisticsCalls::getStats(_) => {
             // Post-Nitro: only block number is meaningful; all Classic stats are 0.
-            let num: u64 = ctx.block().number().try_into().unwrap_or(u64::MAX);
+            let num: u64 = ctx.block_number();
             ok_result(
                 gas_limit,
                 alloy_core::sol_types::SolValue::abi_encode(&(

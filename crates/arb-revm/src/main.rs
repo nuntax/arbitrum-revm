@@ -1,14 +1,17 @@
+// revm's TxEnv/BlockEnv are #[non_exhaustive]; they are built by field assignment.
+#![allow(clippy::field_reassign_with_default)]
+
 use alloy_provider::{Provider, ProviderBuilder};
 use arb_alloy_consensus::transactions::{ArbTxEnvelope, TxRetry};
 use arb_revm::{
     ArbBuilder, ArbChainContext, ArbContext, ArbExecCfg, ArbExecOutcome, ArbExecutionHooks,
-    ArbExecutionInput, ArbMessageEnvelope, ArbParentHeader, ArbRunner, ArbRunnerError,
+    ArbExecutionInput, ArbParentHeader, ArbRunner, ArbRunnerError,
     ArbStartBlockDerived, ArbTransaction, ArbosState, DefaultArb, DefaultArbExecutionHooks,
     constants::{ARB_RETRYABLE_TX_ADDRESS, ARBITRUM_INTERNAL_TX_TYPE, HISTORY_STORAGE_ADDRESS},
-    executor::ArbExecError,
+    executor::{ArbExecError, digest_message_envelope},
     transaction::arb_envelope_to_tx_env,
 };
-use arb_sequencer_network::sequencer::feed::{BroadcastFeedMessage, L1Header, Root};
+use arb_sequencer_network::sequencer::feed::{BroadcastFeedMessage, Root};
 use eyre::{Result, eyre};
 use revm::{
     Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm,
@@ -21,7 +24,6 @@ use revm::{
     state::EvmState,
 };
 use revm_database::{AlloyDB, BlockId};
-use sequencer_client::reader::parse_message;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{collections::VecDeque, env, fs, str::FromStr};
@@ -475,7 +477,7 @@ fn collect_state_diff(state: &EvmState) -> Vec<DumpAccountDiff> {
             .collect::<Vec<_>>();
         storage.sort_by(|a, b| a.slot.cmp(&b.slot));
 
-        let info_changed = account.info != *account.original_info;
+        let info_changed = account.info != account.original_info();
         if !info_changed
             && storage.is_empty()
             && !account.is_touched()
@@ -485,16 +487,17 @@ fn collect_state_diff(state: &EvmState) -> Vec<DumpAccountDiff> {
             continue;
         }
 
+        let original_info = account.original_info();
         accounts.push(DumpAccountDiff {
             address: format!("{address:#x}"),
             touched: account.is_touched(),
             created: account.is_created(),
             selfdestructed: account.is_selfdestructed(),
-            balance_pre: format!("{:#x}", account.original_info.balance),
+            balance_pre: format!("{:#x}", original_info.balance),
             balance_post: format!("{:#x}", account.info.balance),
-            nonce_pre: account.original_info.nonce,
+            nonce_pre: original_info.nonce,
             nonce_post: account.info.nonce,
-            code_hash_pre: format!("{:#x}", account.original_info.code_hash),
+            code_hash_pre: format!("{:#x}", original_info.code_hash),
             code_hash_post: format!("{:#x}", account.info.code_hash),
             storage,
         });
@@ -540,7 +543,7 @@ fn dump_execution(
         tx_hash,
         result: execution_kind(result).to_string(),
         success: result.is_success(),
-        gas_used: result.gas_used(),
+        gas_used: result.tx_gas_used(),
         output: result
             .output()
             .map(|bytes| format!("0x{}", hex::encode(bytes.as_ref()))),
@@ -632,7 +635,7 @@ where
         let start_block_result = evm.transact(start_block_tx)?;
 
         outcome.start_block_success = start_block_result.result.is_success();
-        outcome.start_block_gas_used = start_block_result.result.gas_used();
+        outcome.start_block_gas_used = start_block_result.result.tx_gas_used();
 
         start_block_dump = Some(dump_execution(
             "start_block",
@@ -681,7 +684,7 @@ where
         outcome.executed = outcome.executed.saturating_add(1);
         outcome.txs.push(arb_revm::ArbTxExecution {
             tx_hash: queued.tx.hash(),
-            gas_used: tx_result.result.gas_used(),
+            gas_used: tx_result.result.tx_gas_used(),
             success: tx_result.result.is_success(),
         });
 
@@ -773,14 +776,6 @@ async fn main() -> Result<()> {
 
     let parent_from_chain = fetch_parent_header(rpc_url, state_block_number).await?;
 
-    let l1_message = feed_msg.message_with_meta_data.l1_incoming_message.clone();
-    let l1_header = L1Header::from_header(
-        &l1_message.header,
-        feed_msg.message_with_meta_data.delayed_messages_read,
-    )
-    .map_err(|e| eyre!("invalid L1 header in sequencer message: {e}"))?;
-    let txs = parse_message(l1_message, chain_id, version)?;
-
     let provider = ProviderBuilder::new().connect(rpc_url).await?.erased();
     let alloy_db = AlloyDB::new(provider, BlockId::from(state_block_number));
     let wrapped = WrapDatabaseAsync::new(alloy_db).ok_or_else(|| {
@@ -788,22 +783,8 @@ async fn main() -> Result<()> {
     })?;
     let mut db = CacheDB::new(wrapped);
 
-    let poster = Address::from_str(&format!("{:#x}", l1_header.poster))
-        .map_err(|e| eyre!("failed to parse poster address: {e}"))?;
-    let l1_base_fee_wei = l1_header
-        .base_fee_l1
-        .map(|v| U256::from_limbs(*v.as_limbs()))
-        .unwrap_or(U256::ZERO);
-
-    let message = ArbMessageEnvelope {
-        sequence_number: Some(feed_msg.sequence_number),
-        l1_block_number: l1_header.block_number,
-        l1_timestamp: l1_header.timestamp,
-        poster,
-        l1_base_fee_wei,
-        delayed_messages_read: l1_header.delayed_messages_read,
-        txs,
-    };
+    // Decode the feed message into the executor's message envelope (see executor::digest).
+    let message = digest_message_envelope(&feed_msg, chain_id, version)?;
 
     let parent = ArbParentHeader {
         number: parent_number_flag.unwrap_or(parent_from_chain.number),

@@ -1,7 +1,8 @@
+#![allow(clippy::field_reassign_with_default)]
 //! Regression test for Arbitrum's `NUMBER` opcode semantics.
 //!
 //! On Arbitrum the EVM `NUMBER` opcode (`block.number`) returns the **L1** block
-//! number, not the L2 block number — Nitro patches `opNumber` to read
+//! number, not the L2 block number, Nitro patches `opNumber` to read
 //! `ProcessingHook.L1BlockNumber` (`go-ethereum/core/vm/instructions.go`). We carry
 //! that value in `ArbChainContext::l1_block_number` and override the opcode.
 
@@ -18,7 +19,7 @@ use revm::{
 
 #[test]
 fn number_opcode_returns_l1_block_number() {
-    // NUMBER, PUSH1 0x00, SSTORE, STOP — stores block.number into slot 0.
+    // NUMBER, PUSH1 0x00, SSTORE, STOP, stores block.number into slot 0.
     let code = Bytes::from(vec![0x43, 0x60, 0x00, 0x55, 0x00]);
     let code_hash = keccak256(&code);
     let contract = Address::with_last_byte(0xcc);

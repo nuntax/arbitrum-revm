@@ -2,7 +2,6 @@ use crate::{
     api::exec::ArbContextTr,
     storage::{ArbosState, StorageSlot},
 };
-use arb_alloy_precompiles::addresses::ARB_NATIVE_TOKEN_MANAGER;
 use revm::{
     Database as _,
     context_interface::{Block, ContextTr, JournalTr, Transaction, journaled_state::account::JournaledAccountTr},
@@ -18,7 +17,7 @@ const HISTORY_STORAGE_ADDRESS: Address = Address::new([
 /// Arbitrum's EIP-2935 ring-buffer size (`0x05ffd0`); Nitro widened the Ethereum default
 /// of 8191 to this. See `params.HistoryStorageCodeArbitrum`.
 const HISTORY_SERVE_WINDOW: u64 = 393_168;
-/// `params.HistoryStorageCodeArbitrum` — the EIP-2935 history contract runtime code
+/// `params.HistoryStorageCodeArbitrum`, the EIP-2935 history contract runtime code
 /// (rings at 393168 and reads the L2 block number via ArbSys `arbBlockNumber`, since the
 /// `NUMBER` opcode returns the L1 block number on Arbitrum). Deployed at the v40 upgrade.
 const HISTORY_STORAGE_CODE_HEX: &str = "3373fffffffffffffffffffffffffffffffffffffffe1460605760203603605c575f3563a3b1b31d5f5260205f6004601c60645afa15605c575f51600181038211605c57816205ffd0910311605c576205ffd09006545f5260205ff35b5f5ffd5b5f356205ffd0600163a3b1b31d5f5260205f6004601c60645afa15605c575f5103065500";
@@ -150,6 +149,19 @@ fn apply_start_block<CTX: ArbContextTr>(ctx: &mut CTX, input: &Bytes) -> Result<
             .map_err(|err| format!("[ARBITRUM] failed to record ArbOS L1 block hash: {err}"))?;
     }
 
+    // The `NUMBER` opcode returns the ArbOS-state L1 block number (Nitro's patched
+    // `opNumber` reads `ProcessingHook.L1BlockNumber`, which is exactly this stored value
+    // *after* the start-block update), not the raw message block number. That distinction
+    // matters because the stored value is monotonic and, for ArbOS < 8, one higher than the
+    // message's number (the `l1_block_number++` above). The block-scoped chain context still
+    // carries the raw message value the driver/replay seeded it with, so refresh it from the
+    // post-update ArbOS state here; every user tx in this block then sees the correct
+    // `NUMBER`. Without this, a tx that reads/stores `NUMBER` diverges from canonical.
+    let new_l1_block_number = arbos_state
+        .block_hashes
+        .l1_block_number(journal)
+        .map_err(|err| format!("[ARBITRUM] failed to read updated ArbOS L1 block number: {err}"))?;
+
     // Nitro reaps up to two retryables during StartBlock.
     let _ = arbos_state
         .retryables
@@ -179,11 +191,23 @@ fn apply_start_block<CTX: ArbContextTr>(ctx: &mut CTX, input: &Bytes) -> Result<
         upgrade_arbos_version(
             arbos_version,
             upgrade_version,
+            // A runtime upgrade is never the firstTime (genesis) path.
+            false,
             &arbos_state,
             journal,
         )
         .map_err(|err| format!("[ARBITRUM] ArbOS version upgrade failed: {err}"))?;
     }
+
+    // Refresh the block-scoped L1 block number now that the journal borrow is released, so
+    // the `NUMBER` opcode (which reads `chain().l1_block_number`) returns the post-update
+    // ArbOS-state value for the rest of this block's transactions.
+    ctx.chain_mut().l1_block_number = new_l1_block_number;
+
+    // New block: no retryables have been submitted yet, so drop any zombie-escrow tickets
+    // carried over from the previous block. This is what scopes the pre-Stylus zombie escrow
+    // to same-block submit+redeem pairs (see `ArbChainContext::pending_zombie_escrow_tickets`).
+    ctx.chain_mut().pending_zombie_escrow_tickets.clear();
 
     Ok(())
 }
@@ -192,12 +216,15 @@ fn apply_start_block<CTX: ArbContextTr>(ctx: &mut CTX, input: &Bytes) -> Result<
 /// `target_version`, incrementing one step at a time.
 ///
 /// Mirrors Nitro's `UpgradeArbosVersion` loop in arbosState.go.
-/// Only the migrations that touch storage fields available in arb-revm are implemented;
-/// Stylus-program-param upgrades (v30, v31, v40, v50 Stylus part, v60 Stylus part) are
-/// intentionally skipped — they are handled by the Stylus runtime.
-fn upgrade_arbos_version<J: JournalTr>(
+/// Stylus-program-param upgrades (v30 programs init, v31 Version+MinInitGas, v40 MaxWasmSize,
+/// v50 MaxStackDepth cap, v60 MaxFragmentCount) are now fully implemented.
+pub(crate) fn upgrade_arbos_version<J: JournalTr>(
     current_version: u64,
     target_version: u64,
+    // Mirrors Nitro's `firstTime` flag: true for the genesis cascade (`UpgradeArbosVersion(desired,
+    // firstTime=true)`), false for a runtime upgrade. A few steps (e.g. v11's chain-owner list
+    // clear) run only when NOT firstTime.
+    first_time: bool,
     state: &ArbosState,
     journal: &mut J,
 ) -> Result<(), String> {
@@ -225,7 +252,7 @@ fn upgrade_arbos_version<J: JournalTr>(
                     .set(u64::MAX, journal);
             }
             // v4-v9: no storage-level changes needed.
-            4 | 5 | 6 | 7 | 8 | 9 => {}
+            4..=9 => {}
             // v10: seed l1_fees_available from L1PricerFundsPool balance.
             // The journal's database holds the canonical balance.
             10 => {
@@ -253,9 +280,14 @@ fn upgrade_arbos_version<J: JournalTr>(
                         .amortized_cost_cap_bips
                         .set(0_u64, journal);
                 }
-                // chain_owners list clear is a no-op here (list integrity is managed by
-                // the AddressSet implementation; clearing is only needed for firstTime init,
-                // which is not our concern during normal block execution).
+                // Clear the chain-owners list, but only on a runtime upgrade: Nitro guards this
+                // with `if !firstTime { chainOwners.ClearList() }`, so the genesis cascade must
+                // NOT run it (a chain genesis'd at >= v11 keeps its owner list). It zeroes the list
+                // slots + size (members stay in the by-address mapping), a real storage write:
+                // skipping it on a runtime upgrade diverges the state root at the v11 block.
+                if !first_time {
+                    let _ = state.chain_owners.clear_list(journal);
+                }
             }
             // v12-v19: reserved for Orbit chains; no mainnet state changes.
             12..=19 => {}
@@ -265,15 +297,38 @@ fn upgrade_arbos_version<J: JournalTr>(
             }
             // v21-v29: reserved for Orbit chains.
             21..=29 => {}
-            // v30: Stylus program param initialization — handled by Stylus runtime.
-            30 => {}
-            // v31: Stylus program params v2 upgrade — handled by Stylus runtime.
-            31 => {}
+            // v30: Stylus program genesis state initialization.
+            // Nitro: `programs.Initialize(nextArbosVersion=30, sto)` in arbosstate.go.
+            // Writes the packed params word (Version=1, all initial constants), data-pricer
+            // fields (bytes_per_second, last_update_time=ArbitrumStartTime, min_price, inertia),
+            // and the cacheManagers set (a no-op on a fresh trie).
+            30 => {
+                state
+                    .programs
+                    .initialize(30, journal)
+                    .map_err(|e| format!("[ARBITRUM] programs.initialize failed: {e}"))?;
+            }
+            // v31: Stylus params v2 upgrade.
+            // Nitro: `params.UpgradeToVersion(2)` + `params.Save()` in arbosstate.go.
+            // Sets Version = 2 and MinInitGas = v2MinInitGas (69).
+            31 => {
+                use crate::storage::programs::{stylus_param_layout as l, pack_uint, V2_STYLUS_VERSION, V2_MIN_INIT_GAS};
+                let mut params_word = state
+                    .programs
+                    .read_params_word(journal)
+                    .map_err(|e| format!("[ARBITRUM] v31: failed to read Stylus params: {e}"))?;
+                pack_uint(&mut params_word, l::VERSION.0,       l::VERSION.1,       V2_STYLUS_VERSION);
+                pack_uint(&mut params_word, l::MIN_INIT_GAS.0,  l::MIN_INIT_GAS.1,  V2_MIN_INIT_GAS);
+                state
+                    .programs
+                    .write_params_word(params_word, journal)
+                    .map_err(|e| format!("[ARBITRUM] v31: failed to write Stylus params: {e}"))?;
+            }
             // v32: no storage changes.
             32 => {}
             // v33-v39: reserved for Orbit chains.
             33..=39 => {}
-            // v40: EIP-2935 history storage and Stylus params — EVM code install handled externally.
+            // v40: EIP-2935 history storage and Stylus params, EVM code install handled externally.
             // v40: deploy the EIP-2935 history-storage contract (nonce=1 + Arbitrum code).
             // Nitro: arbosState.go UpgradeArbosVersion case ArbosVersion_40.
             40 => {
@@ -304,17 +359,9 @@ fn upgrade_arbos_version<J: JournalTr>(
                     .write_params_word(params_word, journal)
                     .map_err(|e| format!("[ARBITRUM] failed to write Stylus params: {e}"))?;
             }
-            // v41: install the ArbNativeTokenManager (0x73) precompile account. Nitro
-            // arbosState.go UpgradeArbosVersion installs `[INVALID]` (0xfe) code for every
-            // precompile whose MinArbOSVersion == the version being activated, giving the
-            // account a non-empty code hash in the trie. ArbNativeTokenManager activates at
-            // v41 (ArbFilteredTransactionsManager at 0x74 activates at v60 — handled there).
-            41 => {
-                journal
-                    .load_account_mut(ARB_NATIVE_TOKEN_MANAGER)
-                    .map_err(|e| format!("[ARBITRUM] failed to load ArbNativeTokenManager: {e}"))?;
-                journal.set_code(ARB_NATIVE_TOKEN_MANAGER, Bytecode::new_raw(vec![0xfe].into()));
-            }
+            // v41: no state changes beyond the precompile install below (ArbNativeTokenManager
+            // 0x73 activates here; installed by `install_precompiles_introduced_at`).
+            41 => {}
             // v42-v49: reserved for Orbit chains.
             42..=49 => {}
             // v50: set per-tx gas limit; Stylus param upgrade handled by runtime.
@@ -345,14 +392,34 @@ fn upgrade_arbos_version<J: JournalTr>(
             51 => {}
             // v52-v59: reserved for Orbit chains.
             52..=59 => {}
-            // v60: transaction filterer subspace init — AddressSet already initializes lazily.
-            60 => {}
+            // v60: Stylus StylusContractLimit param + transaction-filterer init.
+            // Nitro: `p.UpgradeToArbosVersion(60)` sets MaxFragmentCount = initialMaxFragmentCount (2)
+            // + `addressSet.Initialize(transactionFiltererSubspace)` (no-op on fresh trie).
+            60 => {
+                use crate::storage::programs::{stylus_param_layout as l, pack_uint, INITIAL_MAX_FRAGMENT_COUNT};
+                let mut params_word = state
+                    .programs
+                    .read_params_word(journal)
+                    .map_err(|e| format!("[ARBITRUM] v60: failed to read Stylus params: {e}"))?;
+                pack_uint(&mut params_word, l::MAX_FRAGMENT_COUNT.0, l::MAX_FRAGMENT_COUNT.1, INITIAL_MAX_FRAGMENT_COUNT);
+                state
+                    .programs
+                    .write_params_word(params_word, journal)
+                    .map_err(|e| format!("[ARBITRUM] v60: failed to write Stylus params: {e}"))?;
+                // transaction-filterer AddressSet.Initialize writes 0 to slot 0, SSTORE no-op
+                // on a fresh trie; the AddressSet already initializes lazily on first use.
+            }
             unknown => {
                 return Err(format!(
                     "[ARBITRUM] chain is upgrading to unsupported ArbOS version {unknown}; please upgrade the node"
                 ));
             }
         }
+
+        // Install any precompiles introduced at this version, matching Nitro's per-step
+        // "install any new precompiles" loop. Without this a runtime upgrade to v30 leaves the
+        // Stylus precompiles (0x71/0x72) with an empty code hash and diverges the state root.
+        crate::arbos_init::install_precompiles_introduced_at(version, journal)?;
 
         // Persist the incremented version after each successful step.
         let _ = state.arbos_version.set(version, journal);
@@ -494,9 +561,12 @@ fn decode_batch_posting_report_calldata(
     ))
 }
 
+/// Decoded fields of a batchPostingReportV2 calldata blob.
+type BatchPostingReportV2Fields = (U256, Address, u64, u64, u64, u64, U256);
+
 fn decode_batch_posting_report_v2_calldata(
     input: &[u8],
-) -> Result<(U256, Address, u64, u64, u64, u64, U256), String> {
+) -> Result<BatchPostingReportV2Fields, String> {
     if input.len() != SELECTOR_SIZE + (BATCH_POSTING_REPORT_V2_CALLDATA_WORDS * ABI_WORD_SIZE) {
         return Err(format!(
             "[ARBITRUM] invalid batchPostingReportV2 calldata length {}, expected {}",

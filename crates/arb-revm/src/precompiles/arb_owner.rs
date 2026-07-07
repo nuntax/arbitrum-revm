@@ -1,7 +1,8 @@
 use super::*;
+use crate::arb_journal::{ArbCall, ArbJournal, ArbPrecompileCtx};
 use crate::storage::{pack_uint, stylus_param_layout as layout};
-use revm::context_interface::Block;
-use revm::interpreter::CallInputs;
+use revm::interpreter::InstructionResult;
+use revm::primitives::{B256, Bytes, Log, keccak256};
 
 const FEATURE_ENABLE_DELAY_SECONDS: u64 = 7 * 24 * 60 * 60;
 const ARBOS_VERSION_PER_TX_GAS_LIMIT: u64 = 50;
@@ -10,14 +11,17 @@ const MIN_CACHED_INIT_GAS_UNITS: u64 = 32;
 const COST_SCALAR_PERCENT_UNITS: u64 = 2;
 const MAX_UINT24: u32 = 0x00ff_ffff;
 
+// The feature-timestamp guards are written out per Nitro's ArbOwner checks rather than
+// factored, so the parity mapping stays obvious.
+#[allow(clippy::nonminimal_bool)]
 pub(super) fn run_arb_owner<CTX>(
     ctx: &mut CTX,
     input: &[u8],
     gas_limit: u64,
-    call_inputs: &CallInputs,
+    call_inputs: &ArbCall,
 ) -> InterpreterResult
 where
-    CTX: ContextTr<Journal: JournalTr>,
+    CTX: ArbPrecompileCtx,
 {
     let call = match ArbOwner::ArbOwnerCalls::abi_decode(input) {
         Ok(c) => c,
@@ -25,10 +29,7 @@ where
     };
 
     let state = ArbosState::open();
-    let block_timestamp: u64 = match ctx.block().timestamp().try_into() {
-        Ok(v) => v,
-        Err(_) => return revert_result(gas_limit, "ArbOwner: block timestamp overflow"),
-    };
+    let block_timestamp: u64 = ctx.block_timestamp();
     let j = ctx.journal_mut();
     let is_owner = match state.chain_owners.is_member(call_inputs.caller, j) {
         Ok(v) => v,
@@ -50,7 +51,7 @@ where
         };
     }
 
-    match call {
+    let result = match call {
         ArbOwner::ArbOwnerCalls::addChainOwner(c) => {
             set_or_revert!(state.chain_owners.add(c.newOwner, j), "addChainOwner")
         }
@@ -387,7 +388,7 @@ where
             gas_limit,
             "ArbOwner: releaseL1PricerSurplusFunds not yet implemented",
         ),
-        // Stylus / WASM settings — stored as packed bytes in a single 32-byte
+        // Stylus / WASM settings, stored as packed bytes in a single 32-byte
         // storage word at index 0 of the programs.params subspace.
         // Each setter performs a read-modify-write on the packed word.
         // Nitro reference: arbos/programs/params.go Save() / Params().
@@ -656,5 +657,37 @@ where
                 "setMaxStylusContractFragments"
             )
         }
+    };
+
+    // Nitro wraps every successful, state-mutating ArbOwner method with an `OwnerActs` event
+    // (precompiles/precompile.go `emitOwnerActs` via `OwnerPrecompile.Call`): the event records the
+    // 4-byte method selector, the owner, and the full calldata. The owner is NOT charged gas for it
+    // (Nitro returns `ZeroGas`; our `ok_result` already records zero precompile gas). Without it the
+    // produced block's receipts/logs-bloom (and thus the block hash) diverge from Nitro on any
+    // owner action. `event OwnerActs(bytes4 indexed method, address indexed owner, bytes data)`.
+    if result.result == InstructionResult::Return && !call_inputs.is_static && input.len() >= 4 {
+        let mut method_topic = [0u8; 32];
+        method_topic[..4].copy_from_slice(&input[..4]);
+        let mut owner_topic = [0u8; 32];
+        owner_topic[12..].copy_from_slice(call_inputs.caller.as_slice());
+
+        // ABI-encode the single `bytes data` argument: offset (0x20) | length | content (32-padded).
+        let mut data = Vec::with_capacity(64 + input.len().next_multiple_of(32));
+        data.extend_from_slice(&U256::from(32u64).to_be_bytes::<32>());
+        data.extend_from_slice(&U256::from(input.len()).to_be_bytes::<32>());
+        data.extend_from_slice(input);
+        data.resize(64 + input.len().next_multiple_of(32), 0);
+
+        ctx.journal_mut().emit_log(Log::new_unchecked(
+            call_inputs.bytecode_address,
+            vec![
+                keccak256("OwnerActs(bytes4,address,bytes)"),
+                B256::from(method_topic),
+                B256::from(owner_topic),
+            ],
+            Bytes::from(data),
+        ));
     }
+
+    result
 }

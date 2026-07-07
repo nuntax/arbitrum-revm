@@ -11,6 +11,10 @@ eyre.workspace = true
 hex.workspace = true
 revm.workspace = true
 revm-database.workspace = true
+# reth node seam: `EvmInternals` (the state handle DynPrecompiles receive). 0.30 pins the exact
+# same revm 36 as the workspace, so this adds no new revm to the graph. Hosts the orphan-rule
+# `impl ArbJournal for EvmInternals` that lets ArbOS precompiles run on the node path.
+alloy-evm = { version = "0.37", default-features = false }
 alloy-provider = { workspace = true, features = ["reqwest", "debug-api"] }
 serde_json.workspace = true
 serde = { version = "1.0.228", features = ["derive"] }
@@ -20,35 +24,27 @@ tokio.workspace = true
 tracing.workspace = true
 alloy-rlp.workspace = true
 alloy-trie = "0.9.5"
-alloy-consensus = "1.4.3"
-alloy-eips = "1.8.3"
+alloy-consensus = "2.0"
+alloy-eips = "2.0"
 alloy-core = "1.4.3"
-alloy-rpc-client = "1.8.3"
-alloy-transport = "1.8.3"
-alloy-rpc-types-eth = "1.8.3"
-alloy-rpc-types-trace = "1.8.3"
-alloy-network-primitives = "1.8.3"
+alloy-rpc-client = "2.0"
+alloy-transport = "2.0"
+alloy-rpc-types-eth = "2.0"
+alloy-rpc-types-trace = "2.0"
+alloy-network-primitives = "2.0"
 url = "2.5"
-sequencer_client = { path = "../../../sequencer_client/crates/sequencer_client" }
-arb_alloy_consensus = { package = "arb-alloy-consensus", path = "../../../arb-alloy/crates/consensus", features = ["k256"] }
-arb_sequencer_network = { package = "arb-sequencer-network", path = "../../../arb-alloy/crates/sequencer-network" }
-arb_alloy_precompiles = { package = "arb-alloy-precompiles", path = "../../../arb-alloy/crates/precompiles" }
-arb_alloy_rpc_types = { package = "arb-alloy-rpc-types", path = "../../../arb-alloy/crates/rpc-types" }
-arb_alloy_network = { package = "arb-alloy-network", path = "../../../arb-alloy/crates/network" }
-brotli = { path = "../../../nitro/crates/brotli", features = ["cc_brotli"] }
+arb_alloy_consensus = { package = "arb-alloy-consensus", git = "https://github.com/nuntax/arb-alloy", rev = "dbbb6061447a41498e117e16ae38e2bbb7ec0ac7", features = ["k256"] }
+arb_sequencer_network = { package = "arb-sequencer-network", git = "https://github.com/nuntax/arb-alloy", rev = "dbbb6061447a41498e117e16ae38e2bbb7ec0ac7" }
+arb_alloy_precompiles = { package = "arb-alloy-precompiles", git = "https://github.com/nuntax/arb-alloy", rev = "dbbb6061447a41498e117e16ae38e2bbb7ec0ac7" }
+arb_alloy_rpc_types = { package = "arb-alloy-rpc-types", git = "https://github.com/nuntax/arb-alloy", rev = "dbbb6061447a41498e117e16ae38e2bbb7ec0ac7" }
+arb_alloy_network = { package = "arb-alloy-network", git = "https://github.com/nuntax/arb-alloy", rev = "dbbb6061447a41498e117e16ae38e2bbb7ec0ac7" }
+brotli = { path = "../../vendor/brotli/crates/brotli", features = ["cc_brotli"] }
 
-# Stylus WASM execution. Feature-gated ("stylus"; pulls Nitro's forked wasmer — heavy
-# build). Uses the CANONICAL local Nitro crates (exact runtime the real chain runs = best
-# parity; fork-in-place if we ever need to change them). arbos-revm is the integration
-# blueprint, but the runtime is upstream Nitro (its arbutil exposes the same API).
-stylus = { path = "../../../nitro/crates/stylus", features = ["cc_brotli"], optional = true }
-arbutil = { path = "../../../nitro/crates/arbutil", optional = true }
-wasmer-types = { path = "../../../nitro/crates/tools/wasmer/lib/types", optional = true }
-wasm-encoder = { version = "0.244.0", optional = true }
-wasmparser = { version = "0.244.0", optional = true }
-wasmprinter = { version = "0.244.0", optional = true }
-lru = { version = "0.16.3", optional = true }
-lazy_static = { version = "1.5.0", optional = true }
+# Stylus WASM execution is deferred for the standalone build: it needs Nitro's forked
+# wasmer (crates/stylus, arbutil, wasmer-types), which is not packaged standalone and would
+# pull a second copy of `brotli` that collides with the vendored one. The `src/stylus`
+# module stays in-tree but is compiled only under the `stylus` feature, which currently has
+# no backing dependencies (enabling it will not build until they are restored).
 
 [features]
-stylus = ["dep:stylus", "dep:arbutil", "dep:wasmer-types", "dep:wasm-encoder", "dep:wasmparser", "dep:wasmprinter", "dep:lru", "dep:lazy_static"]
+stylus = []
