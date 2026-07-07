@@ -33,11 +33,11 @@ alloy-rpc-types-eth = "2.0"
 alloy-rpc-types-trace = "2.0"
 alloy-network-primitives = "2.0"
 url = "2.5"
-arb_alloy_consensus = { package = "arb-alloy-consensus", git = "https://github.com/nuntax/arb-alloy", rev = "6862abe361cc1b4d7c1dddee1550a6bb34158d3b", features = ["k256"] }
-arb_sequencer_network = { package = "arb-sequencer-network", git = "https://github.com/nuntax/arb-alloy", rev = "6862abe361cc1b4d7c1dddee1550a6bb34158d3b" }
-arb_alloy_precompiles = { package = "arb-alloy-precompiles", git = "https://github.com/nuntax/arb-alloy", rev = "6862abe361cc1b4d7c1dddee1550a6bb34158d3b" }
-arb_alloy_rpc_types = { package = "arb-alloy-rpc-types", git = "https://github.com/nuntax/arb-alloy", rev = "6862abe361cc1b4d7c1dddee1550a6bb34158d3b" }
-arb_alloy_network = { package = "arb-alloy-network", git = "https://github.com/nuntax/arb-alloy", rev = "6862abe361cc1b4d7c1dddee1550a6bb34158d3b" }
+arb_alloy_consensus = { package = "arbitrum-alloy-consensus", git = "https://github.com/nuntax/arbitrum-alloy", rev = "80af283ceaa0166e7f9660cea8db056ad8226387", features = ["k256"] }
+arb_sequencer_network = { package = "arbitrum-sequencer-network", git = "https://github.com/nuntax/arbitrum-alloy", rev = "80af283ceaa0166e7f9660cea8db056ad8226387" }
+arb_alloy_precompiles = { package = "arbitrum-alloy-precompiles", git = "https://github.com/nuntax/arbitrum-alloy", rev = "80af283ceaa0166e7f9660cea8db056ad8226387" }
+arb_alloy_rpc_types = { package = "arbitrum-alloy-rpc-types", git = "https://github.com/nuntax/arbitrum-alloy", rev = "80af283ceaa0166e7f9660cea8db056ad8226387" }
+arb_alloy_network = { package = "arbitrum-alloy-network", git = "https://github.com/nuntax/arbitrum-alloy", rev = "80af283ceaa0166e7f9660cea8db056ad8226387" }
 brotli = { path = "../../vendor/brotli/crates/brotli", features = ["cc_brotli"] }
 
 # Stylus WASM execution is deferred for the standalone build: it needs Nitro's forked
