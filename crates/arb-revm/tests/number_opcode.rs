@@ -6,7 +6,7 @@
 //! `ProcessingHook.L1BlockNumber` (`go-ethereum/core/vm/instructions.go`). We carry
 //! that value in `ArbChainContext::l1_block_number` and override the opcode.
 
-use arb_alloy_consensus::transactions::{ArbTxEnvelope, TxUnsigned};
+use arbitrum_alloy_consensus::transactions::{ArbTxEnvelope, TxUnsigned};
 use arb_revm::transaction::arb_envelope_to_tx_env;
 use arb_revm::{ArbBuilder, ArbChainContext, ArbContext, ArbSpecId, ArbTransaction, DefaultArb};
 use revm::{

@@ -9,9 +9,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use arb_alloy_consensus::transactions::ArbTxEnvelope;
+use arbitrum_alloy_consensus::transactions::ArbTxEnvelope;
 use arb_revm::executor::digest_message_envelope;
-use arb_sequencer_network::sequencer::feed::BroadcastFeedMessage;
+use arbitrum_alloy_sequencer::sequencer::feed::BroadcastFeedMessage;
 use revm::primitives::{Address, U256};
 
 const CHAIN_ID: u64 = 42161;

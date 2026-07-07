@@ -2,7 +2,7 @@
 #![allow(clippy::field_reassign_with_default)]
 
 use alloy_provider::{Provider, ProviderBuilder};
-use arb_alloy_consensus::transactions::{ArbTxEnvelope, TxRetry};
+use arbitrum_alloy_consensus::transactions::{ArbTxEnvelope, TxRetry};
 use arb_revm::{
     ArbBuilder, ArbChainContext, ArbContext, ArbExecCfg, ArbExecOutcome, ArbExecutionHooks,
     ArbExecutionInput, ArbParentHeader, ArbRunner, ArbRunnerError,
@@ -11,7 +11,7 @@ use arb_revm::{
     executor::{ArbExecError, digest_message_envelope},
     transaction::arb_envelope_to_tx_env,
 };
-use arb_sequencer_network::sequencer::feed::{BroadcastFeedMessage, Root};
+use arbitrum_alloy_sequencer::sequencer::feed::{BroadcastFeedMessage, Root};
 use eyre::{Result, eyre};
 use revm::{
     Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm,

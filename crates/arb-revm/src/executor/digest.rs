@@ -4,13 +4,13 @@
 //! [`ArbExecutionInput`] the executor consumes. One feed message produces one block; the parent
 //! header is supplied by the caller from the node's chain tip (it is *not* carried in the message).
 //! This is the message half of Nitro's block production, the L2 transaction decode is delegated to
-//! [`arb_sequencer_network::reader::parse_message`] (verified against Nitro `arbos/parse_l2.go`).
+//! [`arbitrum_alloy_sequencer::reader::parse_message`] (verified against Nitro `arbos/parse_l2.go`).
 
 use crate::executor::contract::{
     ArbExecCfg, ArbExecutionInput, ArbMessageEnvelope, ArbParentHeader,
 };
-use arb_sequencer_network::reader::parse_message;
-use arb_sequencer_network::sequencer::feed::{BroadcastFeedMessage, L1Header};
+use arbitrum_alloy_sequencer::reader::parse_message;
+use arbitrum_alloy_sequencer::sequencer::feed::{BroadcastFeedMessage, L1Header};
 use eyre::{Result, eyre};
 use revm::primitives::U256;
 

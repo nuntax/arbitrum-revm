@@ -1090,7 +1090,7 @@ mod tests {
         transaction::RetryTxMeta,
     };
     use alloy_core::sol_types::SolCall;
-    use arb_alloy_precompiles::{
+    use arbitrum_alloy_precompiles::{
         ArbOwner,
         addresses::{ARB_OWNER, ARB_SYS},
     };

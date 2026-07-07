@@ -1,6 +1,6 @@
 use alloy_consensus::transaction::Transaction as AlloyTransaction;
 use alloy_eips::eip2718::{Encodable2718, Typed2718};
-use arb_alloy_consensus::transactions::ArbTxEnvelope;
+use arbitrum_alloy_consensus::transactions::ArbTxEnvelope;
 use revm::context_interface::{either::Either, transaction::AccessList};
 use revm::{
     context::{
@@ -49,7 +49,7 @@ impl core::error::Error for TxConversionError {}
 /// wrapper. This is the canonical adapter from "a tx as received over RPC / decoded
 /// from a sequencer feed" to "a tx the EVM can execute".
 ///
-/// `arb_alloy_rpc_types::ArbTransaction` and the sequencer feed envelopes all expose
+/// `arbitrum_alloy_rpc_types::ArbTransaction` and the sequencer feed envelopes all expose
 /// their inner [`ArbTxEnvelope`] via [`AsRef`], so callers can write
 /// `ArbTransaction::try_from(rpc_tx.as_ref())`.
 impl TryFrom<&ArbTxEnvelope> for ArbTransaction<TxEnv> {

@@ -3,7 +3,7 @@ use crate::{
     arb_journal::{ArbCall, ArbPrecompileCtx},
     util::{inverse_remap_l1_address, remap_l1_address},
 };
-use arb_alloy_precompiles::addresses::{
+use arbitrum_alloy_precompiles::addresses::{
     ARB_ADDRESS_TABLE, ARB_AGGREGATOR, ARB_BLS, ARB_DEBUG, ARB_FILTERED_TRANSACTIONS_MANAGER,
     ARB_FUNCTION_TABLE, ARB_GAS_INFO, ARB_INFO, ARB_NATIVE_TOKEN_MANAGER, ARB_OWNER,
     ARB_OWNER_PUBLIC, ARB_RETRYABLE_TX, ARB_STATISTICS, ARB_SYS, ARB_WASM, ARB_WASM_CACHE,
@@ -39,7 +39,7 @@ mod common;
 use self::common::{empty_active_result, gated_revert_result, ok_result, revert_result};
 pub(super) use crate::{ArbosState, storage::RETRYABLE_LIFETIME_SECONDS};
 pub(super) use alloy_core::sol_types::SolInterface;
-pub(super) use arb_alloy_precompiles::{
+pub(super) use arbitrum_alloy_precompiles::{
     ArbAddressTable, ArbAggregator, ArbDebug, ArbFunctionTable, ArbGasInfo, ArbInfo, ArbOwner,
     ArbOwnerPublic, ArbRetryableTx, ArbStatistics, ArbSys, ArbWasm, ArbWasmCache,
 };

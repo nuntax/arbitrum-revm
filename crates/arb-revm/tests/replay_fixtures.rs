@@ -12,9 +12,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use arb_alloy_consensus::transactions::ArbTxEnvelope;
-use arb_alloy_consensus::transactions::deposit::TxDeposit;
-use arb_alloy_rpc_types::ArbTransaction as RpcArbTransaction;
+use arbitrum_alloy_consensus::transactions::ArbTxEnvelope;
+use arbitrum_alloy_consensus::transactions::deposit::TxDeposit;
+use arbitrum_alloy_rpc_types::ArbTransaction as RpcArbTransaction;
 use arb_revm::replay::{
     BlockFixture, ExpectedAccountState, ExpectedTx, PrestateFixture, REPLAY_FIXTURE_SCHEMA,
     ReplayFixture, replay_fixture,

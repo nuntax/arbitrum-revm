@@ -19,7 +19,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-use arb_alloy_rpc_types::ArbTransaction as RpcArbTransaction;
+use arbitrum_alloy_rpc_types::ArbTransaction as RpcArbTransaction;
 use revm::{
     DatabaseRef, ExecuteCommitEvm, ExecuteEvm,
     context::{BlockEnv, CfgEnv, TxEnv},

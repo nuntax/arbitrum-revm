@@ -10,7 +10,7 @@ use crate::{
     },
     transaction::arb_envelope_to_tx_env,
 };
-use arb_alloy_consensus::transactions::{ArbTxEnvelope, TxRetry};
+use arbitrum_alloy_consensus::transactions::{ArbTxEnvelope, TxRetry};
 use revm::{
     Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm,
     context::{BlockEnv, CfgEnv, TxEnv},
@@ -394,7 +394,7 @@ mod tests {
         ArbExecCfg, ArbExecutionInput, ArbMessageEnvelope, ArbParentHeader,
         constants::ARB_RETRYABLE_TX_ADDRESS, executor::ArbWriteStage,
     };
-    use arb_alloy_consensus::transactions::{
+    use arbitrum_alloy_consensus::transactions::{
         ArbTxEnvelope, TxUnsigned, submit_retryable::SubmitRetryableTx,
     };
     use revm::{

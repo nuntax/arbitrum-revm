@@ -35,7 +35,7 @@ pub struct ArbMessageEnvelope {
     pub poster: Address,
     pub l1_base_fee_wei: U256,
     pub delayed_messages_read: u64,
-    pub txs: Vec<arb_alloy_consensus::transactions::ArbTxEnvelope>,
+    pub txs: Vec<arbitrum_alloy_consensus::transactions::ArbTxEnvelope>,
 }
 
 /// Static execution configuration.

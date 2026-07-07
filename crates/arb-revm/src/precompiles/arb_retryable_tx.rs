@@ -1,6 +1,6 @@
 use super::*;
 use crate::arb_journal::{ArbCall, ArbJournal, ArbPrecompileCtx};
-use arb_alloy_consensus::transactions::TxRetry;
+use arbitrum_alloy_consensus::transactions::TxRetry;
 use revm::{
     interpreter::{Gas, InstructionResult, InterpreterResult},
     primitives::{Address, B256, Bytes, Log, TxKind, keccak256},

@@ -5,7 +5,7 @@ use crate::{
 };
 use alloy_consensus::Transaction as AlloyTransaction;
 use alloy_rlp::{Encodable, Header};
-use arb_alloy_consensus::transactions::{
+use arbitrum_alloy_consensus::transactions::{
     ArbTxEnvelope, TxRetry, submit_retryable::SubmitRetryableTx,
 };
 use revm::{
@@ -692,7 +692,7 @@ fn address_word(address: Address) -> [u8; 32] {
 #[cfg(test)]
 mod ticket_id_parity {
     use super::*;
-    use arb_alloy_consensus::transactions::submit_retryable::SubmitRetryableTx;
+    use arbitrum_alloy_consensus::transactions::submit_retryable::SubmitRetryableTx;
     use revm::primitives::{Address, B256, Bytes, TxKind, U256};
 
     #[test]

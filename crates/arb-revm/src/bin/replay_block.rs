@@ -10,8 +10,8 @@ use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_client::ClientBuilder;
 use alloy_rpc_types_trace::geth::{GethDebugTracingOptions, GethTrace};
 use alloy_transport::layers::RetryBackoffLayer;
-use arb_alloy_network::Arbitrum;
-use arb_alloy_rpc_types::{ArbTransaction as RpcArbTransaction, ArbTransactionReceipt};
+use arbitrum_alloy_network::Arbitrum;
+use arbitrum_alloy_rpc_types::{ArbTransaction as RpcArbTransaction, ArbTransactionReceipt};
 use arb_revm::replay::{
     BlockFixture, ExpectedAccountState, ExpectedLog, ExpectedTx, REPLAY_FIXTURE_SCHEMA, RecordingDb,
     ReplayFixture, StorageEntry,
