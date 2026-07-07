@@ -89,7 +89,7 @@ impl BlockHashes {
             if arbos_version >= 8 {
                 next_num_buf = next_number.to_le_bytes();
             }
-            let fill = keccak256(&[block_hash.as_slice(), &next_num_buf].concat());
+            let fill = keccak256([block_hash.as_slice(), &next_num_buf].concat());
             self.set_block_hash(next_number, fill, journal)?;
         }
 

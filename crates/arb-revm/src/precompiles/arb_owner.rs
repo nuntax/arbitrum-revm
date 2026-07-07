@@ -11,6 +11,9 @@ const MIN_CACHED_INIT_GAS_UNITS: u64 = 32;
 const COST_SCALAR_PERCENT_UNITS: u64 = 2;
 const MAX_UINT24: u32 = 0x00ff_ffff;
 
+// The feature-timestamp guards are written out per Nitro's ArbOwner checks rather than
+// factored, so the parity mapping stays obvious.
+#[allow(clippy::nonminimal_bool)]
 pub(super) fn run_arb_owner<CTX>(
     ctx: &mut CTX,
     input: &[u8],

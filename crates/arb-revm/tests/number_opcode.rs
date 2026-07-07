@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default)]
 //! Regression test for Arbitrum's `NUMBER` opcode semantics.
 //!
 //! On Arbitrum the EVM `NUMBER` opcode (`block.number`) returns the **L1** block

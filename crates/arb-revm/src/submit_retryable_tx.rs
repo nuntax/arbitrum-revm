@@ -86,7 +86,7 @@ pub(crate) fn encode_submit_retryable_calldata(call: &SubmitRetryableCall) -> By
     args.extend_from_slice(call.retry_data.as_ref());
     let remainder = call.retry_data.len() % WORD_SIZE;
     if remainder != 0 {
-        args.extend(core::iter::repeat(0_u8).take(WORD_SIZE - remainder));
+        args.extend(std::iter::repeat_n(0_u8, WORD_SIZE - remainder));
     }
 
     let mut out = Vec::with_capacity(SELECTOR_SIZE + args.len());

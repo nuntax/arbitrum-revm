@@ -252,7 +252,7 @@ pub(crate) fn upgrade_arbos_version<J: JournalTr>(
                     .set(u64::MAX, journal);
             }
             // v4-v9: no storage-level changes needed.
-            4 | 5 | 6 | 7 | 8 | 9 => {}
+            4..=9 => {}
             // v10: seed l1_fees_available from L1PricerFundsPool balance.
             // The journal's database holds the canonical balance.
             10 => {
@@ -561,9 +561,12 @@ fn decode_batch_posting_report_calldata(
     ))
 }
 
+/// Decoded fields of a batchPostingReportV2 calldata blob.
+type BatchPostingReportV2Fields = (U256, Address, u64, u64, u64, u64, U256);
+
 fn decode_batch_posting_report_v2_calldata(
     input: &[u8],
-) -> Result<(U256, Address, u64, u64, u64, u64, U256), String> {
+) -> Result<BatchPostingReportV2Fields, String> {
     if input.len() != SELECTOR_SIZE + (BATCH_POSTING_REPORT_V2_CALLDATA_WORDS * ABI_WORD_SIZE) {
         return Err(format!(
             "[ARBITRUM] invalid batchPostingReportV2 calldata length {}, expected {}",

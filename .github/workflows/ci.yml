@@ -9,6 +9,9 @@ jobs:
     name: Rust Checks
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      RUSTFLAGS: -D warnings
+      RUSTDOCFLAGS: -D warnings
 
     steps:
       - name: Checkout
@@ -17,6 +20,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.93"
           components: clippy
 
       - name: Cache cargo artifacts
@@ -26,7 +30,7 @@ jobs:
         run: cargo check --workspace --all-targets
 
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo test
         run: cargo test --workspace

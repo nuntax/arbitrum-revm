@@ -76,7 +76,7 @@ impl StorageSpace {
 
     /// Opens a nested subspace using ArbOS's keyed keccak derivation.
     pub fn open_subspace(&self, id: Bytes) -> Self {
-        let derived = keccak256(&[self.key.as_ref(), id.as_ref()].concat());
+        let derived = keccak256([self.key.as_ref(), id.as_ref()].concat());
         Self {
             key: Bytes::from(derived.to_vec()),
             account: self.account,
@@ -91,7 +91,7 @@ impl StorageSpace {
     /// Maps an ArbOS logical key into the concrete storage slot used on-chain.
     pub fn slot_for_hash(&self, hash: FixedBytes<32>) -> FixedBytes<32> {
         let hash_bytes = hash.as_slice();
-        let derived = keccak256(&[self.key.as_ref(), &hash_bytes[..31]].concat());
+        let derived = keccak256([self.key.as_ref(), &hash_bytes[..31]].concat());
         let mut bytes = [0_u8; 32];
         bytes[..31].copy_from_slice(&derived[..31]);
         bytes[31] = hash_bytes[31];

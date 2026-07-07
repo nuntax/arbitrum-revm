@@ -370,17 +370,17 @@ where
     ) -> Result<FrameResult, Self::Error> {
         if is_internal_tx(evm) {
             internal_tx::apply_internal_tx(evm.ctx_mut())
-                .map_err(|msg| ERROR::from_string(msg.into()))?;
+                .map_err(|msg| ERROR::from_string(msg))?;
             return Ok(internal_success_frame_result());
         }
         if is_deposit_tx(evm) {
             deposit_tx::apply_deposit_tx(evm.ctx_mut())
-                .map_err(|msg| ERROR::from_string(msg.into()))?;
+                .map_err(|msg| ERROR::from_string(msg))?;
             return Ok(internal_success_frame_result());
         }
         if is_submit_retryable_tx(evm) {
             let outcome = submit_retryable_tx::apply_submit_retryable_tx(evm.ctx_mut())
-                .map_err(|msg| ERROR::from_string(msg.into()))?;
+                .map_err(|msg| ERROR::from_string(msg))?;
             return Ok(match outcome {
                 // Ticket created: success receipt. gasUsed is `usergas` only when the auto-redeem
                 // was scheduled, else 0 (Nitro `StartTxHook`); the outcome carries the value.
@@ -396,7 +396,7 @@ where
         }
         if is_retry_tx(evm) {
             retry_tx::apply_retry_tx_pre_execution(evm.ctx_mut())
-                .map_err(|msg| ERROR::from_string(msg.into()))?;
+                .map_err(|msg| ERROR::from_string(msg))?;
             return self.mainnet.execution(evm, init_and_floor_gas);
         }
 
@@ -547,7 +547,7 @@ where
             if !status.is_ok() && !is_submit_retryable_tx(evm) {
                 let label = if is_internal_tx(evm) { "internal" } else { "deposit" };
                 return Err(ERROR::from_string(
-                    format!("[ARBITRUM] {label} transaction execution failed").into(),
+                    format!("[ARBITRUM] {label} transaction execution failed"),
                 ));
             }
             return Ok(());
@@ -912,7 +912,7 @@ where
         // EndTxHook because execution delegates to `mainnet.execution`, which does not call
         // `ArbHandler::last_frame_result`.
         retry_tx::apply_retry_tx_post_execution(evm.ctx_mut(), success)
-            .map_err(|msg| ERROR::from_string(msg.into()))?;
+            .map_err(|msg| ERROR::from_string(msg))?;
 
         Ok(())
     }
@@ -1019,17 +1019,17 @@ where
     ) -> Result<FrameResult, Self::Error> {
         if is_internal_tx(evm) {
             internal_tx::apply_internal_tx(evm.ctx_mut())
-                .map_err(|msg| ERROR::from_string(msg.into()))?;
+                .map_err(|msg| ERROR::from_string(msg))?;
             return Ok(internal_success_frame_result());
         }
         if is_deposit_tx(evm) {
             deposit_tx::apply_deposit_tx(evm.ctx_mut())
-                .map_err(|msg| ERROR::from_string(msg.into()))?;
+                .map_err(|msg| ERROR::from_string(msg))?;
             return Ok(internal_success_frame_result());
         }
         if is_submit_retryable_tx(evm) {
             let outcome = submit_retryable_tx::apply_submit_retryable_tx(evm.ctx_mut())
-                .map_err(|msg| ERROR::from_string(msg.into()))?;
+                .map_err(|msg| ERROR::from_string(msg))?;
             return Ok(match outcome {
                 submit_retryable_tx::SubmitRetryableOutcome::Created { gas_used } => {
                     submit_retryable_success_frame_result(gas_used)
@@ -1041,7 +1041,7 @@ where
         }
         if is_retry_tx(evm) {
             retry_tx::apply_retry_tx_pre_execution(evm.ctx_mut())
-                .map_err(|msg| ERROR::from_string(msg.into()))?;
+                .map_err(|msg| ERROR::from_string(msg))?;
         }
 
         // poster_gas/hold_gas are 0 for retry txs (they bypass the GasChargingHook), so the
@@ -1105,13 +1105,10 @@ mod tests {
 
     fn make_evm(
         db: InMemoryDB,
-    ) -> impl ExecuteEvm<
-        Tx = ArbTransaction<TxEnv>,
-        Error = EVMError<
+    ) -> impl ExecuteCommitEvm<Tx = ArbTransaction<TxEnv>, Error = EVMError<
             <InMemoryDB as revm::Database>::Error,
             revm::context_interface::result::InvalidTransaction,
-        >,
-    > + ExecuteCommitEvm {
+        >> {
         let cfg = CfgEnv::new_with_spec(ArbSpecId::NITRO)
             .with_chain_id(42161)
             .with_disable_priority_fee_check(true);
@@ -1292,7 +1289,7 @@ mod tests {
         out.extend_from_slice(data);
         let remainder = data.len() % 32;
         if remainder != 0 {
-            out.extend(core::iter::repeat(0_u8).take(32 - remainder));
+            out.extend(std::iter::repeat_n(0_u8, 32 - remainder));
         }
         out.into()
     }
@@ -1570,7 +1567,7 @@ mod tests {
             "submit-retryable should refund excess submission fee plus gas-price refund"
         );
         assert_eq!(
-            out.result.gas_used(),
+            out.result.tx_gas_used(),
             0,
             "submit-retryable with no scheduled auto-redeem reports gasUsed 0 (Nitro ZeroGas)"
         );
@@ -1630,7 +1627,7 @@ mod tests {
         let out = evm.transact(tx).expect("under-funded submit-retryable must not be a fatal error");
 
         assert!(!out.result.is_success(), "receipt status must be failure");
-        assert_eq!(out.result.gas_used(), 0, "failed submit-retryable consumes zero gas");
+        assert_eq!(out.result.tx_gas_used(), 0, "failed submit-retryable consumes zero gas");
         assert!(out.result.logs().is_empty(), "no TicketCreated on a failed submission");
 
         // The deposit mint is kept (Nitro does not revert it on this failure path).
@@ -1707,7 +1704,7 @@ mod tests {
             "missing RedeemScheduled log"
         );
         assert_eq!(
-            out.result.gas_used(),
+            out.result.tx_gas_used(),
             21_000,
             "submit-retryable with a scheduled auto-redeem charges the reserved usergas as gasUsed"
         );

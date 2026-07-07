@@ -392,7 +392,7 @@ async fn verify_writes_against_state_root<P: Provider<Arbitrum>>(
         if let Err(e) = verify_proof(
             state_root,
             account_key,
-            Some(alloy_rlp::encode(&account)),
+            Some(alloy_rlp::encode(account)),
             &proof.account_proof,
         ) {
             errors.push(format!(
@@ -402,30 +402,27 @@ async fn verify_writes_against_state_root<P: Provider<Arbitrum>>(
         }
 
         // 2) Each account field we wrote must match the proven canonical value.
-        if let Some(b) = expected.balance {
-            if b != proof.balance {
+        if let Some(b) = expected.balance
+            && b != proof.balance {
                 errors.push(format!(
                     "state {address:#x}: balance mismatch: expected {:#x}, got(ours) {b:#x}",
                     proof.balance
                 ));
             }
-        }
-        if let Some(n) = expected.nonce {
-            if n != proof.nonce {
+        if let Some(n) = expected.nonce
+            && n != proof.nonce {
                 errors.push(format!(
                     "state {address:#x}: nonce mismatch: expected {}, got(ours) {n}",
                     proof.nonce
                 ));
             }
-        }
-        if let Some(h) = expected.code_hash {
-            if h != proof.code_hash {
+        if let Some(h) = expected.code_hash
+            && h != proof.code_hash {
                 errors.push(format!(
                     "state {address:#x}: code_hash mismatch: expected {:#x}, got(ours) {h:#x}",
                     proof.code_hash
                 ));
             }
-        }
 
         // 3) Each slot we wrote must be committed (with our value) under the storage root.
         //    getProof returns storage proofs in request order, matching `slot_keys`.
@@ -546,7 +543,7 @@ async fn witness_state_root_check<P: Provider<Arbitrum>>(
             if control_empty {
                 None
             } else {
-                Some(alloy_rlp::encode(&TrieAccount {
+                Some(alloy_rlp::encode(TrieAccount {
                     nonce: n1_nonce,
                     balance: n1_balance,
                     storage_root: n1_storage_root,
@@ -572,7 +569,7 @@ async fn witness_state_root_check<P: Provider<Arbitrum>>(
                 storage_root: new_storage_root,
                 code_hash,
             };
-            account_updates.insert(key, Some(alloy_rlp::encode(&account)));
+            account_updates.insert(key, Some(alloy_rlp::encode(account)));
         }
 
         // A slot set to 0 is a storage deletion; flag the account for the collapse recheck.
@@ -708,7 +705,7 @@ async fn deletion_collapse_recheck<P: Provider<Arbitrum>>(
             if is_empty {
                 None
             } else {
-                Some(alloy_rlp::encode(&TrieAccount {
+                Some(alloy_rlp::encode(TrieAccount {
                     nonce: *our_nonce,
                     balance: *our_balance,
                     storage_root: canon_storage_root,
@@ -959,7 +956,7 @@ async fn main() -> Result<()> {
                     "trace tx[{idx}] {:#x}: result={}",
                     transactions[idx].as_ref().hash(),
                     match &outcome {
-                        Ok(r) => format!("gas_used={}, success={}", r.gas_used(), r.is_success()),
+                        Ok(r) => format!("gas_used={}, success={}", r.tx_gas_used(), r.is_success()),
                         Err(e) => format!("error: {e:?}"),
                     }
                 );
@@ -1090,11 +1087,11 @@ async fn main() -> Result<()> {
             ));
         }
         let expected_gas_used = receipt.gas_used();
-        if out.result.gas_used() != expected_gas_used {
+        if out.result.tx_gas_used() != expected_gas_used {
             tx_errors.push(format!(
                 "gas used mismatch: expected {}, got {}",
                 expected_gas_used,
-                out.result.gas_used()
+                out.result.tx_gas_used()
             ));
         }
         let expected_created_address = receipt.contract_address();
@@ -1147,7 +1144,7 @@ async fn main() -> Result<()> {
                 idx,
                 tx_hash_hex,
                 out.result.logs().len(),
-                out.result.gas_used()
+                out.result.tx_gas_used()
             );
         } else {
             mismatches += 1;

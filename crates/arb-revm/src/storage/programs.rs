@@ -357,7 +357,7 @@ mod tests {
 
     /// Compile-time check: INITIAL_BYTES_PER_SECOND must equal 34865.
     const _ASSERT_BPS: () = {
-        let v: u32 = ((((1u64 << 40) / (365 * 24)) / 3600)) as u32;
+        let v: u32 = (((1u64 << 40) / (365 * 24)) / 3600) as u32;
         assert!(v == 34_865, "INITIAL_BYTES_PER_SECOND must be 34865");
     };
 

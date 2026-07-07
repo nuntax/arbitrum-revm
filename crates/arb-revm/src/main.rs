@@ -1,3 +1,6 @@
+// revm's TxEnv/BlockEnv are #[non_exhaustive]; they are built by field assignment.
+#![allow(clippy::field_reassign_with_default)]
+
 use alloy_provider::{Provider, ProviderBuilder};
 use arb_alloy_consensus::transactions::{ArbTxEnvelope, TxRetry};
 use arb_revm::{
@@ -540,7 +543,7 @@ fn dump_execution(
         tx_hash,
         result: execution_kind(result).to_string(),
         success: result.is_success(),
-        gas_used: result.gas_used(),
+        gas_used: result.tx_gas_used(),
         output: result
             .output()
             .map(|bytes| format!("0x{}", hex::encode(bytes.as_ref()))),
@@ -632,7 +635,7 @@ where
         let start_block_result = evm.transact(start_block_tx)?;
 
         outcome.start_block_success = start_block_result.result.is_success();
-        outcome.start_block_gas_used = start_block_result.result.gas_used();
+        outcome.start_block_gas_used = start_block_result.result.tx_gas_used();
 
         start_block_dump = Some(dump_execution(
             "start_block",
@@ -681,7 +684,7 @@ where
         outcome.executed = outcome.executed.saturating_add(1);
         outcome.txs.push(arb_revm::ArbTxExecution {
             tx_hash: queued.tx.hash(),
-            gas_used: tx_result.result.gas_used(),
+            gas_used: tx_result.result.tx_gas_used(),
             success: tx_result.result.is_success(),
         });
 

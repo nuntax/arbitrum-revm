@@ -5,6 +5,10 @@
 //! Nitro-faithful execution remains a separate layer because it depends heavily
 //! on global node state and runtime data that do not belong in a portable storage crate.
 
+// revm's TxEnv/BlockEnv are #[non_exhaustive], so they are built by field assignment,
+// and several pricing helpers mirror Nitro's multi-argument signatures.
+#![allow(clippy::field_reassign_with_default, clippy::too_many_arguments)]
+
 // Re-export the vendored brotli crate so downstream crates (arb-reth-derive) share the single
 // brotli source and avoid a lockfile collision. BUSL-licensed; see the NOTICE.
 pub use brotli;
