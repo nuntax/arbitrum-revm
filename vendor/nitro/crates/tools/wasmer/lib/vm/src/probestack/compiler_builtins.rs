@@ -57,13 +57,18 @@ unsafe extern "C" {
 // emitted for the function.
 //
 // This is the ELF version.
+// VENDOR PATCH (arbitrum-revm): emit `.weak` instead of `.globl` so this definition does not
+// collide with the identical `__rust_probestack` that Rust's compiler-builtins already provides
+// when wasmer-vm is linked into a pure-Rust binary on ELF/Linux (lld errors on the duplicate strong
+// symbol; macOS is unaffected because its variant uses the triple-underscore name). The impls are
+// the same (this file is copied from compiler-builtins), so the strong compiler-builtins one wins.
 #[cfg(not(any(target_vendor = "apple", target_os = "uefi")))]
 macro_rules! define_rust_probestack {
     ($body: expr) => {
         concat!(
             "
             .pushsection .text.__rust_probestack
-            .globl __rust_probestack
+            .weak __rust_probestack
             .type  __rust_probestack, @function
             .hidden __rust_probestack
         __rust_probestack:
