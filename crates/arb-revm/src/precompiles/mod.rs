@@ -144,6 +144,18 @@ impl ArbPrecompilesEnum {
         if method_gated {
             return gated_revert_result(gas_limit);
         }
+        // Nitro `precompile.go` Call: a non-pure (view/write/payable) method invoked where the
+        // acting address is not the precompile itself, i.e. via DELEGATECALL or CALLCODE, reverts
+        // consuming all gas (Nitro returns `gasLeft = 0` before makeContext). Pure methods touch
+        // no state and stay callable this way. `bytecode_address` is always the precompile here
+        // (it keyed this dispatch), so acting != bytecode means a delegate/code call.
+        if call.acting_address != call.bytecode_address {
+            // `selector` is `Some`: the `None` case already returned via `method_gated`.
+            let sel = selector.expect("selector resolved past method gating");
+            if !method_is_pure(arb, sel) {
+                return gated_revert_result(gas_limit);
+            }
+        }
         let mut result = self.dispatch(ctx, call);
         // ArbOwner is wrapped by Nitro's `OwnerPrecompile`, which returns `multigas.ZeroGas()`
         // the chain owner is NEVER charged for an ArbOwner call (success or revert), so it pays
@@ -247,8 +259,7 @@ fn arbos_call_extra_gas(
 ) -> u64 {
     let args_cost = COPY_GAS * words_for_bytes(input_len.saturating_sub(4));
     let result_cost = COPY_GAS * words_for_bytes(output_len);
-    let is_pure = arb == ArbPrecompilesEnum::ArbSys
-        && selector == Some(ArbSys::mapL1SenderContractAddressToL2AliasCall::SELECTOR);
+    let is_pure = selector.is_some_and(|sel| method_is_pure(arb, sel));
     let state_open = if is_pure { 0 } else { ARBOS_STATE_OPEN_GAS };
     args_cost + result_cost + state_open
 }
@@ -262,6 +273,24 @@ fn precompile_min_arbos_version(arb: ArbPrecompilesEnum) -> u64 {
         ArbPrecompilesEnum::ArbNativeTokenManager => 41,
         ArbPrecompilesEnum::ArbFilteredTransactionsManager => 60, // ArbosVersion_TransactionFiltering
         _ => 0,
+    }
+}
+
+/// Whether an ArbOS precompile method is declared `pure` (Solidity `stateMutability`), mirroring
+/// Nitro's `method.purity == pure`. Pure methods touch no ArbOS state: they skip the
+/// `OpenArbosState` read (Nitro `context.go` makeContext, `purity != pure`) and stay callable via
+/// DELEGATECALL/CALLCODE (Nitro `precompile.go` Call only rejects `purity >= view` there).
+/// Everything not listed here is view/write/payable. These are the only `pure` methods across the
+/// ArbOS precompiles we implement.
+fn method_is_pure(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> bool {
+    match arb {
+        ArbPrecompilesEnum::ArbSys => {
+            sel == ArbSys::mapL1SenderContractAddressToL2AliasCall::SELECTOR
+        }
+        ArbPrecompilesEnum::ArbDebug => {
+            sel == ArbDebug::customRevertCall::SELECTOR || sel == ArbDebug::legacyErrorCall::SELECTOR
+        }
+        _ => false,
     }
 }
 
@@ -415,6 +444,7 @@ where
                 caller: inputs.caller,
                 value: inputs.call_value(),
                 bytecode_address: inputs.bytecode_address,
+                acting_address: inputs.target_address,
                 is_static: inputs.is_static,
             };
             return Ok(Some(arb.run_dispatch(context, &call)));
@@ -435,8 +465,8 @@ where
 mod gating_tests {
     // Note: do NOT `use ArbPrecompilesEnum::*` here, the variant names (ArbGasInfo, ArbOwner, …)
     // would shadow the sol-interface modules of the same name and break `Module::methodCall::SELECTOR`.
-    use super::{ArbPrecompilesEnum as E, method_arbos_bounds, precompile_min_arbos_version};
-    use super::{ArbGasInfo, ArbOwner, ArbOwnerPublic};
+    use super::{ArbPrecompilesEnum as E, method_arbos_bounds, method_is_pure, precompile_min_arbos_version};
+    use super::{ArbDebug, ArbGasInfo, ArbOwner, ArbOwnerPublic, ArbSys};
     use alloy_core::sol_types::SolCall;
 
     #[test]
@@ -487,5 +517,26 @@ mod gating_tests {
             method_arbos_bounds(E::ArbSys, ArbGasInfo::getMaxTxGasLimitCall::SELECTOR),
             (0, 0)
         );
+    }
+
+    #[test]
+    fn pure_methods() {
+        // The only `pure` methods across the ArbOS precompiles we implement. These stay callable
+        // via DELEGATECALL/CALLCODE and skip the OpenArbosState (800) read.
+        assert!(method_is_pure(
+            E::ArbSys,
+            ArbSys::mapL1SenderContractAddressToL2AliasCall::SELECTOR
+        ));
+        assert!(method_is_pure(E::ArbDebug, ArbDebug::customRevertCall::SELECTOR));
+        assert!(method_is_pure(E::ArbDebug, ArbDebug::legacyErrorCall::SELECTOR));
+
+        // A view/payable method is not pure -> rejected via delegatecall, charged the state open.
+        assert!(!method_is_pure(E::ArbSys, ArbSys::withdrawEthCall::SELECTOR));
+        assert!(!method_is_pure(E::ArbGasInfo, ArbGasInfo::getPricesInWeiCall::SELECTOR));
+        // A pure selector on the wrong precompile is not pure.
+        assert!(!method_is_pure(
+            E::ArbGasInfo,
+            ArbSys::mapL1SenderContractAddressToL2AliasCall::SELECTOR
+        ));
     }
 }

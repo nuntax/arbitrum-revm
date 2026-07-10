@@ -424,6 +424,10 @@ pub struct ArbCall<'a> {
     pub value: U256,
     /// The precompile's own address (its `bytecode_address`).
     pub bytecode_address: Address,
+    /// The address the call executes *as* (revm/alloy `target_address`). Equals
+    /// `bytecode_address` for CALL/STATICCALL, but differs for DELEGATECALL/CALLCODE where the
+    /// precompile is not acting as itself. Nitro's `actingAsAddress` (`precompile.go` Call).
+    pub acting_address: Address,
     /// Whether the call is static (no state mutation permitted).
     pub is_static: bool,
 }
