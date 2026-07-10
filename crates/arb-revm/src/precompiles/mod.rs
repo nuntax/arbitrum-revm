@@ -296,12 +296,34 @@ fn method_is_pure(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> bool {
 
 /// `(minArbosVersion, maxArbosVersion)` for a precompile method (max 0 = no upper bound). A call
 /// with `version < min` or `version > max>0` reverts (Nitro `precompile.go` Call, method gate).
-/// Only methods with a non-default bound that are also decodable by our sol interfaces need an
-/// entry, methods absent from the interface already revert via `abi_decode` failure. Covers the
-/// 40→51 gates (native-token v41, gas methods v50, and `cacheCodehash` removed after v30).
+/// Only methods with a non-default bound that are ALSO decodable by our sol interfaces need an
+/// entry; methods absent from the interface already revert via `abi_decode` failure. Whole
+/// precompiles gated by version (ArbWasm/ArbWasmCache v30, ArbNativeTokenManager v41,
+/// ArbFilteredTransactionsManager v60) are handled by `precompile_min_arbos_version` (which
+/// returns no-code, not a revert) and their methods do not need an entry here.
+///
+/// Mirrors every method-level `arbosVersion` assignment in Nitro `precompiles/precompile.go`
+/// `Precompiles()` (v5 through v60). `maxArbosVersion` gates: the only one (`cacheCodehash`,
+/// max v30) was dropped from our interface entirely, so it already reverts.
 fn method_arbos_bounds(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> (u64, u64) {
     match arb {
         ArbPrecompilesEnum::ArbGasInfo => {
+            if sel == ArbGasInfo::getL1FeesAvailableCall::SELECTOR {
+                return (10, 0);
+            }
+            if sel == ArbGasInfo::getL1RewardRateCall::SELECTOR
+                || sel == ArbGasInfo::getL1RewardRecipientCall::SELECTOR
+            {
+                return (11, 0);
+            }
+            if sel == ArbGasInfo::getL1PricingEquilibrationUnitsCall::SELECTOR
+                || sel == ArbGasInfo::getLastL1PricingUpdateTimeCall::SELECTOR
+                || sel == ArbGasInfo::getL1PricingFundsDueForRewardsCall::SELECTOR
+                || sel == ArbGasInfo::getL1PricingUnitsSinceUpdateCall::SELECTOR
+                || sel == ArbGasInfo::getLastL1PricingSurplusCall::SELECTOR
+            {
+                return (20, 0);
+            }
             if sel == ArbGasInfo::getMaxTxGasLimitCall::SELECTOR
                 || sel == ArbGasInfo::getMaxBlockGasLimitCall::SELECTOR
             {
@@ -309,7 +331,59 @@ fn method_arbos_bounds(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> (u64, u64) {
             }
             (0, 0)
         }
+        ArbPrecompilesEnum::ArbOwnerPublic => {
+            if sel == ArbOwnerPublic::getInfraFeeAccountCall::SELECTOR {
+                return (5, 0);
+            }
+            if sel == ArbOwnerPublic::rectifyChainOwnerCall::SELECTOR {
+                return (11, 0);
+            }
+            if sel == ArbOwnerPublic::getBrotliCompressionLevelCall::SELECTOR
+                || sel == ArbOwnerPublic::getScheduledUpgradeCall::SELECTOR
+            {
+                return (20, 0);
+            }
+            if sel == ArbOwnerPublic::isCalldataPriceIncreaseEnabledCall::SELECTOR {
+                return (40, 0);
+            }
+            if sel == ArbOwnerPublic::isNativeTokenOwnerCall::SELECTOR
+                || sel == ArbOwnerPublic::getAllNativeTokenOwnersCall::SELECTOR
+            {
+                return (41, 0);
+            }
+            if sel == ArbOwnerPublic::getParentGasFloorPerTokenCall::SELECTOR
+                || sel == ArbOwnerPublic::getNativeTokenManagementFromCall::SELECTOR
+            {
+                return (50, 0);
+            }
+            if sel == ArbOwnerPublic::getMaxStylusContractFragmentsCall::SELECTOR
+                || sel == ArbOwnerPublic::getTransactionFilteringFromCall::SELECTOR
+                || sel == ArbOwnerPublic::isTransactionFiltererCall::SELECTOR
+                || sel == ArbOwnerPublic::getAllTransactionFilterersCall::SELECTOR
+                || sel == ArbOwnerPublic::getFilteredFundsRecipientCall::SELECTOR
+            {
+                return (60, 0);
+            }
+            (0, 0)
+        }
         ArbPrecompilesEnum::ArbOwner => {
+            if sel == ArbOwner::setInfraFeeAccountCall::SELECTOR {
+                return (5, 0);
+            }
+            if sel == ArbOwner::releaseL1PricerSurplusFundsCall::SELECTOR {
+                return (10, 0);
+            }
+            if sel == ArbOwner::setChainConfigCall::SELECTOR {
+                return (11, 0);
+            }
+            if sel == ArbOwner::setBrotliCompressionLevelCall::SELECTOR {
+                return (20, 0);
+            }
+            if sel == ArbOwner::setCalldataPriceIncreaseCall::SELECTOR
+                || sel == ArbOwner::setWasmMaxSizeCall::SELECTOR
+            {
+                return (40, 0);
+            }
             if sel == ArbOwner::addNativeTokenOwnerCall::SELECTOR
                 || sel == ArbOwner::removeNativeTokenOwnerCall::SELECTOR
                 || sel == ArbOwner::setNativeTokenManagementFromCall::SELECTOR
@@ -322,18 +396,13 @@ fn method_arbos_bounds(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> (u64, u64) {
             {
                 return (50, 0);
             }
-            (0, 0)
-        }
-        ArbPrecompilesEnum::ArbOwnerPublic => {
-            if sel == ArbOwnerPublic::isNativeTokenOwnerCall::SELECTOR
-                || sel == ArbOwnerPublic::getAllNativeTokenOwnersCall::SELECTOR
+            if sel == ArbOwner::setMaxStylusContractFragmentsCall::SELECTOR
+                || sel == ArbOwner::addTransactionFiltererCall::SELECTOR
+                || sel == ArbOwner::removeTransactionFiltererCall::SELECTOR
+                || sel == ArbOwner::setTransactionFilteringFromCall::SELECTOR
+                || sel == ArbOwner::setFilteredFundsRecipientCall::SELECTOR
             {
-                return (41, 0);
-            }
-            if sel == ArbOwnerPublic::getParentGasFloorPerTokenCall::SELECTOR
-                || sel == ArbOwnerPublic::getNativeTokenManagementFromCall::SELECTOR
-            {
-                return (50, 0);
+                return (60, 0);
             }
             (0, 0)
         }
@@ -342,6 +411,14 @@ fn method_arbos_bounds(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> (u64, u64) {
             // already reverts via abi_decode failure. `cacheProgram` is v31 (StylusFixes).
             if sel == ArbWasmCache::cacheProgramCall::SELECTOR {
                 return (31, 0);
+            }
+            (0, 0)
+        }
+        ArbPrecompilesEnum::ArbDebug => {
+            // `panic` is v30 (Stylus). `customRevert`/`legacyError`/`becomeChainOwner`/
+            // `overwriteContractCode` are ungated (v0).
+            if sel == ArbDebug::panicCall::SELECTOR {
+                return (30, 0);
             }
             (0, 0)
         }
@@ -515,6 +592,54 @@ mod gating_tests {
         // a gated selector on the wrong precompile is not gated
         assert_eq!(
             method_arbos_bounds(E::ArbSys, ArbGasInfo::getMaxTxGasLimitCall::SELECTOR),
+            (0, 0)
+        );
+        // early method gates (v5..v40) that a from-genesis replay exercises
+        assert_eq!(
+            method_arbos_bounds(E::ArbGasInfo, ArbGasInfo::getL1FeesAvailableCall::SELECTOR),
+            (10, 0)
+        );
+        assert_eq!(
+            method_arbos_bounds(E::ArbGasInfo, ArbGasInfo::getL1RewardRateCall::SELECTOR),
+            (11, 0)
+        );
+        assert_eq!(
+            method_arbos_bounds(
+                E::ArbGasInfo,
+                ArbGasInfo::getLastL1PricingSurplusCall::SELECTOR
+            ),
+            (20, 0)
+        );
+        assert_eq!(
+            method_arbos_bounds(E::ArbOwnerPublic, ArbOwnerPublic::getInfraFeeAccountCall::SELECTOR),
+            (5, 0)
+        );
+        assert_eq!(
+            method_arbos_bounds(
+                E::ArbOwnerPublic,
+                ArbOwnerPublic::isCalldataPriceIncreaseEnabledCall::SELECTOR
+            ),
+            (40, 0)
+        );
+        assert_eq!(
+            method_arbos_bounds(
+                E::ArbOwner,
+                ArbOwner::releaseL1PricerSurplusFundsCall::SELECTOR
+            ),
+            (10, 0)
+        );
+        assert_eq!(
+            method_arbos_bounds(E::ArbOwner, ArbOwner::setWasmMaxSizeCall::SELECTOR),
+            (40, 0)
+        );
+        // ArbDebug.panic is v30 (Stylus)
+        assert_eq!(
+            method_arbos_bounds(E::ArbDebug, ArbDebug::panicCall::SELECTOR),
+            (30, 0)
+        );
+        // an ungated getter stays open
+        assert_eq!(
+            method_arbos_bounds(E::ArbOwnerPublic, ArbOwnerPublic::isChainOwnerCall::SELECTOR),
             (0, 0)
         );
     }
