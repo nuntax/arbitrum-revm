@@ -1,5 +1,5 @@
 use super::*;
-use crate::arb_journal::{ArbCall, ArbPrecompileCtx};
+use crate::arb_journal::{ArbCall, ArbJournal, ArbPrecompileCtx, MeteredJournal};
 use crate::constants::BATCH_POSTER_ADDRESS;
 
 pub(super) fn run_arb_aggregator<CTX>(
@@ -13,17 +13,44 @@ where
 {
     let call = match ArbAggregator::ArbAggregatorCalls::abi_decode(input) {
         Ok(c) => c,
-        Err(_) => return gated_revert_result(gas_limit),};
+        Err(_) => return gated_revert_result(gas_limit),
+    };
 
     let state = ArbosState::open();
+    // Nitro's ArbAggregator uses `c.caller`, the immediate CALL caller (msg.sender of the
+    // precompile call), NOT the tx origin. Through a proxy that delegatecalls into an impl which
+    // then calls the precompile, these differ.
+    let caller = arb_call.caller;
 
+    // Nitro meters every ArbOS-storage read/write performed inside these methods through the
+    // precompile burner (StorageReadCost=800 / StorageWriteCost=20000), on top of the per-call
+    // args/result/OpenArbosState charge that `arbos_call_extra_gas` already folds in. Route the
+    // storage ops through `MeteredJournal` and add its total to the call's gas.
+    let mut journal = MeteredJournal::new(ctx.journal_mut());
+    let mut result = dispatch_arb_aggregator(&state, call, caller, gas_limit, &mut journal);
+
+    let burned = journal.burned;
+    if !result.gas.record_regular_cost(burned) {
+        result.result = revm::interpreter::InstructionResult::OutOfGas;
+        result.output = revm::primitives::Bytes::new();
+    }
+    result
+}
+
+fn dispatch_arb_aggregator<J: ArbJournal>(
+    state: &ArbosState,
+    call: ArbAggregator::ArbAggregatorCalls,
+    caller: Address,
+    gas_limit: u64,
+    journal: &mut J,
+) -> InterpreterResult {
     match call {
         ArbAggregator::ArbAggregatorCalls::getBatchPosters(_) => {
             let posters = match state
                 .l1_pricing
                 .batch_poster_table
                 .poster_address_set
-                .all_members(ctx.journal_mut())
+                .all_members(journal)
             {
                 Ok(p) => p,
                 Err(e) => return revert_result(gas_limit, &format!("ArbAggregator: error: {e}")),
@@ -36,7 +63,7 @@ where
         ArbAggregator::ArbAggregatorCalls::getFeeCollector(c) => {
             let poster_state = match state.l1_pricing.batch_poster_table.open_poster_checked(
                 c.batchPoster,
-                ctx.journal_mut(),
+                journal,
                 false,
             ) {
                 Ok(s) => s,
@@ -44,7 +71,7 @@ where
                     return revert_result(gas_limit, &format!("ArbAggregator: error: {e}"));
                 }
             };
-            let pay_to = match poster_state.pay_to(ctx.journal_mut()) {
+            let pay_to = match poster_state.pay_to(journal) {
                 Ok(a) => a,
                 Err(e) => return revert_result(gas_limit, &format!("ArbAggregator: error: {e}")),
             };
@@ -69,10 +96,7 @@ where
             alloy_core::sol_types::SolValue::abi_encode(&(U256::ZERO,)),
         ),
         ArbAggregator::ArbAggregatorCalls::addBatchPoster(c) => {
-            // Nitro checks `c.caller`, the immediate CALL caller (msg.sender of the precompile
-            // call), NOT the tx origin. Through a proxy/delegatecall these differ.
-            let caller = arb_call.caller;
-            let caller_is_owner = match state.chain_owners.is_member(caller, ctx.journal_mut()) {
+            let caller_is_owner = match state.chain_owners.is_member(caller, journal) {
                 Ok(v) => v,
                 Err(e) => {
                     return revert_result(gas_limit, &format!("ArbAggregator: error: {e}"));
@@ -85,7 +109,7 @@ where
                 .l1_pricing
                 .batch_poster_table
                 .poster_address_set
-                .is_member(c.newBatchPoster, ctx.journal_mut())
+                .is_member(c.newBatchPoster, journal)
             {
                 Ok(v) => v,
                 Err(e) => {
@@ -98,7 +122,7 @@ where
             match state.l1_pricing.batch_poster_table.add_poster(
                 c.newBatchPoster,
                 c.newBatchPoster,
-                ctx.journal_mut(),
+                journal,
             ) {
                 Ok(_) => ok_result(gas_limit, vec![]),
                 Err(e) => revert_result(
@@ -110,7 +134,7 @@ where
         ArbAggregator::ArbAggregatorCalls::setFeeCollector(c) => {
             let poster_state = match state.l1_pricing.batch_poster_table.open_poster_checked(
                 c.batchPoster,
-                ctx.journal_mut(),
+                journal,
                 false,
             ) {
                 Ok(s) => s,
@@ -121,15 +145,12 @@ where
                     );
                 }
             };
-            let old_fee_collector = match poster_state.pay_to(ctx.journal_mut()) {
+            let old_fee_collector = match poster_state.pay_to(journal) {
                 Ok(a) => a,
                 Err(e) => return revert_result(gas_limit, &format!("ArbAggregator: error: {e}")),
             };
-            // Nitro checks `c.caller`, the immediate CALL caller, not the tx origin.
-            let caller = arb_call.caller;
             if caller != c.batchPoster && caller != old_fee_collector {
-                let caller_is_owner = match state.chain_owners.is_member(caller, ctx.journal_mut())
-                {
+                let caller_is_owner = match state.chain_owners.is_member(caller, journal) {
                     Ok(v) => v,
                     Err(e) => {
                         return revert_result(gas_limit, &format!("ArbAggregator: error: {e}"));
@@ -142,7 +163,7 @@ where
                     );
                 }
             }
-            match poster_state.set_pay_to(c.newFeeCollector, ctx.journal_mut()) {
+            match poster_state.set_pay_to(c.newFeeCollector, journal) {
                 Ok(_) => ok_result(gas_limit, vec![]),
                 Err(e) => revert_result(
                     gas_limit,
