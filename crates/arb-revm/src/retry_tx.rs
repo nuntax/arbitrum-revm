@@ -6,7 +6,7 @@ use revm::{
         Block, ContextTr, JournalTr, Transaction,
         journaled_state::{TransferError, account::JournaledAccountTr},
     },
-    primitives::{Address, B256, U256, keccak256},
+    primitives::{Address, B256, TxKind, U256, keccak256},
 };
 
 const RETRYABLE_ESCROW_TAG: &[u8] = b"retryable escrow";
@@ -20,6 +20,13 @@ pub(crate) fn apply_retry_tx_pre_execution<CTX: ArbContextTr>(ctx: &mut CTX) -> 
         .ok_or_else(|| "[ARBITRUM] retry tx missing retry metadata".to_string())?;
     let ticket_id = retry_meta.ticket_id;
     let from = tx.caller();
+    // A contract-creation retry (retryTo = nil) is run by revm as a CREATE frame, which itself
+    // bumps the caller nonce and derives the deploy address from the PRE-increment nonce. Bumping
+    // here too would double-increment and shift the CREATE address by one nonce (Nitro does a
+    // single increment; the address uses the sender's nonce as-is). A CALL retry still needs the
+    // manual bump below: protocol txs bypass revm's tx-level pre-execution and the CALL frame does
+    // not bump the caller nonce.
+    let is_create = matches!(tx.kind(), TxKind::Create);
     let current_timestamp: u64 = ctx
         .block()
         .timestamp()
@@ -50,11 +57,13 @@ pub(crate) fn apply_retry_tx_pre_execution<CTX: ArbContextTr>(ctx: &mut CTX) -> 
             .map_err(|err| format!("[ARBITRUM] failed to transfer retryable callvalue: {err}"))?;
         map_transfer_error(transfer_error, "retry callvalue transfer")?;
     }
-    let mut caller_account = journal
-        .load_account_mut(from)
-        .map_err(|err| format!("[ARBITRUM] failed to load retry sender account: {err}"))?;
-    if !caller_account.data.bump_nonce() {
-        return Err("[ARBITRUM] retry tx sender nonce overflow".to_string());
+    if !is_create {
+        let mut caller_account = journal
+            .load_account_mut(from)
+            .map_err(|err| format!("[ARBITRUM] failed to load retry sender account: {err}"))?;
+        if !caller_account.data.bump_nonce() {
+            return Err("[ARBITRUM] retry tx sender nonce overflow".to_string());
+        }
     }
 
     Ok(())
