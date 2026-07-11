@@ -658,7 +658,13 @@ where
         };
         let remaining = gas.remaining();
         let refund = gas.refunded().max(0) as u64;
-        let gas_used = tx_gas_limit.saturating_sub(remaining).saturating_sub(refund);
+        // Exclude the EIP-7825/8037 reservoir (see the retry path): the capped-off excess above
+        // TX_GAS_LIMIT_CAP is not real work. Zero on the normal path at our specs, but kept
+        // symmetric with the retry path so a >2^24 gas tx never inflates computeGas.
+        let gas_used = tx_gas_limit
+            .saturating_sub(remaining)
+            .saturating_sub(refund)
+            .saturating_sub(gas.reservoir());
         // gas.refunded() is the capped EIP-3529 refund that reimburse_caller returns to the
         // caller. Nitro's gasUsed = GasLimit - gasLeft (where gasLeft includes the refund),
         // which maps to revm's spent_sub_refunded() at this stage.
@@ -834,7 +840,15 @@ where
         // tx-level gas directly from the raw gas tracker fields.
         let remaining = gas.remaining();
         let refund = gas.refunded().max(0) as u64;
-        let gas_used = tx_gas_limit.saturating_sub(remaining).saturating_sub(refund);
+        // EIP-7825/8037: under Osaka revm sets aside (gas_limit - TX_GAS_LIMIT_CAP) in the gas
+        // reservoir; it is never real work, and revm's ExecutionResult.gas_used excludes it. Nitro
+        // exempts Arbitrum from the cap, so its gasUsed also excludes it. Subtract it here or the
+        // L2 backlog over-grows by exactly the reservoir for any tx whose gas limit exceeds 2^24.
+        let reservoir = gas.reservoir();
+        let gas_used = tx_gas_limit
+            .saturating_sub(remaining)
+            .saturating_sub(refund)
+            .saturating_sub(reservoir);
         let gas_left = tx_gas_limit.saturating_sub(gas_used);
 
         let arbos_state = ArbosState::open();
