@@ -183,21 +183,6 @@ where
             Ok(v) => v,
             Err(e) => return revert_result(gas_limit, &format!("ArbSys: storage error: {e}")),
         };
-
-        if arbos_version >= ARBOS_VERSION_WITH_NATIVE_TOKEN_OWNERS_SEND_RESTRICTION
-            && callvalue > U256::ZERO
-        {
-            let owner_count = match state.native_token_owners.size.get(journal) {
-                Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbSys: storage error: {e}")),
-            };
-            if owner_count > 0 {
-                return revert_result(
-                    gas_limit,
-                    "ArbSys: not allowed to send value when native token owners exist",
-                );
-            }
-        }
     }
 
     let l1_block_num_u256 = U256::from(l1_block_num);
@@ -210,6 +195,27 @@ where
     // billed to the method body. The callvalue burn (`debit_balance`) is also unmetered, Nitro's
     // `util.BurnBalance` touches the state DB directly, not the burner.
     let mut journal = MeteredJournal::new(ctx.journal_mut());
+
+    // NativeTokenOwners().Size() is read through the precompile burner in Nitro (ArbSys.go
+    // SendTxToL1), so it IS metered (flat 800/read), unlike the version/L1-block reads above.
+    // ArbOS 41+ only, and only when value is sent (Nitro's `value.BitLen() != 0` guard).
+    if arbos_version >= ARBOS_VERSION_WITH_NATIVE_TOKEN_OWNERS_SEND_RESTRICTION
+        && callvalue > U256::ZERO
+    {
+        let owner_count = match state.native_token_owners.size.get(&mut journal) {
+            Ok(v) => v,
+            Err(e) => return revert_result(gas_limit, &format!("ArbSys: storage error: {e}")),
+        };
+        if owner_count > 0 {
+            // Nitro reverts here after the metered read; charge the gas burned so far.
+            let mut result = revert_result(
+                gas_limit,
+                "ArbSys: not allowed to send value when native token owners exist",
+            );
+            let _ = result.gas.record_regular_cost(journal.burned);
+            return result;
+        }
+    }
 
     // sendHash = arbosState.KeccakHash(...), charged through the metered journal.
     let send_hash = {
