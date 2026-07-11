@@ -6,6 +6,11 @@ use revm::primitives::{B256, Bytes, Log, keccak256};
 
 const FEATURE_ENABLE_DELAY_SECONDS: u64 = 7 * 24 * 60 * 60;
 const ARBOS_VERSION_PER_TX_GAS_LIMIT: u64 = 50;
+// Gas-constraint pricing model version gates (Nitro go-ethereum/params/config_arbitrum.go).
+const ARBOS_MULTI_CONSTRAINT_FIX: u64 = 51;
+const ARBOS_MULTI_GAS_CONSTRAINTS_VERSION: u64 = 60;
+// Max single-gas constraints, enforced only in [MultiConstraintFix, MultiGasConstraintsVersion).
+const GAS_CONSTRAINTS_MAX_NUM: u64 = 20;
 const MIN_INIT_GAS_UNITS: u64 = 128;
 const MIN_CACHED_INIT_GAS_UNITS: u64 = 32;
 const COST_SCALAR_PERCENT_UNITS: u64 = 2;
@@ -383,6 +388,60 @@ where
         ArbOwner::ArbOwnerCalls::setChainConfig(_) => {
             // Chain config update requires JSON deserialization; stub out for now.
             revert_result(gas_limit, "ArbOwner: setChainConfig not yet implemented")
+        }
+        ArbOwner::ArbOwnerCalls::setGasPricingConstraints(c) => {
+            // Nitro ArbOwner.SetGasPricingConstraints: clear the existing constraints, then install
+            // the new ones. Mirrors the ArbOS-50 single-gas-constraint pricing model (each is
+            // {target, adjustmentWindow, backlog}); the base-fee model already consumes these.
+            let arbos_version = match state.arbos_version.get(j) {
+                Ok(v) => v,
+                Err(e) => {
+                    return revert_result(
+                        gas_limit,
+                        &format!("ArbOwner: setGasPricingConstraints error: {e}"),
+                    );
+                }
+            };
+            if let Err(e) = state.l2_pricing.clear_gas_constraints(j) {
+                return revert_result(
+                    gas_limit,
+                    &format!("ArbOwner: setGasPricingConstraints error: {e}"),
+                );
+            }
+            // The count limit applies only in [MultiConstraintFix, MultiGasConstraintsVersion)
+            // (Nitro: retryable-redeem gas accounting bounds it; lifted at ArbOS 60).
+            if (ARBOS_MULTI_CONSTRAINT_FIX..ARBOS_MULTI_GAS_CONSTRAINTS_VERSION)
+                .contains(&arbos_version)
+                && c.constraints.len() as u64 > GAS_CONSTRAINTS_MAX_NUM
+            {
+                return revert_result(gas_limit, "ArbOwner: too many constraints");
+            }
+            let mut failed: Option<String> = None;
+            for constraint in &c.constraints {
+                let target = constraint[0];
+                let adjustment_window = constraint[1];
+                let backlog = constraint[2];
+                if target == 0 || adjustment_window == 0 {
+                    failed = Some(format!(
+                        "invalid constraint with target {target} and adjustment window {adjustment_window}"
+                    ));
+                    break;
+                }
+                if let Err(e) =
+                    state
+                        .l2_pricing
+                        .add_gas_constraint(target, adjustment_window, backlog, j)
+                {
+                    failed = Some(format!("failed to add constraint: {e}"));
+                    break;
+                }
+            }
+            match failed {
+                None => ok_result(gas_limit, vec![]),
+                Some(msg) => {
+                    revert_result(gas_limit, &format!("ArbOwner: setGasPricingConstraints {msg}"))
+                }
+            }
         }
         ArbOwner::ArbOwnerCalls::releaseL1PricerSurplusFunds(_) => revert_result(
             gas_limit,

@@ -231,6 +231,45 @@ impl L2Pricing {
             .open_subspace(Bytes::copy_from_slice(&slot_id));
         GasConstraint::open(&storage)
     }
+
+    /// Appends a gas constraint to the `gasConstraints` sub-storage vector, mirroring Nitro
+    /// `L2PricingState.AddGasConstraint` (`storage.SubStorageVector.Push` then set the three
+    /// fields). Push opens the element sub-storage at the big-endian current length, then bumps
+    /// the length slot (offset 0 of the vector root).
+    pub fn add_gas_constraint<J: ArbJournal>(
+        &self,
+        target: u64,
+        adjustment_window: u64,
+        backlog: u64,
+        journal: &mut J,
+    ) -> Result<()> {
+        let length = self.gas_constraints_len(journal)?;
+        let constraint = self.open_gas_constraint(length);
+        self.gas_constraints
+            .storage_backed::<u64>(SUB_STORAGE_VECTOR_LENGTH_OFFSET)
+            .set(length + 1, journal)?;
+        constraint.target.set(target, journal)?;
+        constraint.adjustment_window.set(adjustment_window, journal)?;
+        constraint.backlog.set(backlog, journal)?;
+        Ok(())
+    }
+
+    /// Clears every gas constraint, mirroring Nitro `L2PricingState.ClearGasConstraints`: pop each
+    /// element (decrement the length slot) from the tail and zero its three fields.
+    pub fn clear_gas_constraints<J: ArbJournal>(&self, journal: &mut J) -> Result<()> {
+        let length = self.gas_constraints_len(journal)?;
+        for _ in 0..length {
+            let current = self.gas_constraints_len(journal)?;
+            let constraint = self.open_gas_constraint(current - 1);
+            self.gas_constraints
+                .storage_backed::<u64>(SUB_STORAGE_VECTOR_LENGTH_OFFSET)
+                .set(current - 1, journal)?;
+            constraint.target.set(0, journal)?;
+            constraint.adjustment_window.set(0, journal)?;
+            constraint.backlog.set(0, journal)?;
+        }
+        Ok(())
+    }
 }
 
 fn approx_exp_basis_points(value: i64, accuracy: u64) -> i64 {
