@@ -429,9 +429,9 @@ fn method_arbos_bounds(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> (u64, u64) {
 /// Eth precompile set for an ArbOS version, mirroring Nitro's `activePrecompiledContracts`
 /// (`gethhook/geth-hook.go`): ArbOS 30-49 = Cancun (0x01-0x0a, NO BLS) + the standalone
 /// secp256r1 P256VERIFY (RIP-7212, 0x100); ArbOS 50+ (`IsDia`) = Osaka (Prague + BLS + P256 +
-/// EIP-7823/7883 modexp). arb_revm targets ArbOS 40+. NOTE: this is keyed on the ArbOS
-/// version, NOT the eth spec, at ArbOS 40-51 the eth spec is Prague throughout, but the
-/// precompile set flips at the ArbOS 50 boundary.
+/// EIP-7823/7883 modexp). arb_revm targets ArbOS 40+. Keyed on the ArbOS version: the
+/// precompile set flips at the ArbOS 50 boundary, which is also the eth-spec Prague->Osaka
+/// boundary (see spec.rs into_eth_spec), so the sets stay aligned.
 pub fn arb_eth_precompiles(spec: ArbSpecId) -> &'static Precompiles {
     if spec.arbos_version() >= 50 {
         Precompiles::osaka()
