@@ -9,15 +9,31 @@ use revm::{
 const REDEEM_SCHEDULED_EVENT_SIGNATURE: &[u8] =
     b"RedeemScheduled(bytes32,bytes32,uint64,uint64,address,uint256,uint256)";
 const RETRY_TX_GAS_MINIMUM: u64 = 21_000;
-const REDEEM_SCHEDULED_EVENT_GAS: u64 = 2_899; // LogGas(375)+4*LogTopicGas(375)+128*LogDataGas(8)
+// EVM log gas (go-ethereum params/protocol_params.go); version-independent.
+const LOG_GAS: u64 = 375; // params.LogGas
+const LOG_TOPIC_GAS: u64 = 375; // params.LogTopicGas
+const LOG_DATA_GAS: u64 = 8; // params.LogDataGas
+// Cost of emitting the RedeemScheduled event. Unlike the ArbOS-version-dependent backlog cost, this
+// is a genuine constant: the event shape never changes -- 4 topics (sig + 3 indexed: ticketId,
+// retryTxHash, sequenceNum) and 128 bytes of data (4 non-indexed words: donatedGas, gasDonor,
+// maxRefund, submissionFeeRefund). Nitro computes it via `con.RedeemScheduledGasCost(...zeros...)`,
+// which returns the same value because only the fixed size matters, not the arg values.
+const REDEEM_SCHEDULED_EVENT_DATA_BYTES: u64 = 128; // 4 * 32-byte words
+const REDEEM_SCHEDULED_EVENT_GAS: u64 =
+    LOG_GAS + 4 * LOG_TOPIC_GAS + REDEEM_SCHEDULED_EVENT_DATA_BYTES * LOG_DATA_GAS; // 2899
 const REDEEM_COPY_GAS: u64 = 3; // params.CopyGas (gasCostToReturnResult)
-const BACKLOG_UPDATE_COST_PRE_V50: u64 = 20_800; // StorageRead(800)+StorageWrite(20000)
-const BACKLOG_UPDATE_COST_V50: u64 = 21_600; // +StorageRead(800) for GasModelToUse
+// Nitro ArbOS pricer version boundaries (go-ethereum/params/config_arbitrum.go). At and after
+// `SingleGasConstraints` the redeem's backlog reservation includes an extra `GasModelToUse` read;
+// at and after `MultiGasConstraints` the ShrinkBacklog cost is a fixed amount charged manually and
+// the SSTORE itself runs unmetered (Redeem calls `SetUnmeteredGasAccounting`).
+const ARBOS_VERSION_SINGLE_GAS_CONSTRAINTS: u64 = 50;
+const ARBOS_VERSION_MULTI_GAS_CONSTRAINTS: u64 = 60;
 // ArbOS flat storage gas (Nitro arbos/storage): every read = StorageReadCost, every write =
 // StorageWriteCost (SstoreSetGasEIP2200, flat, not EIP-2929). The retryable-size burn at
 // ArbRetryableTx.go:60 uses params.SloadGas (the *COPY* multiplier = 50), NOT StorageReadCost.
 const REDEEM_STORAGE_READ: u64 = 800; // StorageReadCost = SloadGasEIP2200
 const REDEEM_STORAGE_WRITE: u64 = 20_000; // StorageWriteCost = SstoreSetGasEIP2200
+const REDEEM_STORAGE_WRITE_ZERO: u64 = 5_000; // StorageWriteZeroCost = SstoreResetGasEIP2200
 const REDEEM_SIZE_SLOAD_GAS: u64 = 50; // params.SloadGas (COPY multiplier), ArbRetryableTx.go:60
 // ArbOS-storage gas Nitro burns for the retryable reads BEFORE reading GasLeft for the donation,
 // for a ZERO-calldata retryable (W=0). arb_revm's ArbosState reads are free, so we replicate it
@@ -28,7 +44,7 @@ const REDEEM_READ_BURNS_BASE: u64 = 28_353;
 // The backlog SSTORE the redeem prepays for is reserved as an SstoreSet (20000), but the actual
 // ShrinkBacklog write is a reset (5000) of the already-non-zero backlog: 15000 is refunded. This
 // is what makes the redeem tx gasUsed independent of the donation amount.
-const REDEEM_BACKLOG_OVERRESERVE: u64 = REDEEM_STORAGE_WRITE - 5_000;
+const REDEEM_BACKLOG_OVERRESERVE: u64 = REDEEM_STORAGE_WRITE - REDEEM_STORAGE_WRITE_ZERO;
 // Nitro's Redeem, on a missing/expired ticket, reads the retryable `timeout` twice before
 // reverting (RetryableSizeBytes -> OpenRetryable, then the direct OpenRetryable), each a flat
 // StorageReadCost. arb_revm's ArbosState reads are free, so charge the equivalent so the not-found
@@ -37,6 +53,24 @@ const REDEEM_NOT_FOUND_READ_BURNS: u64 = 2 * REDEEM_STORAGE_READ;
 // `NoTicketWithID()` custom-error selector, the revert reason Nitro returns for a missing ticket at
 // ArbOS >= 3 (oldNotFoundError). Matching it also matches the revert-output copy gas.
 const NO_TICKET_WITH_ID_SELECTOR: [u8; 4] = [0x80, 0x69, 0x84, 0x56];
+
+/// Nitro `L2PricingState.BacklogUpdateCost()` (arbos/l2pricing/model.go): the gas `redeem` prepays
+/// for the trailing `ShrinkBacklog`. v60+ (MultiGasConstraints) charges a fixed `StorageRead +
+/// StorageWrite`; v50-59 (SingleGasConstraints) adds one `StorageRead` for `GasModelToUse`; v40-49
+/// is the legacy `StorageRead + StorageWrite`. Configured gas constraints would add per-constraint
+/// read+write (MultiConstraintFix+), but mainnet/robinhood run with none, so this no-constraints
+/// form is exact. TODO: read `gasConstraints.Length()` dynamically once an ArbosState accessor
+/// exists, instead of assuming zero.
+fn redeem_backlog_update_cost(arbos_version: u64) -> u64 {
+    if arbos_version >= ARBOS_VERSION_MULTI_GAS_CONSTRAINTS {
+        return REDEEM_STORAGE_READ + REDEEM_STORAGE_WRITE; // MultiConstraintStaticBacklogUpdateCost
+    }
+    let mut cost = REDEEM_STORAGE_READ + REDEEM_STORAGE_WRITE; // legacy read + write
+    if arbos_version >= ARBOS_VERSION_SINGLE_GAS_CONSTRAINTS {
+        cost += REDEEM_STORAGE_READ; // GasModelToUse read
+    }
+    cost
+}
 
 pub(super) fn run_arb_retryable_tx<CTX>(
     ctx: &mut CTX,
@@ -210,11 +244,7 @@ where
             // the retry tx hash, the RedeemScheduled event, and the ShrinkBacklog below, matches.
             // 40-49: legacy backlog cost (20800); 50-59: single-gas-constraints (+800 GasModelToUse).
             let arbos_version = state.arbos_version.get(ctx.journal_mut()).unwrap_or(0);
-            let backlog_update_cost = if (50..60).contains(&arbos_version) {
-                BACKLOG_UPDATE_COST_V50
-            } else {
-                BACKLOG_UPDATE_COST_PRE_V50
-            };
+            let backlog_update_cost = redeem_backlog_update_cost(arbos_version);
             let future_gas_costs =
                 REDEEM_SCHEDULED_EVENT_GAS + REDEEM_COPY_GAS + backlog_update_cost;
             let calldata_words = words_for_bytes(input.len());
@@ -288,17 +318,16 @@ where
                 return revert_result(gas_limit, &format!("ArbRetryableTx: backlog error: {e}"));
             }
 
-            // The redeem reserves a full StorageWrite (20000) for the ShrinkBacklog SSTORE, but the
-            // realized cost is Nitro's `writeCost(newValue)` (arbos/storage/storage.go): only 5000
-            // (StorageWriteZeroCost) when the backlog is shrunk to ZERO, otherwise the full 20000.
-            // So the 15000 over-reserve is refunded ONLY when the post-shrink backlog is zero -- the
-            // case on a low-usage chain (the v40 testnode this was calibrated against), but NOT on a
-            // busy one (e.g. early-ArbOS mainnet, where the backlog stays non-zero).
-            // Reading gas_backlog here is free in arb_revm (ArbosState reads don't burn). v50+
-            // (multi-gas-constraints) charges a fixed backlog cost, not writeCost(value), so leave
-            // its separately-calibrated over-reserve untouched.
-            let backlog_overreserve = if arbos_version >= 50 {
-                REDEEM_BACKLOG_OVERRESERVE
+            // The redeem prepays a full StorageWrite (20000) for the trailing ShrinkBacklog SSTORE.
+            // At v40-59 that SSTORE is metered at Nitro's `writeCost(newValue)`
+            // (arbos/storage/storage.go): StorageWriteZeroCost (5000) when the backlog is reset to
+            // ZERO, else the full StorageWrite (20000). So the 15000 difference is refunded ONLY
+            // when the post-shrink backlog is zero. At v60+ (MultiGasConstraints) Redeem charges a
+            // fixed `MultiConstraintStaticBacklogUpdateCost` and runs ShrinkBacklog UNMETERED
+            // (`SetUnmeteredGasAccounting`), so the reservation is exactly consumed -- NO
+            // over-reserve. (Reading gas_backlog is free in arb_revm; ArbosState reads don't burn.)
+            let backlog_overreserve = if arbos_version >= ARBOS_VERSION_MULTI_GAS_CONSTRAINTS {
+                0
             } else {
                 let new_backlog = state.l2_pricing.gas_backlog.get(ctx.journal_mut()).unwrap_or(0);
                 if new_backlog == 0 { REDEEM_BACKLOG_OVERRESERVE } else { 0 }
@@ -328,4 +357,40 @@ where
 #[inline]
 fn u256_to_b256(value: U256) -> B256 {
     B256::from(value.to_be_bytes::<32>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `redeem` backlog reservation per Nitro `BacklogUpdateCost()` (no configured constraints).
+    #[test]
+    fn backlog_update_cost_matches_nitro_boundaries() {
+        // v40-49 (pre-SingleGasConstraints): legacy read + write.
+        assert_eq!(redeem_backlog_update_cost(40), 20_800);
+        assert_eq!(redeem_backlog_update_cost(49), 20_800);
+        // v50-59 (SingleGasConstraints): + GasModelToUse read.
+        assert_eq!(redeem_backlog_update_cost(50), 21_600);
+        assert_eq!(redeem_backlog_update_cost(59), 21_600);
+        // v60+ (MultiGasConstraints): fixed MultiConstraintStaticBacklogUpdateCost = read + write.
+        assert_eq!(redeem_backlog_update_cost(60), 20_800);
+        assert_eq!(redeem_backlog_update_cost(61), 20_800);
+    }
+
+    /// Regression for robinhood block 6268608: at v60+ the ShrinkBacklog SSTORE runs unmetered, so
+    /// there is NO 15000 over-reserve refund (refunding it undercharged the redeem by 15000). The
+    /// over-reserve constant itself is StorageWrite - StorageWriteZero.
+    #[test]
+    fn redeem_scheduled_event_gas_is_fixed() {
+        // Derived from the fixed event shape; must equal the historical hardcoded 2899.
+        assert_eq!(REDEEM_SCHEDULED_EVENT_GAS, 2_899);
+    }
+
+    #[test]
+    fn backlog_overreserve_constant() {
+        assert_eq!(REDEEM_BACKLOG_OVERRESERVE, 15_000);
+        // v60+ boundary is the fix: robinhood (ArbOS 61) must take the zero-over-reserve path.
+        assert!(61 >= ARBOS_VERSION_MULTI_GAS_CONSTRAINTS);
+        assert!(!(49 >= ARBOS_VERSION_MULTI_GAS_CONSTRAINTS));
+    }
 }
