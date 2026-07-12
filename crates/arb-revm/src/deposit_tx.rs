@@ -1,4 +1,5 @@
 use crate::api::exec::ArbContextTr;
+use crate::constants::FILTERED_TRANSACTIONS_STATE_ADDRESS;
 use crate::storage::{ArbosState, StorageSpace};
 use crate::transaction::ArbTxTr;
 use revm::{
@@ -6,15 +7,8 @@ use revm::{
     primitives::{Address, TxKind, U256, keccak256},
 };
 
-/// Dedicated backing account for the filtered-transactions KV store (Nitro
-/// `types.FilteredTransactionsStateAddress`).
-const FILTERED_TRANSACTIONS_STATE_ADDRESS: Address = Address::new([
-    0xA4, 0xB0, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x01,
-]);
-
 /// Nitro `filteredTransactions.presentHash` = common.BytesToHash([]byte{1}) = 1.
-const PRESENT_VALUE: U256 = U256::from_limbs([1, 0, 0, 0]);
+const PRESENT_VALUE: U256 = U256::ONE;
 
 /// Result of applying a deposit: whether it was redirected by the on-chain transaction filter.
 pub(crate) enum DepositOutcome {

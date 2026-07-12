@@ -1,25 +1,18 @@
 use super::{ArbosState, gated_revert_result, ok_result, revert_result};
 use crate::arb_journal::{ArbCall, ArbJournal, ArbPrecompileCtx};
+use crate::constants::FILTERED_TRANSACTIONS_STATE_ADDRESS;
 use crate::storage::StorageSpace;
 use alloy_core::sol;
 use alloy_core::sol_types::{SolInterface, SolValue};
 use revm::interpreter::InterpreterResult;
-use revm::primitives::{Address, B256, Bytes, Log, U256, keccak256};
+use revm::primitives::{B256, Bytes, Log, U256, keccak256};
 
 /// ArbOS version at which ArbFilteredTransactionsManager becomes active.
 /// Nitro reference: params.ArbosVersion_TransactionFiltering = ArbosVersion_60 = 60.
 const ARBOS_VERSION_TRANSACTION_FILTERING: u64 = 60;
 
-/// Dedicated backing account for the filtered-transactions KV store.
-/// Nitro: `types.FilteredTransactionsStateAddress`. The account is created (nonce=1) at the ArbOS-60
-/// upgrade (see internal_tx.rs); the entries live directly under it with an empty storage subspace.
-const FILTERED_TRANSACTIONS_STATE_ADDRESS: Address = Address::new([
-    0xA4, 0xB0, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x01,
-]);
-
 /// Nitro `filteredTransactions.presentHash` = common.BytesToHash([]byte{1}) = 1.
-const PRESENT_VALUE: U256 = U256::from_limbs([1, 0, 0, 0]);
+const PRESENT_VALUE: U256 = U256::ONE;
 
 sol! {
     interface ArbFilteredTransactionsManager {

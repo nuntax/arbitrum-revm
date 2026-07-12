@@ -4,7 +4,8 @@ use crate::{
     constants::{
         ARB_RETRYABLE_TX_ADDRESS, ARBITRUM_DEPOSIT_TX_TYPE, ARBITRUM_INTERNAL_TX_TYPE,
         ARBITRUM_RETRY_TX_TYPE, ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE, ARBOS_ACTS_ADDRESS,
-        BATCH_POSTER_ADDRESS, CURRENT_TX_L1_FEE_ADDR, L1_PRICER_FUNDS_POOL_ADDRESS,
+        BATCH_POSTER_ADDRESS, CURRENT_TX_L1_FEE_ADDR, FILTERED_TRANSACTIONS_STATE_ADDRESS,
+        L1_PRICER_FUNDS_POOL_ADDRESS,
     },
     deposit_tx, internal_tx,
     l1_cost::{compute_poster_info, encode_tx_bytes},
@@ -33,13 +34,6 @@ use revm::{
 /// ArbOS version at which the on-chain transaction filter is active (Nitro
 /// ArbosVersion_TransactionFiltering = 60).
 const ARBOS_VERSION_TRANSACTION_FILTERING: u64 = 60;
-
-/// Dedicated backing account for the filtered-transactions KV store (Nitro
-/// `types.FilteredTransactionsStateAddress`).
-const FILTERED_TRANSACTIONS_STATE_ADDRESS: Address = Address::new([
-    0xA4, 0xB0, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x01,
-]);
 
 /// Arbitrum handler that composes mainnet logic and overrides Arbitrum-specific
 /// transaction semantics.
@@ -136,7 +130,7 @@ where
     }
     StorageSpace::new(FILTERED_TRANSACTIONS_STATE_ADDRESS)
         .get(tx_hash, journal)
-        .map(|v| v.data == U256::from(1))
+        .map(|v| v.data == U256::ONE)
         .unwrap_or(false)
 }
 

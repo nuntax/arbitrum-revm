@@ -1,5 +1,6 @@
 use crate::{
     api::exec::ArbContextTr,
+    constants::{FILTERED_TRANSACTIONS_STATE_ADDRESS, HISTORY_STORAGE_ADDRESS},
     storage::{ArbosState, StorageSlot},
 };
 use revm::{
@@ -9,19 +10,6 @@ use revm::{
     state::Bytecode,
 };
 
-/// EIP-2935 history storage contract (`0x0000F90827F1C53a10cb7A02335B175320002935`).
-const HISTORY_STORAGE_ADDRESS: Address = Address::new([
-    0x00, 0x00, 0xF9, 0x08, 0x27, 0xF1, 0xC5, 0x3a, 0x10, 0xcb, 0x7A, 0x02, 0x33, 0x5B, 0x17, 0x53,
-    0x20, 0x00, 0x29, 0x35,
-]);
-/// Dedicated backing account for the ArbOS TransactionFiltering state
-/// (`types.FilteredTransactionsStateAddress` = `0xA4B0500000000000000000000000000000000001`),
-/// introduced at ArbOS 60. Nitro opens this state on every `OpenArbosState` at v60+, and
-/// `KVStorage` calls `SetNonce(account, 1)` so Geth won't prune the (otherwise empty) account.
-const FILTERED_TRANSACTIONS_STATE_ADDRESS: Address = Address::new([
-    0xA4, 0xB0, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x01,
-]);
 /// Arbitrum's EIP-2935 ring-buffer size (`0x05ffd0`); Nitro widened the Ethereum default
 /// of 8191 to this. See `params.HistoryStorageCodeArbitrum`.
 const HISTORY_SERVE_WINDOW: u64 = 393_168;

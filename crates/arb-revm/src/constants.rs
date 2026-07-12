@@ -28,6 +28,13 @@ pub const CURRENT_TX_L1_FEE_ADDR: Address = address!("0x000000000000000000000000
 /// EIP-2935 history storage contract address.
 pub const HISTORY_STORAGE_ADDRESS: Address = address!("0x0000F90827F1C53a10cb7A02335B175320002935");
 
+/// Dedicated backing account for the ArbOS TransactionFiltering state (Nitro
+/// `types.FilteredTransactionsStateAddress`), introduced at ArbOS 60. Nitro opens this state on
+/// every `OpenArbosState` at v60+, and `KVStorage` calls `SetNonce(account, 1)` so Geth won't prune
+/// the (otherwise empty) account.
+pub const FILTERED_TRANSACTIONS_STATE_ADDRESS: Address =
+    address!("0xA4B0500000000000000000000000000000000001");
+
 /// ArbOS version that enables EIP-2935 parent hash processing in StartBlock.
 pub const ARBOS_VERSION_EIP2935: u64 = 40;
 
