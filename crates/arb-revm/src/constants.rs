@@ -52,3 +52,8 @@ pub const ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE: u8 = 0x69;
 
 /// Nitro typed transaction discriminator for retry (redeem) transactions.
 pub const ARBITRUM_RETRY_TX_TYPE: u8 = 0x68;
+
+/// Nitro typed transaction discriminator for L1->L2 contract transactions (unsigned, from an
+/// aliased L1 contract). Unlike a normal tx these are not nonce-checked (uniqueness comes from the
+/// L1 `requestId`); the nonce field is always 0.
+pub const ARBITRUM_CONTRACT_TX_TYPE: u8 = 0x66;

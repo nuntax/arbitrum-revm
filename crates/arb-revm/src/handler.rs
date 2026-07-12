@@ -2,8 +2,9 @@ use crate::{
     ArbSpecId, ArbosState,
     api::exec::ArbContextTr,
     constants::{
-        ARB_RETRYABLE_TX_ADDRESS, ARBITRUM_DEPOSIT_TX_TYPE, ARBITRUM_INTERNAL_TX_TYPE,
-        ARBITRUM_RETRY_TX_TYPE, ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE, ARBOS_ACTS_ADDRESS,
+        ARB_RETRYABLE_TX_ADDRESS, ARBITRUM_CONTRACT_TX_TYPE, ARBITRUM_DEPOSIT_TX_TYPE,
+        ARBITRUM_INTERNAL_TX_TYPE, ARBITRUM_RETRY_TX_TYPE, ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE,
+        ARBOS_ACTS_ADDRESS,
         BATCH_POSTER_ADDRESS, CURRENT_TX_L1_FEE_ADDR, FILTERED_TRANSACTIONS_STATE_ADDRESS,
         L1_PRICER_FUNDS_POOL_ADDRESS,
     },
@@ -517,7 +518,11 @@ where
                 tx.kind().is_call(),
                 tx.nonce(),
                 ctx.cfg().is_eip3607_disabled(),
-                ctx.cfg().is_nonce_check_disabled(),
+                // ArbitrumContractTx (L1->L2 unsigned contract call) is not nonce-checked: its
+                // nonce field is always 0 and uniqueness comes from the L1 requestId. Nitro skips
+                // the check but still bumps the sender nonce (kept below via `bump_nonce`).
+                ctx.cfg().is_nonce_check_disabled()
+                    || tx.tx_type() == ARBITRUM_CONTRACT_TX_TYPE,
             )
         };
 
