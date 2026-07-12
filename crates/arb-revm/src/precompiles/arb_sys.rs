@@ -63,7 +63,7 @@ where
             if !fits_u64 || target >= current || target.saturating_add(256) < current {
                 let arbos_version = match state.arbos_version.get(ctx.journal_mut()) {
                     Ok(v) => v,
-                    Err(e) => return revert_result(gas_limit, &format!("ArbSys: storage error: {e}")),
+                    Err(e) => return fatal_result(gas_limit, &format!("ArbSys: storage error: {e}")),
                 };
                 // ArbOS >= 11 returns the `InvalidBlockNumber(uint256,uint256)` custom error, which
                 // Nitro's precompile framework renders as a graceful (gas-refunding) revert. Before
@@ -86,7 +86,7 @@ where
         ArbSys::ArbSysCalls::arbChainID(_) => {
             let chain_id = match state.chain_id.get(ctx.journal_mut()) {
                 Ok(id) => id,
-                Err(e) => return revert_result(gas_limit, &format!("ArbSys: storage error: {e}")),
+                Err(e) => return fatal_result(gas_limit, &format!("ArbSys: storage error: {e}")),
             };
             ok_result(
                 gas_limit,
@@ -96,7 +96,7 @@ where
         ArbSys::ArbSysCalls::arbOSVersion(_) => {
             let version = match state.arbos_version.get(ctx.journal_mut()) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbSys: storage error: {e}")),
+                Err(e) => return fatal_result(gas_limit, &format!("ArbSys: storage error: {e}")),
             };
             // Nitro starts at ArbOS version 56 and exposes this as 55 + internal version.
             let encoded_version = U256::from(55_u64.saturating_add(version));
@@ -214,11 +214,11 @@ where
         let journal = ctx.journal_mut();
         arbos_version = match state.arbos_version.get(journal) {
             Ok(v) => v,
-            Err(e) => return revert_result(gas_limit, &format!("ArbSys: storage error: {e}")),
+            Err(e) => return fatal_result(gas_limit, &format!("ArbSys: storage error: {e}")),
         };
         l1_block_num = match state.block_hashes.l1_block_number(journal) {
             Ok(v) => v,
-            Err(e) => return revert_result(gas_limit, &format!("ArbSys: storage error: {e}")),
+            Err(e) => return fatal_result(gas_limit, &format!("ArbSys: storage error: {e}")),
         };
     }
 
@@ -241,7 +241,7 @@ where
     {
         let owner_count = match state.native_token_owners.size.get(&mut journal) {
             Ok(v) => v,
-            Err(e) => return revert_result(gas_limit, &format!("ArbSys: storage error: {e}")),
+            Err(e) => return fatal_result(gas_limit, &format!("ArbSys: storage error: {e}")),
         };
         if owner_count > 0 {
             // Nitro reverts here after the metered read; charge the gas burned so far.
@@ -284,7 +284,7 @@ where
     if callvalue > U256::ZERO {
         let sufficient = match journal.debit_balance(precompile_address, callvalue) {
             Ok(ok) => ok,
-            Err(e) => return revert_result(gas_limit, &format!("ArbSys: storage error: {e}")),
+            Err(e) => return fatal_result(gas_limit, &format!("ArbSys: storage error: {e}")),
         };
         if !sufficient {
             return revert_result(gas_limit, "ArbSys: insufficient balance for L2->L1 burn");

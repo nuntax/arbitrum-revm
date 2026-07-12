@@ -471,6 +471,142 @@ mod tests {
         );
     }
 
+    /// Regression for arb1 mainnet block 65185426: a retryable whose auto-redeem is a CONTRACT
+    /// CREATE (retryTo = nil) with callvalue > 0 and initcode that fails. Nitro bumps the sender
+    /// nonce exactly once (the CREATE frame does it; the submit does not). Our node was bumping it
+    /// twice, diverging the state root. Create-retries are rare (retries are usually calls), which
+    /// is why forward sync only broke here.
+    #[test]
+    fn failing_create_retry_bumps_sender_nonce_once() {
+        use revm::DatabaseRef;
+        let sender = Address::with_last_byte(0x11);
+        let request_id = B256::with_last_byte(0x33);
+        let submit = SubmitRetryableTx::new(
+            U256::from(42161_u64),
+            request_id,
+            sender,
+            U256::from(7_u64),                   // l1_base_fee
+            U256::from(200_000_000_000_000_u64), // deposit_value (covers fees + callvalue)
+            U256::from(1_000_000_000_u64),       // gas_fee_cap
+            U256::from(100_000_u64),             // gas_limit
+            TxKind::Create,                      // retry destination = CREATE (retryTo nil)
+            U256::from(1_000_u64),               // retry callvalue > 0 (escrowed)
+            Address::ZERO,                       // beneficiary
+            U256::from(100_000_000_000_000_u64), // max_submission_fee
+            sender,                              // fee refund addr
+            Bytes::from(vec![0xfe]),             // initcode = INVALID opcode -> create fails
+        );
+
+        let input = ArbExecutionInput::new(
+            ArbParentHeader {
+                number: 0,
+                timestamp: 1,
+                beneficiary: Address::ZERO,
+                basefee: 100_000_000,
+                gas_limit: 30_000_000,
+                difficulty: U256::ZERO,
+                prevrandao: Some(B256::ZERO),
+            },
+            ArbMessageEnvelope {
+                sequence_number: Some(1),
+                l1_block_number: 1,
+                l1_timestamp: 1,
+                poster: Address::ZERO,
+                l1_base_fee_wei: U256::from(7_u64),
+                delayed_messages_read: 0,
+                txs: vec![ArbTxEnvelope::from(submit)],
+            },
+            ArbExecCfg::default(),
+        );
+
+        let mut db = InMemoryDB::default();
+        let outcome = execute_message(&mut db, &input).expect("message execution should succeed");
+
+        assert_eq!(outcome.txs.len(), 2, "submit should schedule one retry tx");
+        assert!(outcome.txs[0].success, "submit tx should succeed");
+        assert!(!outcome.txs[1].success, "create-retry with failing initcode should fail");
+
+        let nonce = db.basic_ref(sender).unwrap().map(|a| a.nonce).unwrap_or(0);
+        assert_eq!(
+            nonce, 1,
+            "a failed CREATE retry must bump the sender nonce exactly once (Nitro parity); got {nonce}"
+        );
+    }
+
+    /// Same as above but the CREATE target address is already occupied (a deployed contract on
+    /// mainnet), forcing revm's `CreateCollision` path. Suspected cause of the arb1 65185426
+    /// node-path double nonce bump: the collision path may bump the caller nonce differently than
+    /// a plain failing create.
+    #[test]
+    fn colliding_create_retry_bumps_sender_nonce_once() {
+        use revm::DatabaseRef;
+        let sender = Address::with_last_byte(0x11);
+        let request_id = B256::with_last_byte(0x33);
+        // The create runs with the sender at nonce 0 (submit does not bump), so the deploy address
+        // is `sender.create(0)`. Pre-occupy it to force a collision.
+        let collide_addr = sender.create(0);
+        let submit = SubmitRetryableTx::new(
+            U256::from(42161_u64),
+            request_id,
+            sender,
+            U256::from(7_u64),
+            U256::from(200_000_000_000_000_u64),
+            U256::from(1_000_000_000_u64),
+            U256::from(100_000_u64),
+            TxKind::Create,
+            U256::from(1_000_u64),
+            Address::ZERO,
+            U256::from(100_000_000_000_000_u64),
+            sender,
+            Bytes::from(vec![0x00]), // STOP: would succeed if not for the collision
+        );
+
+        let input = ArbExecutionInput::new(
+            ArbParentHeader {
+                number: 0,
+                timestamp: 1,
+                beneficiary: Address::ZERO,
+                basefee: 100_000_000,
+                gas_limit: 30_000_000,
+                difficulty: U256::ZERO,
+                prevrandao: Some(B256::ZERO),
+            },
+            ArbMessageEnvelope {
+                sequence_number: Some(1),
+                l1_block_number: 1,
+                l1_timestamp: 1,
+                poster: Address::ZERO,
+                l1_base_fee_wei: U256::from(7_u64),
+                delayed_messages_read: 0,
+                txs: vec![ArbTxEnvelope::from(submit)],
+            },
+            ArbExecCfg::default(),
+        );
+
+        let mut db = InMemoryDB::default();
+        // Occupy the deploy address with a deployed contract (nonce 1, some code) -> CreateCollision.
+        db.insert_account_info(
+            collide_addr,
+            revm::state::AccountInfo {
+                nonce: 1,
+                code_hash: keccak256([0x00u8]),
+                code: Some(revm::bytecode::Bytecode::new_raw(Bytes::from(vec![0x00]))),
+                balance: U256::ZERO,
+                ..Default::default()
+            },
+        );
+
+        let outcome = execute_message(&mut db, &input).expect("message execution should succeed");
+        assert_eq!(outcome.txs.len(), 2, "submit should schedule one retry tx");
+        assert!(!outcome.txs[1].success, "colliding create-retry should fail");
+
+        let nonce = db.basic_ref(sender).unwrap().map(|a| a.nonce).unwrap_or(0);
+        assert_eq!(
+            nonce, 1,
+            "a colliding CREATE retry must bump the sender nonce exactly once (Nitro parity); got {nonce}"
+        );
+    }
+
     #[test]
     fn redeem_precompile_log_schedules_retry_tx() {
         let sender = Address::with_last_byte(0x31);

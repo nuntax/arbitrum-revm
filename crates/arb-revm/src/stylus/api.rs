@@ -112,8 +112,14 @@ where
     CTX: ContextTr<Journal: JournalTr>,
 {
     let debug = std::env::var("STYLUS_GAS_DEBUG").is_ok();
+    // A valid Stylus program always sends correctly-sized hostio requests. Guard the decoders
+    // below so a hostile or broken guest cannot panic the host callback (it runs inside the
+    // wasmer trampoline) with short/oversized `req_data`; a malformed request yields a benign
+    // empty response with zero gas, same as an unhandled hostio.
+    let malformed = || (Vec::new(), empty_reader(), ArbGas(0));
     let result = match req_type {
         // SLOAD: req = key(32) → value(32) + sload gas.
+        EvmApiMethod::GetBytes32 if req_data.len() < 32 => malformed(),
         EvmApiMethod::GetBytes32 => {
             let key = word(&req_data);
             let loaded = ctx
@@ -145,12 +151,14 @@ where
         }
 
         // TLOAD: req = key(32) → value(32).
+        EvmApiMethod::GetTransientBytes32 if req_data.len() < 32 => malformed(),
         EvmApiMethod::GetTransientBytes32 => {
             let value = ctx.journal_mut().tload(contract, word(&req_data));
             (value.to_be_bytes::<32>().to_vec(), empty_reader(), ArbGas(0))
         }
 
         // TSTORE: req = key(32) ++ value(32) → status.
+        EvmApiMethod::SetTransientBytes32 if req_data.len() < 64 => malformed(),
         EvmApiMethod::SetTransientBytes32 => {
             let key = word(&req_data);
             let value = word(&req_data[32..]);
@@ -159,21 +167,30 @@ where
         }
 
         // LOG: req = n_topics(4) ++ [topic(32)]*n ++ data → empty on success.
+        EvmApiMethod::EmitLog if req_data.len() < 4 => malformed(),
         EvmApiMethod::EmitLog => {
             let n_topics = u32::from_be_bytes(req_data[..4].try_into().unwrap()) as usize;
             let body = &req_data[4..];
-            let topics = (0..n_topics)
-                .map(|i| revm::primitives::B256::from_slice(&body[i * 32..i * 32 + 32]))
-                .collect::<Vec<_>>();
-            let data = Bytes::copy_from_slice(&body[n_topics * 32..]);
-            ctx.journal_mut().log(Log {
-                address: contract,
-                data: LogData::new_unchecked(topics, data),
-            });
-            (Vec::new(), empty_reader(), ArbGas(0))
+            // `n_topics` is guest-controlled: reject if the claimed topics don't fit (or the
+            // byte count overflows) rather than slicing out of bounds.
+            match n_topics.checked_mul(32) {
+                Some(topics_len) if topics_len <= body.len() => {
+                    let topics = (0..n_topics)
+                        .map(|i| revm::primitives::B256::from_slice(&body[i * 32..i * 32 + 32]))
+                        .collect::<Vec<_>>();
+                    let data = Bytes::copy_from_slice(&body[topics_len..]);
+                    ctx.journal_mut().log(Log {
+                        address: contract,
+                        data: LogData::new_unchecked(topics, data),
+                    });
+                    (Vec::new(), empty_reader(), ArbGas(0))
+                }
+                _ => malformed(),
+            }
         }
 
         // BALANCE: req = address(20) → balance(32) + access gas.
+        EvmApiMethod::AccountBalance if req_data.len() < 20 => malformed(),
         EvmApiMethod::AccountBalance => {
             let address = Address::from_slice(&req_data[..20]);
             let (balance, is_cold) = ctx
@@ -190,6 +207,7 @@ where
         }
 
         // EXTCODEHASH: req = address(20) → codehash(32) + access gas.
+        EvmApiMethod::AccountCodeHash if req_data.len() < 20 => malformed(),
         EvmApiMethod::AccountCodeHash => {
             let address = Address::from_slice(&req_data[..20]);
             let (code_hash, is_cold) = ctx

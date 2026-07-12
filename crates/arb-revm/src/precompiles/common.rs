@@ -70,6 +70,21 @@ pub(super) fn gated_revert_result(gas_limit: u64) -> InterpreterResult {
     }
 }
 
+/// Build a **fatal** `InterpreterResult` for a genuine backend/storage fault (a failed state
+/// read/write), as opposed to a business-logic revert. `InstructionResult::FatalExternalError` is
+/// a sentinel that the precompile provider (`precompiles/mod.rs::run`) turns into an aborting
+/// `EVMError`, so a backend fault halts execution (Nitro's fatal path) instead of being masked as
+/// a keep-gas revert that would silently diverge the state root during replay. The message rides
+/// in `output` for the provider to surface.
+#[inline]
+pub(super) fn fatal_result(gas_limit: u64, msg: &str) -> InterpreterResult {
+    InterpreterResult {
+        result: InstructionResult::FatalExternalError,
+        gas: Gas::new(gas_limit),
+        output: Bytes::from(msg.as_bytes().to_vec()),
+    }
+}
+
 /// Extract raw input bytes from a `CallInputs`, resolving any shared-buffer
 /// reference against the context.
 #[inline]

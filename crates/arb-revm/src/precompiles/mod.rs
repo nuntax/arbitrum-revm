@@ -36,7 +36,7 @@ mod arb_wasm;
 mod arb_wasm_cache;
 mod common;
 
-use self::common::{empty_active_result, gated_revert_result, ok_result, revert_result};
+use self::common::{empty_active_result, fatal_result, gated_revert_result, ok_result, revert_result};
 pub(super) use crate::{ArbosState, storage::RETRYABLE_LIFETIME_SECONDS};
 pub(super) use alloy_core::sol_types::SolInterface;
 pub(super) use arbitrum_alloy_precompiles::{
@@ -157,6 +157,12 @@ impl ArbPrecompilesEnum {
             }
         }
         let mut result = self.dispatch(ctx, call);
+        // A genuine backend/storage fault is fatal: pass the sentinel through untouched (no gas
+        // folding, no `OutOfGas` rewrite, no ArbOwner/free-access gas reset) so `run` can turn it
+        // into an aborting `EVMError` rather than a masked revert.
+        if result.result == InstructionResult::FatalExternalError {
+            return result;
+        }
         // ArbOwner is wrapped by Nitro's `OwnerPrecompile`, which returns `multigas.ZeroGas()`
         // the chain owner is NEVER charged for an ArbOwner call (success or revert), so it pays
         // neither the method gas nor the per-call arg/result-copy + ArbosState-open gas. Reset to
@@ -538,7 +544,14 @@ where
                 acting_address: inputs.target_address,
                 is_static: inputs.is_static,
             };
-            return Ok(Some(arb.run_dispatch(context, &call)));
+            let out = arb.run_dispatch(context, &call);
+            // A fatal backend/storage fault surfaced by a precompile: propagate as an aborting
+            // EVM error (revm `run(...).map_err(from_string)?`) instead of a revert, so a failed
+            // state read halts the block rather than silently diverging the state root.
+            if out.result == InstructionResult::FatalExternalError {
+                return Err(String::from_utf8_lossy(&out.output).into_owned());
+            }
+            return Ok(Some(out));
         }
         self.inner.run(context, inputs)
     }

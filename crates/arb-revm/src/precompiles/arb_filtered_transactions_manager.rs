@@ -1,4 +1,4 @@
-use super::{ArbosState, gated_revert_result, ok_result, revert_result};
+use super::{ArbosState, fatal_result, gated_revert_result, ok_result, revert_result};
 use crate::arb_journal::{ArbCall, ArbJournal, ArbPrecompileCtx};
 use crate::constants::FILTERED_TRANSACTIONS_STATE_ADDRESS;
 use crate::storage::StorageSpace;
@@ -47,7 +47,7 @@ where
     let arbos_version = match state.arbos_version.get(j) {
         Ok(v) => v,
         Err(e) => {
-            return revert_result(
+            return fatal_result(
                 gas_limit,
                 &format!("ArbFilteredTransactionsManager: storage error: {e}"),
             );

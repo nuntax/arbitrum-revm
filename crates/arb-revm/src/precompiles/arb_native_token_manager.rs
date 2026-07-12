@@ -1,4 +1,4 @@
-use super::{ArbosState, ok_result, revert_result};
+use super::{ArbosState, fatal_result, ok_result, revert_result};
 use crate::arb_journal::ArbPrecompileCtx;
 use alloy_core::sol;
 use revm::interpreter::InterpreterResult;
@@ -32,7 +32,7 @@ where
     let arbos_version = match state.arbos_version.get(ctx.journal_mut()) {
         Ok(v) => v,
         Err(e) => {
-            return revert_result(
+            return fatal_result(
                 gas_limit,
                 &format!("ArbNativeTokenManager: storage error: {e}"),
             );

@@ -21,7 +21,7 @@ where
     let state = ArbosState::open();
     let arbos_version = match state.arbos_version.get(ctx.journal_mut()) {
         Ok(v) => v,
-        Err(e) => return revert_result(gas_limit, &format!("ArbWasmCache: storage error: {e}")),
+        Err(e) => return fatal_result(gas_limit, &format!("ArbWasmCache: storage error: {e}")),
     };
     if arbos_version < ARBOS_VERSION_STYLUS {
         return revert_result(
