@@ -192,10 +192,43 @@ impl L2Pricing {
         }
     }
 
-    pub fn shrink_backlog<J: ArbJournal>(&self, gas: u64, journal: &mut J) -> Result<()> {
-        let current = self.gas_backlog.get(journal)?;
-        self.gas_backlog.set(current.saturating_sub(gas), journal)?;
-        Ok(())
+    /// Shrink the L2 gas backlog by `gas`, mirroring [`grow_backlog`] under the active gas model
+    /// (Nitro `L2PricingState.ShrinkBacklog` -> `updateBacklog(Shrink, ..)`). This MUST be model-
+    /// aware: under `SingleGasConstraints` the live backlog lives in the per-constraint slots, not
+    /// the legacy `gas_backlog`, so a legacy-only shrink is a no-op on the real backlog and leaves
+    /// it too high after a retryable redeem (the redeem's `ShrinkBacklog(gasToDonate)` releases the
+    /// reservation the retry re-grows). Robinhood (SingleGasConstraints) diverged exactly here.
+    ///
+    /// [`grow_backlog`]: Self::grow_backlog
+    pub fn shrink_backlog<J: ArbJournal>(
+        &self,
+        gas: u64,
+        arbos_version: u64,
+        journal: &mut J,
+    ) -> Result<()> {
+        let model = self.gas_model(arbos_version, journal)?;
+        match model {
+            GasModel::Legacy => {
+                let current = self.gas_backlog.get(journal)?;
+                self.gas_backlog.set(current.saturating_sub(gas), journal)?;
+                Ok(())
+            }
+            GasModel::SingleGasConstraints => {
+                let constraints_len = self.gas_constraints_len(journal)?;
+                for i in 0..constraints_len {
+                    let constraint = self.open_gas_constraint(i);
+                    let backlog = constraint.backlog.get(journal)?;
+                    constraint
+                        .backlog
+                        .set(backlog.saturating_sub(gas), journal)?;
+                }
+                Ok(())
+            }
+            GasModel::MultiGasConstraints => {
+                // TODO(parity): implement full multi-gas constraints backlog updates.
+                Ok(())
+            }
+        }
     }
 
     fn gas_model<J: ArbJournal>(&self, arbos_version: u64, journal: &mut J) -> Result<GasModel> {

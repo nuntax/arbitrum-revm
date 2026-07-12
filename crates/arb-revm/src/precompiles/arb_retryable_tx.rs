@@ -310,10 +310,11 @@ where
 
             // Nitro shrinks the L2 gas backlog by the donated gas: it is not consumed by the redeem
             // tx itself (the retry re-grows it). Without this the backlog slot, and thus the state
-            // root, is too high. Single-backlog (legacy / single-constraint) path; v40 testnode.
+            // root, is too high. Model-aware: legacy uses the single gas_backlog, SingleGas/MultiGas
+            // constraints use the per-constraint backlogs (Nitro `ShrinkBacklog`).
             if let Err(e) = state
                 .l2_pricing
-                .shrink_backlog(donated_gas, ctx.journal_mut())
+                .shrink_backlog(donated_gas, arbos_version, ctx.journal_mut())
             {
                 return revert_result(gas_limit, &format!("ArbRetryableTx: backlog error: {e}"));
             }
@@ -389,8 +390,8 @@ mod tests {
     #[test]
     fn backlog_overreserve_constant() {
         assert_eq!(REDEEM_BACKLOG_OVERRESERVE, 15_000);
-        // v60+ boundary is the fix: robinhood (ArbOS 61) must take the zero-over-reserve path.
-        assert!(61 >= ARBOS_VERSION_MULTI_GAS_CONSTRAINTS);
-        assert!(!(49 >= ARBOS_VERSION_MULTI_GAS_CONSTRAINTS));
+        // v60+ boundary is the fix: robinhood (ArbOS 61) takes the zero-over-reserve path while
+        // v49 (pre-MultiGasConstraints) does not.
+        assert_eq!(ARBOS_VERSION_MULTI_GAS_CONSTRAINTS, 60);
     }
 }
