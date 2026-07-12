@@ -9,6 +9,11 @@ const ARBOS_VERSION_PER_TX_GAS_LIMIT: u64 = 50;
 // Gas-constraint pricing model version gates (Nitro go-ethereum/params/config_arbitrum.go).
 const ARBOS_MULTI_CONSTRAINT_FIX: u64 = 51;
 const ARBOS_MULTI_GAS_CONSTRAINTS_VERSION: u64 = 60;
+// ArbOS version that added the per-method ArbOwner events (ChainOwnerAdded, NativeTokenOwnerAdded,
+// etc.). Nitro (precompiles/ArbOwner.go) gates the chain-owner and native-token-owner events on
+// `ArbOSVersion() >= ArbosVersion_60`; the transaction-filterer / filtered-funds events are emitted
+// unconditionally (their feature is itself v60+).
+const ARBOS_VERSION_OWNER_EVENTS: u64 = 60;
 // Max single-gas constraints, enforced only in [MultiConstraintFix, MultiGasConstraintsVersion).
 const GAS_CONSTRAINTS_MAX_NUM: u64 = 20;
 const MIN_INIT_GAS_UNITS: u64 = 128;
@@ -47,6 +52,12 @@ where
         );
     }
 
+    // Needed to gate the per-method owner events the same way Nitro does (>= ArbosVersion_60).
+    let arbos_version = match state.arbos_version.get(j) {
+        Ok(v) => v,
+        Err(e) => return revert_result(gas_limit, &format!("ArbOwner: version read error: {e}")),
+    };
+
     macro_rules! set_or_revert {
         ($expr:expr, $label:literal) => {
             match $expr {
@@ -56,15 +67,52 @@ where
         };
     }
 
+    // Like `set_or_revert!`, but on success also emits Nitro's per-method ArbOwner event before the
+    // wrapping `OwnerActs` (Nitro emits the method-specific event inside the method body, then the
+    // precompile framework appends `OwnerActs`). The event is `Name(address indexed x)` with empty
+    // data. `$emit` gates emission on the ArbOS version. Skipping this diverges the block's
+    // receiptsRoot/logsBloom (and thus block hash) even though state is unaffected.
+    macro_rules! set_or_revert_event {
+        ($expr:expr, $label:literal, $emit:expr, $sig:literal, $addr:expr) => {
+            match $expr {
+                Ok(_) => {
+                    if $emit {
+                        let mut addr_topic = [0u8; 32];
+                        addr_topic[12..].copy_from_slice($addr.as_slice());
+                        j.emit_log(Log::new_unchecked(
+                            call_inputs.bytecode_address,
+                            vec![keccak256($sig), B256::from(addr_topic)],
+                            Bytes::new(),
+                        ));
+                    }
+                    ok_result(gas_limit, vec![])
+                }
+                Err(e) => revert_result(gas_limit, &format!("ArbOwner: {} error: {}", $label, e)),
+            }
+        };
+    }
+
     let result = match call {
         ArbOwner::ArbOwnerCalls::addChainOwner(c) => {
-            set_or_revert!(state.chain_owners.add(c.newOwner, j), "addChainOwner")
+            set_or_revert_event!(
+                state.chain_owners.add(c.newOwner, j),
+                "addChainOwner",
+                arbos_version >= ARBOS_VERSION_OWNER_EVENTS,
+                "ChainOwnerAdded(address)",
+                c.newOwner
+            )
         }
         ArbOwner::ArbOwnerCalls::removeChainOwner(c) => match state
             .chain_owners
             .is_member(c.owner, j)
         {
-            Ok(true) => set_or_revert!(state.chain_owners.remove(c.owner, j), "removeChainOwner"),
+            Ok(true) => set_or_revert_event!(
+                state.chain_owners.remove(c.owner, j),
+                "removeChainOwner",
+                arbos_version >= ARBOS_VERSION_OWNER_EVENTS,
+                "ChainOwnerRemoved(address)",
+                c.owner
+            ),
             Ok(false) => revert_result(gas_limit, "ArbOwner: tried to remove non-owner"),
             Err(e) => revert_result(gas_limit, &format!("ArbOwner: removeChainOwner error: {e}")),
         },
@@ -84,16 +132,22 @@ where
                     "ArbOwner: native token feature is not enabled yet",
                 );
             }
-            set_or_revert!(
+            set_or_revert_event!(
                 state.native_token_owners.add(c.newOwner, j),
-                "addNativeTokenOwner"
+                "addNativeTokenOwner",
+                arbos_version >= ARBOS_VERSION_OWNER_EVENTS,
+                "NativeTokenOwnerAdded(address)",
+                c.newOwner
             )
         }
         ArbOwner::ArbOwnerCalls::removeNativeTokenOwner(c) => {
             match state.native_token_owners.is_member(c.owner, j) {
-                Ok(true) => set_or_revert!(
+                Ok(true) => set_or_revert_event!(
                     state.native_token_owners.remove(c.owner, j),
-                    "removeNativeTokenOwner"
+                    "removeNativeTokenOwner",
+                    arbos_version >= ARBOS_VERSION_OWNER_EVENTS,
+                    "NativeTokenOwnerRemoved(address)",
+                    c.owner
                 ),
                 Ok(false) => revert_result(
                     gas_limit,
@@ -189,16 +243,22 @@ where
                     "ArbOwner: transaction filtering feature is not enabled yet",
                 );
             }
-            set_or_revert!(
+            set_or_revert_event!(
                 state.transaction_filterers.add(c.filterer, j),
-                "addTransactionFilterer"
+                "addTransactionFilterer",
+                true,
+                "TransactionFiltererAdded(address)",
+                c.filterer
             )
         }
         ArbOwner::ArbOwnerCalls::removeTransactionFilterer(c) => {
             match state.transaction_filterers.is_member(c.filterer, j) {
-                Ok(true) => set_or_revert!(
+                Ok(true) => set_or_revert_event!(
                     state.transaction_filterers.remove(c.filterer, j),
-                    "removeTransactionFilterer"
+                    "removeTransactionFilterer",
+                    true,
+                    "TransactionFiltererRemoved(address)",
+                    c.filterer
                 ),
                 Ok(false) => revert_result(
                     gas_limit,
@@ -211,9 +271,12 @@ where
             }
         }
         ArbOwner::ArbOwnerCalls::setFilteredFundsRecipient(c) => {
-            set_or_revert!(
+            set_or_revert_event!(
                 state.filtered_funds_recipient.set(c.newRecipient, j),
-                "setFilteredFundsRecipient"
+                "setFilteredFundsRecipient",
+                true,
+                "FilteredFundsRecipientSet(address)",
+                c.newRecipient
             )
         }
         ArbOwner::ArbOwnerCalls::setNetworkFeeAccount(c) => {
