@@ -166,6 +166,20 @@ impl ArbPrecompilesEnum {
             result.gas = Gas::new(gas_limit);
             return result;
         }
+        // ArbFilteredTransactionsManager is wrapped by Nitro's `FreeAccessPrecompile`: when the
+        // immediate caller is a registered transaction filterer the WHOLE call is free
+        // (`multigas.ZeroGas()`, wrapper.go), exactly like ArbOwner, so it pays neither the method
+        // gas nor the per-call extra. Non-filterer callers (e.g. an `isTransactionFiltered` view via
+        // eth_call, or an unauthorized add/delete) are charged normally.
+        if arb == ArbPrecompilesEnum::ArbFilteredTransactionsManager
+            && ArbosState::open()
+                .transaction_filterers
+                .is_member(call.caller, ctx.journal_mut())
+                .unwrap_or(false)
+        {
+            result.gas = Gas::new(gas_limit);
+            return result;
+        }
         // Fold the per-call precompile gas (arg/result copy + ArbosState open) into the returned
         // gas so the CALL's net cost matches Nitro.
         let extra = arbos_call_extra_gas(arb, input_len, result.output.len(), selector);
@@ -201,7 +215,7 @@ impl ArbPrecompilesEnum {
             Self::ArbWasmCache => run_arb_wasm_cache(ctx, raw, gas_limit, call),
             Self::ArbNativeTokenManager => run_arb_native_token_manager(ctx, raw, gas_limit),
             Self::ArbFilteredTransactionsManager => {
-                run_arb_filtered_transactions_manager(ctx, raw, gas_limit)
+                run_arb_filtered_transactions_manager(ctx, raw, gas_limit, call)
             }
             Self::ArbDebug => run_arb_debug(ctx, raw, gas_limit),
         }
