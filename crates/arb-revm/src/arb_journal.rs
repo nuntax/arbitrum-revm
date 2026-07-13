@@ -221,8 +221,21 @@ where
         account: Address,
         slot: StorageKey,
     ) -> Result<StateLoad<StorageValue>, Self::Error> {
-        self.load_account(account)?;
-        self.sload(account, slot)
+        // ArbOS state is out-of-band from the EVM: Nitro reads it via statedb.GetState, which never
+        // touches the EIP-2929 access list. `load_account`/`sload` warm `account`, so a later USER
+        // `CALL`/`STATICCALL`/`EXTCODE*`/`BALANCE` to an ArbOS address (e.g. ARBOS_STATE_ADDRESS
+        // 0xa4b05fff…) would be mischarged warm. If this ArbOS read is what first warmed the account,
+        // restore its cold status so user EVM sees it cold, matching Nitro. ArbOS bills its own
+        // storage gas through the burner, so no EIP-2929 accounting is lost.
+        let was_cold = self.load_account(account)?.is_cold;
+        let value = self.sload(account, slot)?;
+        if was_cold {
+            self.load_account_mut_skip_cold_load(account, false)
+                .map_err(|e| e.unwrap_db_error())?
+                .data
+                .unsafe_mark_cold();
+        }
+        Ok(value)
     }
 
     fn write_slot(
@@ -231,10 +244,17 @@ where
         slot: StorageKey,
         value: StorageValue,
     ) -> Result<StateLoad<SStoreResult>, Self::Error> {
-        self.load_account(account)?;
+        // See `read_slot`: an ArbOS write must not warm the account for user EVM gas.
+        let was_cold = self.load_account(account)?.is_cold;
         let result = self.sstore(account, slot, value)?;
         // Touch so the storage-only change survives `DatabaseCommit`, which skips untouched accounts.
         self.touch_account(account);
+        if was_cold {
+            self.load_account_mut_skip_cold_load(account, false)
+                .map_err(|e| e.unwrap_db_error())?
+                .data
+                .unsafe_mark_cold();
+        }
         Ok(result)
     }
 
