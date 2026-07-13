@@ -1,9 +1,9 @@
-use super::{ArbosState, fatal_result, gated_revert_result, ok_result, revert_result};
+use super::{ArbosState, fatal_result, gated_revert_result, ok_result};
 use crate::arb_journal::{ArbCall, ArbJournal, ArbPrecompileCtx, MeteredJournal};
 use crate::constants::FILTERED_TRANSACTIONS_STATE_ADDRESS;
 use crate::storage::StorageSpace;
 use alloy_core::sol;
-use alloy_core::sol_types::{SolInterface, SolValue};
+use alloy_core::sol_types::{SolCall, SolInterface, SolValue};
 use revm::interpreter::InterpreterResult;
 use revm::primitives::{B256, Bytes, Log, U256, keccak256};
 
@@ -31,7 +31,7 @@ sol! {
 /// caller to be a registered transaction filterer (an ArbOwner-managed set); isTransactionFiltered is
 /// a public view. Entries are a flat KV map on the dedicated state account: key = the tx hash mapped
 /// through ArbOS paging (`StorageSpace::slot_for_hash`, empty subspace = Nitro's `mapAddress`), value
-/// = 1. `FreeAccessPrecompile` restores gas to registered filterers only after a successful call:
+/// = 1. `FreeAccessPrecompile` restores gas to registered filterers after either success or revert;
 /// its inner precompile still burns the ArbOS storage/log budget and must revert before committing
 /// a mutation when the forwarded gas cannot cover it.
 pub(super) fn run_arb_filtered_transactions_manager<CTX>(
@@ -84,7 +84,7 @@ where
                 Ok(true) => {}
                 Ok(false) => return gated_revert_result(gas_limit),
                 Err(e) => {
-                    return revert_result(
+                    return fatal_result(
                         gas_limit,
                         &format!("ArbFilteredTransactionsManager: access check error: {e}"),
                     );
@@ -99,7 +99,7 @@ where
         ) => {
             require_filterer!();
             if let Err(e) = filtered.set(c.txHash, PRESENT_VALUE, &mut journal) {
-                return revert_result(
+                return fatal_result(
                     gas_limit,
                     &format!("ArbFilteredTransactionsManager: add error: {e}"),
                 );
@@ -120,7 +120,7 @@ where
             require_filterer!();
             // Nitro `store.Clear` writes 0, which makes geth delete the trie entry (not store zeros).
             if let Err(e) = filtered.set(c.txHash, U256::ZERO, &mut journal) {
-                return revert_result(
+                return fatal_result(
                     gas_limit,
                     &format!("ArbFilteredTransactionsManager: delete error: {e}"),
                 );
@@ -141,7 +141,7 @@ where
             let value = match filtered.get(c.txHash, &mut journal) {
                 Ok(v) => v.data,
                 Err(e) => {
-                    return revert_result(
+                    return fatal_result(
                         gas_limit,
                         &format!("ArbFilteredTransactionsManager: read error: {e}"),
                     );
@@ -161,4 +161,9 @@ where
         result.output = Bytes::new();
     }
     result
+}
+
+pub(super) fn method_is_write(selector: [u8; 4]) -> bool {
+    selector == ArbFilteredTransactionsManager::addFilteredTransactionCall::SELECTOR
+        || selector == ArbFilteredTransactionsManager::deleteFilteredTransactionCall::SELECTOR
 }

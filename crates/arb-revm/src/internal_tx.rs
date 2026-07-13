@@ -112,6 +112,15 @@ fn apply_start_block<CTX: ArbContextTr>(ctx: &mut CTX, input: &Bytes) -> Result<
         .get(journal)
         .map_err(|err| format!("[ARBITRUM] failed to read ArbOS version: {err}"))?;
 
+    // Nitro `ProduceBlockAdvanced` rotates next-block multi-resource fees into the current slots
+    // immediately before constructing the header/start-block transaction. Doing it at the start
+    // of our equivalent internal transaction has the same consensus state effect and precedes the
+    // pricing-model update below, which computes the next block's fees.
+    arbos_state
+        .l2_pricing
+        .commit_multi_gas_fees(arbos_version, journal)
+        .map_err(|err| format!("[ARBITRUM] failed to commit multi-gas fees: {err}"))?;
+
     // EIP-2935 (ArbOS >= 40): mirror `core.ProcessParentBlockHash`. Nitro issues a
     // system call to the history-storage contract with the parent hash as calldata; the
     // contract's only persistent effect is storing that hash at slot

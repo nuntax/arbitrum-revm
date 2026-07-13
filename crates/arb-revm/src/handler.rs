@@ -835,9 +835,12 @@ where
         }
 
         // Grow L2 backlog by computeGas only (poster gas is L1 accounting, not compute time).
-        let _ = arbos_state
+        arbos_state
             .l2_pricing
-            .grow_backlog(compute_gas, arbos_version, journal);
+            .grow_backlog(compute_gas, arbos_version, journal)
+            .map_err(|error| {
+                ERROR::from_string(format!("[ARBITRUM] failed to grow L2 gas backlog: {error}"))
+            })?;
 
         // Do NOT call mainnet.reward_beneficiary, Arbitrum replaces that entire path.
         Ok(())
@@ -985,9 +988,12 @@ where
 
         // GrowBacklog by gas_used (Nitro retry path: gasLimit - gasLeft), using the
         // active L2 pricing model.
-        let _ = arbos_state
+        arbos_state
             .l2_pricing
-            .grow_backlog(gas_used, arbos_version, journal);
+            .grow_backlog(gas_used, arbos_version, journal)
+            .map_err(|error| {
+                ERROR::from_string(format!("[ARBITRUM] failed to grow retry L2 backlog: {error}"))
+            })?;
 
         // Retry post-exec lifecycle (clear on success, restore escrow on failure) must run in
         // EndTxHook because execution delegates to `mainnet.execution`, which does not call
@@ -1245,6 +1251,13 @@ mod tests {
         let mut tx = make_call_tx(0x02, caller, Address::with_last_byte(0x74));
         tx.base.gas_limit = gas_limit;
         tx.base.data = Bytes::from([&[0xcb, 0x47, 0x04, 0x91][..], tx_hash.as_slice()].concat());
+        tx
+    }
+
+    fn manager_get_tx(caller: Address, tx_hash: B256) -> ArbTransaction<TxEnv> {
+        let mut tx = make_call_tx(0x02, caller, Address::with_last_byte(0x74));
+        // isTransactionFiltered(bytes32)
+        tx.base.data = Bytes::from([&[0x85, 0xc7, 0x33, 0xa4][..], tx_hash.as_slice()].concat());
         tx
     }
 
@@ -1762,6 +1775,181 @@ mod tests {
                 .unwrap_or(U256::ZERO),
             U256::ONE,
             "successful add persists the filter entry"
+        );
+    }
+
+    #[test]
+    fn filtered_transaction_manager_charges_only_the_outer_wrapper_to_non_filterers() {
+        // Nitro `FreeAccessPrecompile` gives the wrapper and inner call independent copies of the
+        // supplied gas. A filterer gets all gas back; a non-filterer pays only OpenArbosState(800)
+        // + TransactionFilterers.IsMember(800), even though the public getter's inner call also
+        // performs its own state-open and filtered-map read.
+        const FREE_ACCESS_CHECK_GAS: u64 = 1_600;
+
+        let filterer = Address::with_last_byte(0x77);
+        let non_filterer = Address::with_last_byte(0x78);
+        let tx_hash = B256::repeat_byte(0x5b);
+        let mut db = InMemoryDB::default();
+        seed_transaction_filter(
+            &mut db,
+            tx_hash,
+            Address::with_last_byte(0x79),
+            Address::with_last_byte(0x7a),
+        );
+        for caller in [filterer, non_filterer] {
+            db.insert_account_info(
+                caller,
+                AccountInfo {
+                    balance: U256::from(1_000_000_u64),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let make_manager_evm = |db, register_filterer| {
+            let cfg = CfgEnv::new_with_spec(ArbSpecId::NITRO)
+                .with_chain_id(42161)
+                .with_disable_priority_fee_check(true);
+            let mut ctx = Context::mainnet()
+                .with_tx(ArbTransaction::<TxEnv>::default())
+                .with_cfg(cfg)
+                .with_chain(ArbChainContext::default())
+                .with_db(db);
+            if register_filterer {
+                ArbosState::open()
+                    .transaction_filterers
+                    .add(filterer, ctx.journal_mut())
+                    .expect("seed transaction filterer");
+            }
+            ctx.build_arb()
+        };
+
+        let mut free = make_manager_evm(db.clone(), true);
+        let filterer_result = free
+            .transact(manager_get_tx(filterer, tx_hash))
+            .expect("filterer getter must execute");
+        assert!(filterer_result.result.is_success());
+
+        let mut charged = make_manager_evm(db, false);
+        let non_filterer_result = charged
+            .transact(manager_get_tx(non_filterer, tx_hash))
+            .expect("public getter must execute for a non-filterer");
+        assert!(non_filterer_result.result.is_success());
+        assert_eq!(
+            non_filterer_result.result.output(),
+            filterer_result.result.output(),
+            "wrapper role must not change the public getter output"
+        );
+        // The filterer's raw 21_576 intrinsic is raised to the EIP-7623 calldata floor (22_440)
+        // at receipt settlement. The non-filterer's raw intrinsic + wrapper cost is 23_176, above
+        // that floor. Assert both totals so the 1_600-gas wrapper charge remains explicit.
+        assert_eq!(filterer_result.result.tx_gas_used(), 22_440);
+        assert_eq!(
+            non_filterer_result.result.tx_gas_used(),
+            21_576 + FREE_ACCESS_CHECK_GAS,
+            "non-filterers pay only the outer FreeAccessPrecompile access check"
+        );
+    }
+
+    #[test]
+    fn filtered_transaction_manager_wraps_unauthorized_errors_with_outer_gas() {
+        let caller = Address::with_last_byte(0x7b);
+        let tx_hash = B256::repeat_byte(0x5c);
+        let target_slot =
+            StorageSpace::new(FILTERED_TRANSACTIONS_STATE_ADDRESS).slot_for_hash(tx_hash);
+        let mut db = InMemoryDB::default();
+        seed_transaction_filter(
+            &mut db,
+            B256::ZERO,
+            Address::with_last_byte(0x7c),
+            Address::with_last_byte(0x7d),
+        );
+        db.insert_account_info(
+            caller,
+            AccountInfo {
+                balance: U256::from(1_000_000_u64),
+                ..Default::default()
+            },
+        );
+
+        let cfg = CfgEnv::new_with_spec(ArbSpecId::NITRO)
+            .with_chain_id(42161)
+            .with_disable_priority_fee_check(true);
+        let ctx = Context::mainnet()
+            .with_tx(ArbTransaction::<TxEnv>::default())
+            .with_cfg(cfg)
+            .with_chain(ArbChainContext::default())
+            .with_db(db);
+        let mut evm = ctx.build_arb();
+        let result = evm
+            .transact(manager_add_tx(caller, tx_hash, 100_000))
+            .expect("unauthorized add must return a failed receipt");
+        assert!(!result.result.is_success());
+        assert!(
+            result.result.tx_gas_used() < 100_000,
+            "the outer wrapper discards the inner BurnOut gas for non-filterers"
+        );
+        assert!(result.result.logs().is_empty());
+        assert_eq!(
+            result
+                .state
+                .get(&FILTERED_TRANSACTIONS_STATE_ADDRESS)
+                .and_then(|account| account.storage.get(&U256::from_be_bytes(target_slot.0)))
+                .map(|slot| slot.present_value())
+                .unwrap_or(U256::ZERO),
+            U256::ZERO
+        );
+    }
+
+    #[test]
+    fn filtered_transaction_manager_wraps_the_inactive_inner_precompile_before_arbos_60() {
+        let caller = Address::with_last_byte(0x7e);
+        let tx_hash = B256::repeat_byte(0x5d);
+        let mut db = InMemoryDB::default();
+        seed_transaction_filter(
+            &mut db,
+            tx_hash,
+            Address::with_last_byte(0x7f),
+            Address::with_last_byte(0x80),
+        );
+        let (_, version_slot) = ArbosState::open().arbos_version.account_and_key();
+        db.insert_account_storage(
+            ARBOS_STATE_ADDRESS,
+            U256::from_be_bytes(version_slot.0),
+            U256::from(59_u64),
+        )
+        .expect("set pre-filtering ArbOS version");
+        db.insert_account_info(
+            caller,
+            AccountInfo {
+                balance: U256::from(1_000_000_u64),
+                ..Default::default()
+            },
+        );
+
+        let cfg = CfgEnv::new_with_spec(ArbSpecId::ARBOS_50)
+            .with_chain_id(42161)
+            .with_disable_priority_fee_check(true);
+        let ctx = Context::mainnet()
+            .with_tx(ArbTransaction::<TxEnv>::default())
+            .with_cfg(cfg)
+            .with_chain(ArbChainContext::default())
+            .with_db(db);
+        let mut evm = ctx.build_arb();
+        let result = evm
+            .transact(manager_get_tx(caller, tx_hash))
+            .expect("pre-v60 manager wrapper must execute");
+        assert!(result.result.is_success());
+        assert!(
+            result
+                .result
+                .output()
+                .is_none_or(|output| output.as_ref().is_empty())
+        );
+        assert_eq!(
+            result.result.tx_gas_used(),
+            21_576 + 1_600,
+            "Nitro's outer FreeAccessPrecompile remains active around the inactive v59 inner call"
         );
     }
 

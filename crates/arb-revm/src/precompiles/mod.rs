@@ -49,7 +49,9 @@ use arb_address_table::run_arb_address_table;
 use arb_aggregator::run_arb_aggregator;
 use arb_bls::run_arb_bls;
 use arb_debug::run_arb_debug;
-use arb_filtered_transactions_manager::run_arb_filtered_transactions_manager;
+use arb_filtered_transactions_manager::{
+    method_is_write as filtered_manager_method_is_write, run_arb_filtered_transactions_manager,
+};
 use arb_function_table::run_arb_function_table;
 use arb_gas_info::run_arb_gas_info;
 use arb_info::run_arb_info;
@@ -123,14 +125,52 @@ impl ArbPrecompilesEnum {
         // ArbOS version-gating: read the version once (the dispatcher read is free, not part of the
         // method's charged gas). Both gated paths return BEFORE arbos_call_extra_gas, matching Nitro
         // which returns before makeContext.
-        let arbos_version = ArbosState::open()
-            .arbos_version
-            .get(ctx.journal_mut())
-            .unwrap_or(0);
+        let arbos_version = match ArbosState::open().arbos_version.get(ctx.journal_mut()) {
+            Ok(version) => version,
+            Err(error) => {
+                // Nitro cannot turn a failed ArbOS-state open/read into an inactive precompile:
+                // its metered storage burner panics and aborts execution. Treating the error as
+                // version zero would silently execute a no-code call and could commit a bad root.
+                return fatal_result(
+                    gas_limit,
+                    &format!("ArbOS precompile version read failed: {error}"),
+                );
+            }
+        };
+        // Nitro wraps 0x74 in `FreeAccessPrecompile`. The wrapper runs before the wrapped
+        // precompile's whole-precompile version gate, selector/delegate-call checks, and body, and
+        // gives both its access check and the inner call the original gas supply. Consequently
+        // these are two independent budgets:
+        //
+        // * registered filterer: the outer 1600-gas check must fit, then all gas is restored;
+        // * everyone else: the inner call must fit, but only the outer 1600 gas is charged.
+        //
+        // Keep this outside `run_active_dispatch` so invalid selectors and other inner errors are
+        // folded through the wrapper exactly like successful public view calls.
+        if arb == ArbPrecompilesEnum::ArbFilteredTransactionsManager {
+            return self.run_filtered_manager_wrapper(ctx, call, arbos_version);
+        }
+
         // Precompile not yet active => behaves like an account with no code.
         if arbos_version < precompile_min_arbos_version(arb) {
             return empty_active_result(gas_limit);
         }
+
+        self.run_active_dispatch(ctx, call, arbos_version)
+    }
+
+    /// Dispatch an ArbOS precompile that has already passed its whole-precompile version gate.
+    fn run_active_dispatch<CTX>(
+        &self,
+        ctx: &mut CTX,
+        call: &ArbCall,
+        arbos_version: u64,
+    ) -> InterpreterResult
+    where
+        CTX: ArbPrecompileCtx,
+    {
+        let arb = *self;
+        let gas_limit = call.gas_limit;
         let input_len = call.input.len();
         let selector: Option<[u8; 4]> = call.input.get(..4).map(|s| s.try_into().unwrap());
         // Invalid selector, or method not active at this ArbOS version => revert (all gas).
@@ -143,6 +183,17 @@ impl ArbPrecompilesEnum {
         };
         if method_gated {
             return gated_revert_result(gas_limit);
+        }
+        // All manager methods are non-payable, and add/delete are writes. Nitro performs both
+        // checks before `makeContext`; the surrounding free-access wrapper still decides the
+        // final gas charge, but the inner mutation must never run.
+        if arb == ArbPrecompilesEnum::ArbFilteredTransactionsManager {
+            let sel = selector.expect("selector resolved past method gating");
+            if call.value != U256::ZERO
+                || (call.is_static && filtered_manager_method_is_write(sel))
+            {
+                return gated_revert_result(gas_limit);
+            }
         }
         // Nitro `precompile.go` Call: a non-pure (view/write/payable) method invoked where the
         // acting address is not the precompile itself, i.e. via DELEGATECALL or CALLCODE, reverts
@@ -172,35 +223,76 @@ impl ArbPrecompilesEnum {
             result.gas = Gas::new(gas_limit);
             return result;
         }
-        // ArbFilteredTransactionsManager is wrapped by Nitro's `FreeAccessPrecompile`. A
-        // registered filterer receives its gas back *after* the wrapped precompile has checked
-        // the budget for `makeContext` / calldata. This is distinct from skipping the budget:
-        // an underfunded add/delete must still revert and roll its ArbOS mutation back. Charge the
-        // per-call extra before restoring gas; the manager body has already folded its storage and
-        // event burner costs into `result.gas`.
-        if arb == ArbPrecompilesEnum::ArbFilteredTransactionsManager
-            && ArbosState::open()
-                .transaction_filterers
-                .is_member(call.caller, ctx.journal_mut())
-                .unwrap_or(false)
-        {
-            let extra = arbos_call_extra_gas(arb, input_len, result.output.len(), selector);
-            if !result.gas.record_regular_cost(extra) {
-                // Nitro maps a post-v11 inner-precompile gas exhaustion to an execution revert;
-                // FreeAccessPrecompile then restores the filterer's supplied gas. Keeping this as
-                // revm `OutOfGas` would consume that restored gas at the CALL boundary.
-                result.result = InstructionResult::Revert;
-                result.output = Default::default();
-            }
-            result.gas = Gas::new(gas_limit);
-            return result;
-        }
         // Fold the per-call precompile gas (arg/result copy + ArbosState open) into the returned
         // gas so the CALL's net cost matches Nitro.
         let extra = arbos_call_extra_gas(arb, input_len, result.output.len(), selector);
         if !result.gas.record_regular_cost(extra) {
             result.result = InstructionResult::OutOfGas;
             result.output = Default::default();
+        }
+        result
+    }
+
+    /// Nitro `FreeAccessPrecompile.Call`, used only by ArbFilteredTransactionsManager (0x74).
+    fn run_filtered_manager_wrapper<CTX>(
+        &self,
+        ctx: &mut CTX,
+        call: &ArbCall,
+        arbos_version: u64,
+    ) -> InterpreterResult
+    where
+        CTX: ArbPrecompileCtx,
+    {
+        debug_assert_eq!(*self, ArbPrecompilesEnum::ArbFilteredTransactionsManager);
+
+        // OpenArbosState(version read) + TransactionFilterers.IsMember(storage read).
+        const FREE_ACCESS_CHECK_GAS: u64 = 2 * crate::arb_journal::STORAGE_READ_COST;
+        if call.gas_limit < FREE_ACCESS_CHECK_GAS {
+            let mut result = empty_active_result(call.gas_limit);
+            result.result = InstructionResult::OutOfGas;
+            result.output = Default::default();
+            result.gas.spend_all();
+            return result;
+        }
+
+        let is_filterer = match ArbosState::open()
+            .transaction_filterers
+            .is_member(call.caller, ctx.journal_mut())
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return fatal_result(
+                    call.gas_limit,
+                    &format!("ArbFilteredTransactionsManager wrapper: storage error: {error}"),
+                );
+            }
+        };
+
+        // The wrapped call receives the original gas supply, not the outer burner's remainder.
+        // Its own whole-precompile version check happens inside the wrapper in Nitro, so a pre-v60
+        // call returns empty success but still incurs this outer access check for non-filterers.
+        let mut result = if arbos_version < precompile_min_arbos_version(*self) {
+            empty_active_result(call.gas_limit)
+        } else {
+            self.run_active_dispatch(ctx, call, arbos_version)
+        };
+        if result.result == InstructionResult::FatalExternalError {
+            return result;
+        }
+
+        // At the only active versions (v60+), Nitro converts every wrapped-precompile failure to
+        // ErrExecutionReverted. This matters when the inner per-call copy/open budget runs out.
+        if result.result == InstructionResult::OutOfGas {
+            result.result = InstructionResult::Revert;
+            result.output = Default::default();
+        }
+
+        result.gas = Gas::new(call.gas_limit);
+        if !is_filterer {
+            // Non-filterers are charged solely for the outer access check; inner gas is used only
+            // as an independent feasibility check and is otherwise discarded by Nitro's wrapper.
+            let recorded = result.gas.record_regular_cost(FREE_ACCESS_CHECK_GAS);
+            debug_assert!(recorded);
         }
         result
     }
