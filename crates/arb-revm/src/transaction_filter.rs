@@ -1,7 +1,7 @@
 use crate::{
     arb_journal::ArbJournal,
     constants::FILTERED_TRANSACTIONS_STATE_ADDRESS,
-    storage::{ArbosState, StorageSpace},
+    storage::{ArbosMetadataOffset, StorageSpace},
 };
 use revm::primitives::{Address, B256, U256};
 
@@ -17,9 +17,10 @@ pub(crate) fn is_tx_hash_filtered<J: ArbJournal>(
     tx_hash: B256,
     journal: &mut J,
 ) -> Result<bool, String> {
-    let arbos = ArbosState::open();
-    if arbos
-        .arbos_version
+    // This check runs on every regular and retry transaction. Opening the whole typed ArbOS tree
+    // derives slots for every unrelated subspace; only the version metadata word is required here.
+    if StorageSpace::arbos()
+        .storage_backed::<u64>(ArbosMetadataOffset::Version as u8)
         .get(journal)
         .map_err(|err| format!("failed to read ArbOS version: {err:?}"))?
         < ARBOS_VERSION_TRANSACTION_FILTERING
@@ -38,14 +39,14 @@ pub(crate) fn is_tx_hash_filtered<J: ArbJournal>(
 pub(crate) fn filtered_funds_recipient_or_default<J: ArbJournal>(
     journal: &mut J,
 ) -> Result<Address, String> {
-    let arbos = ArbosState::open();
+    let arbos = StorageSpace::arbos();
     let recipient = arbos
-        .filtered_funds_recipient
+        .storage_backed::<Address>(ArbosMetadataOffset::FilteredFundsRecipient as u8)
         .get(journal)
         .map_err(|err| format!("failed to read filtered-funds recipient: {err:?}"))?;
     if recipient == Address::ZERO {
         arbos
-            .network_fee_account
+            .storage_backed::<Address>(ArbosMetadataOffset::NetworkFeeAccount as u8)
             .get(journal)
             .map_err(|err| format!("failed to read network-fee account: {err:?}"))
     } else {

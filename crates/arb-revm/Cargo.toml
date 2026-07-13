@@ -22,6 +22,7 @@ reqwest = { version = "0.12.24", default-features = false, features = ["json", "
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 tokio.workspace = true
 tracing.workspace = true
+metrics = "0.24"
 alloy-rlp.workspace = true
 alloy-trie = "0.9.5"
 alloy-consensus = "2.0"

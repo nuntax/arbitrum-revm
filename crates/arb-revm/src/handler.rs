@@ -29,6 +29,54 @@ use revm::{
     },
     primitives::{Address, Bytes, U256, hardfork::SpecId, keccak256},
 };
+use std::time::Instant;
+
+struct ArbOsPhaseTimer {
+    started_at: Instant,
+    histogram: metrics::Histogram,
+}
+
+impl Drop for ArbOsPhaseTimer {
+    fn drop(&mut self) {
+        self.histogram.record(self.started_at.elapsed().as_secs_f64());
+    }
+}
+
+#[inline]
+fn tx_type_label(tx_type: u8) -> &'static str {
+    match tx_type {
+        0x00 => "legacy",
+        0x01 => "eip2930",
+        0x02 => "eip1559",
+        0x03 => "eip4844",
+        0x04 => "eip7702",
+        0x64 => "deposit",
+        0x65 => "unsigned",
+        0x66 => "contract",
+        0x68 => "retry",
+        0x69 => "submit_retryable",
+        0x6a => "internal",
+        _ => "unknown",
+    }
+}
+
+/// Records a handler phase even when the phase exits early with an error or protocol shortcut.
+#[inline]
+fn arbos_phase_timer<EVM: EvmTr>(
+    evm: &mut EVM,
+    phase: &'static str,
+    mode: &'static str,
+) -> ArbOsPhaseTimer {
+    ArbOsPhaseTimer {
+        started_at: Instant::now(),
+        histogram: metrics::histogram!(
+            "arb_revm.arbos.handler_phase_seconds",
+            "phase" => phase,
+            "tx_type" => tx_type_label(evm.ctx().tx().tx_type()),
+            "mode" => mode,
+        ),
+    }
+}
 
 /// Arbitrum handler that composes mainnet logic and overrides Arbitrum-specific
 /// transaction semantics.
@@ -235,6 +283,7 @@ where
         evm: &mut Self::Evm,
         init_and_floor_gas: &mut InitialAndFloorGas,
     ) -> Result<u64, Self::Error> {
+        let _timer = arbos_phase_timer(evm, "pre_execution", "execute");
         if is_protocol_env_bypass_tx(evm) {
             // Protocol txs (internal/deposit/submit-retryable/retry) carry no L1 poster cost and
             // skip the GasChargingHook below, but they still execute EVM and must obey EIP-2929.
@@ -405,6 +454,7 @@ where
         evm: &mut Self::Evm,
         init_and_floor_gas: &InitialAndFloorGas,
     ) -> Result<FrameResult, Self::Error> {
+        let _timer = arbos_phase_timer(evm, "execution", "execute");
         if evm.ctx().chain().filtered_tx {
             return Ok(filtered_tx_frame_result(evm.ctx().tx().gas_limit()));
         }
@@ -490,6 +540,7 @@ where
         evm: &mut Self::Evm,
         _init_and_floor_gas: &mut InitialAndFloorGas,
     ) -> Result<(), Self::Error> {
+        let _timer = arbos_phase_timer(evm, "validate_and_deduct", "execute");
         if is_protocol_env_bypass_tx(evm) {
             // Nitro internal/deposit/submit-retryable/retry txs are protocol actions,
             // not regular fee-paying user transactions.
@@ -590,6 +641,7 @@ where
         original_reservoir: u64,
         frame_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
     ) -> Result<(), Self::Error> {
+        let _timer = arbos_phase_timer(evm, "last_frame_result", "execute");
         if is_protocol_short_circuit_tx(evm) {
             let status = frame_result.interpreter_result().result;
             // A submit-retryable may legitimately fail its funds checks: Nitro records it as
@@ -617,6 +669,7 @@ where
         evm: &mut Self::Evm,
         frame_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
     ) -> Result<(), Self::Error> {
+        let _timer = arbos_phase_timer(evm, "reimburse_caller", "execute");
         if is_protocol_env_bypass_tx(evm) {
             return Ok(());
         }
@@ -651,6 +704,7 @@ where
         frame_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
         eip7702_refund: i64,
     ) {
+        let _timer = arbos_phase_timer(evm, "refund", "execute");
         // Nitro caps SSTORE-style refunds against (gasUsed - posterGas), where poster gas is
         // nonrefundable. Revm's default cap uses gasUsed only, so we specialize it here.
         // Use tx-level total_gas_spent (which includes intrinsic, unlike frame-level).
@@ -680,6 +734,7 @@ where
         evm: &mut Self::Evm,
         frame_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
     ) -> Result<(), Self::Error> {
+        let _timer = arbos_phase_timer(evm, "end_tx_hook", "execute");
         // Protocol short-circuit txs (internal/deposit/submit-retryable) fully bypass.
         // Retry txs get their own EndTxHook below.
         if is_protocol_short_circuit_tx(evm) {
@@ -1108,6 +1163,7 @@ where
         evm: &mut Self::Evm,
         init_and_floor_gas: &InitialAndFloorGas,
     ) -> Result<FrameResult, Self::Error> {
+        let _timer = arbos_phase_timer(evm, "execution", "inspect");
         if evm.ctx().chain().filtered_tx {
             return Ok(filtered_tx_frame_result(evm.ctx().tx().gas_limit()));
         }
