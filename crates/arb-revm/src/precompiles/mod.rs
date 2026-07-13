@@ -172,17 +172,26 @@ impl ArbPrecompilesEnum {
             result.gas = Gas::new(gas_limit);
             return result;
         }
-        // ArbFilteredTransactionsManager is wrapped by Nitro's `FreeAccessPrecompile`: when the
-        // immediate caller is a registered transaction filterer the WHOLE call is free
-        // (`multigas.ZeroGas()`, wrapper.go), exactly like ArbOwner, so it pays neither the method
-        // gas nor the per-call extra. Non-filterer callers (e.g. an `isTransactionFiltered` view via
-        // eth_call, or an unauthorized add/delete) are charged normally.
+        // ArbFilteredTransactionsManager is wrapped by Nitro's `FreeAccessPrecompile`. A
+        // registered filterer receives its gas back *after* the wrapped precompile has checked
+        // the budget for `makeContext` / calldata. This is distinct from skipping the budget:
+        // an underfunded add/delete must still revert and roll its ArbOS mutation back. Charge the
+        // per-call extra before restoring gas; the manager body has already folded its storage and
+        // event burner costs into `result.gas`.
         if arb == ArbPrecompilesEnum::ArbFilteredTransactionsManager
             && ArbosState::open()
                 .transaction_filterers
                 .is_member(call.caller, ctx.journal_mut())
                 .unwrap_or(false)
         {
+            let extra = arbos_call_extra_gas(arb, input_len, result.output.len(), selector);
+            if !result.gas.record_regular_cost(extra) {
+                // Nitro maps a post-v11 inner-precompile gas exhaustion to an execution revert;
+                // FreeAccessPrecompile then restores the filterer's supplied gas. Keeping this as
+                // revm `OutOfGas` would consume that restored gas at the CALL boundary.
+                result.result = InstructionResult::Revert;
+                result.output = Default::default();
+            }
             result.gas = Gas::new(gas_limit);
             return result;
         }

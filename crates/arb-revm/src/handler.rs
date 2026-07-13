@@ -1200,9 +1200,12 @@ mod tests {
     use revm::{
         Context, ExecuteCommitEvm, ExecuteEvm, MainContext,
         context::{BlockEnv, CfgEnv, TxEnv},
-        context_interface::result::{EVMError, InvalidTransaction},
+        context_interface::{
+            ContextTr,
+            result::{EVMError, InvalidTransaction},
+        },
         database::InMemoryDB,
-        primitives::{Address, B256, TxKind, U256, keccak256},
+        primitives::{Address, B256, Bytes, TxKind, U256, keccak256},
         state::AccountInfo,
     };
 
@@ -1236,6 +1239,13 @@ mod tests {
         tx.nonce = 0;
         tx.chain_id = Some(42161);
         ArbTransaction::new(tx)
+    }
+
+    fn manager_add_tx(caller: Address, tx_hash: B256, gas_limit: u64) -> ArbTransaction<TxEnv> {
+        let mut tx = make_call_tx(0x02, caller, Address::with_last_byte(0x74));
+        tx.base.gas_limit = gas_limit;
+        tx.base.data = Bytes::from([&[0xcb, 0x47, 0x04, 0x91][..], tx_hash.as_slice()].concat());
+        tx
     }
 
     fn make_deposit_tx(caller: Address, to: Address, value: U256) -> ArbTransaction<TxEnv> {
@@ -1655,6 +1665,103 @@ mod tests {
                 .nonce,
             1,
             "Nitro's RevertedTxHook increments the sender nonce"
+        );
+    }
+
+    #[test]
+    fn filtered_transaction_manager_checks_the_free_call_gas_budget_before_writing() {
+        // Nitro's manager add budget is args(3) + OpenArbosState(800) + IsMember(800) +
+        // SSTORE(20_000) + LOG2(1_125) = 22_728. The free-access wrapper restores a registered
+        // filterer's gas only after this budget check; an underfunded call must revert without
+        // keeping the filter entry or event.
+        const MANAGER_ADD_BUDGET: u64 = 22_728;
+        const INTRINSIC_GAS: u64 = 21_576; // 21_000 + 36 non-zero calldata bytes × 16
+
+        let filterer = Address::with_last_byte(0x74);
+        let tx_hash = B256::repeat_byte(0x5a);
+        let target_slot =
+            StorageSpace::new(FILTERED_TRANSACTIONS_STATE_ADDRESS).slot_for_hash(tx_hash);
+        let mut db = InMemoryDB::default();
+        seed_transaction_filter(
+            &mut db,
+            B256::ZERO,
+            Address::with_last_byte(0x75),
+            Address::with_last_byte(0x76),
+        );
+        db.insert_account_info(
+            filterer,
+            AccountInfo {
+                balance: U256::from(1_000_000_u64),
+                ..Default::default()
+            },
+        );
+
+        let make_manager_evm = |db| {
+            let cfg = CfgEnv::new_with_spec(ArbSpecId::NITRO)
+                .with_chain_id(42161)
+                .with_disable_priority_fee_check(true);
+            let mut ctx = Context::mainnet()
+                .with_tx(ArbTransaction::<TxEnv>::default())
+                .with_cfg(cfg)
+                .with_chain(ArbChainContext::default())
+                .with_db(db);
+            ArbosState::open()
+                .transaction_filterers
+                .add(filterer, ctx.journal_mut())
+                .expect("seed transaction filterer");
+            ctx.build_arb()
+        };
+
+        let mut insufficient = make_manager_evm(db.clone());
+        let failed = insufficient
+            .transact(manager_add_tx(
+                filterer,
+                tx_hash,
+                INTRINSIC_GAS + MANAGER_ADD_BUDGET - 1,
+            ))
+            .expect("underfunded manager call must produce a receipt");
+        assert!(!failed.result.is_success(), "underfunded add must revert");
+        assert!(
+            failed.result.logs().is_empty(),
+            "reverted add must drop its event"
+        );
+        assert_eq!(
+            failed
+                .state
+                .get(&FILTERED_TRANSACTIONS_STATE_ADDRESS)
+                .and_then(|account| account.storage.get(&U256::from_be_bytes(target_slot.0)))
+                .map(|slot| slot.present_value())
+                .unwrap_or(U256::ZERO),
+            U256::ZERO,
+            "reverted add must not persist the filter entry"
+        );
+
+        let mut sufficient = make_manager_evm(db);
+        let succeeded = sufficient
+            .transact(manager_add_tx(
+                filterer,
+                tx_hash,
+                INTRINSIC_GAS + MANAGER_ADD_BUDGET,
+            ))
+            .expect("exact-budget manager call must produce a receipt");
+        assert!(
+            succeeded.result.is_success(),
+            "exact-budget add must succeed"
+        );
+        assert_eq!(
+            succeeded.result.logs().len(),
+            1,
+            "successful add emits its event"
+        );
+        assert_eq!(
+            succeeded
+                .state
+                .get(&FILTERED_TRANSACTIONS_STATE_ADDRESS)
+                .and_then(|account| account.storage.get(&U256::from_be_bytes(target_slot.0)))
+                .map(|slot| slot.present_value())
+                .unwrap_or(U256::ZERO),
+            U256::ONE,
+            "successful add persists the filter entry"
         );
     }
 

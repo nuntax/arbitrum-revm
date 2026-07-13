@@ -1,5 +1,5 @@
 use super::{ArbosState, fatal_result, gated_revert_result, ok_result, revert_result};
-use crate::arb_journal::{ArbCall, ArbJournal, ArbPrecompileCtx};
+use crate::arb_journal::{ArbCall, ArbJournal, ArbPrecompileCtx, MeteredJournal};
 use crate::constants::FILTERED_TRANSACTIONS_STATE_ADDRESS;
 use crate::storage::StorageSpace;
 use alloy_core::sol;
@@ -31,8 +31,9 @@ sol! {
 /// caller to be a registered transaction filterer (an ArbOwner-managed set); isTransactionFiltered is
 /// a public view. Entries are a flat KV map on the dedicated state account: key = the tx hash mapped
 /// through ArbOS paging (`StorageSpace::slot_for_hash`, empty subspace = Nitro's `mapAddress`), value
-/// = 1. The state write is NOT metered into frame gas (raw ArbOS journal, like ArbOwner); the
-/// framework's per-call `arbos_call_extra_gas` is the whole precompile cost.
+/// = 1. `FreeAccessPrecompile` restores gas to registered filterers only after a successful call:
+/// its inner precompile still burns the ArbOS storage/log budget and must revert before committing
+/// a mutation when the forwarded gas cannot cover it.
 pub(super) fn run_arb_filtered_transactions_manager<CTX>(
     ctx: &mut CTX,
     input: &[u8],
@@ -66,11 +67,20 @@ where
             Err(_) => return gated_revert_result(gas_limit),
         };
 
+    let filtered = StorageSpace::new(FILTERED_TRANSACTIONS_STATE_ADDRESS);
+    // The duplicate ArbOS-version read above stays unmetered: `run_dispatch` already performs
+    // Nitro's version gating before `makeContext`. All manager-body reads, writes, and logs are
+    // billed through Nitro's storage burner.
+    let mut journal = MeteredJournal::new(j);
+
     // `hasAccess`: the immediate caller must be a registered transaction filterer. Nitro returns
     // `c.BurnOut()` (consume all gas, revert) when it isn't; mirror with an all-gas revert.
     macro_rules! require_filterer {
         () => {
-            match state.transaction_filterers.is_member(call.caller, j) {
+            match state
+                .transaction_filterers
+                .is_member(call.caller, &mut journal)
+            {
                 Ok(true) => {}
                 Ok(false) => return gated_revert_result(gas_limit),
                 Err(e) => {
@@ -83,20 +93,18 @@ where
         };
     }
 
-    let filtered = StorageSpace::new(FILTERED_TRANSACTIONS_STATE_ADDRESS);
-
-    match parsed {
+    let mut result = match parsed {
         ArbFilteredTransactionsManager::ArbFilteredTransactionsManagerCalls::addFilteredTransaction(
             c,
         ) => {
             require_filterer!();
-            if let Err(e) = filtered.set(c.txHash, PRESENT_VALUE, j) {
+            if let Err(e) = filtered.set(c.txHash, PRESENT_VALUE, &mut journal) {
                 return revert_result(
                     gas_limit,
                     &format!("ArbFilteredTransactionsManager: add error: {e}"),
                 );
             }
-            j.emit_log(Log::new_unchecked(
+            journal.emit_log(Log::new_unchecked(
                 call.bytecode_address,
                 vec![
                     keccak256("FilteredTransactionAdded(bytes32)"),
@@ -111,13 +119,13 @@ where
         ) => {
             require_filterer!();
             // Nitro `store.Clear` writes 0, which makes geth delete the trie entry (not store zeros).
-            if let Err(e) = filtered.set(c.txHash, U256::ZERO, j) {
+            if let Err(e) = filtered.set(c.txHash, U256::ZERO, &mut journal) {
                 return revert_result(
                     gas_limit,
                     &format!("ArbFilteredTransactionsManager: delete error: {e}"),
                 );
             }
-            j.emit_log(Log::new_unchecked(
+            journal.emit_log(Log::new_unchecked(
                 call.bytecode_address,
                 vec![
                     keccak256("FilteredTransactionDeleted(bytes32)"),
@@ -130,7 +138,7 @@ where
         ArbFilteredTransactionsManager::ArbFilteredTransactionsManagerCalls::isTransactionFiltered(
             c,
         ) => {
-            let value = match filtered.get(c.txHash, j) {
+            let value = match filtered.get(c.txHash, &mut journal) {
                 Ok(v) => v.data,
                 Err(e) => {
                     return revert_result(
@@ -142,5 +150,15 @@ where
             let is_filtered = value == PRESENT_VALUE;
             ok_result(gas_limit, SolValue::abi_encode(&(is_filtered,)))
         }
+    };
+
+    // The manager's burner costs (access check, storage op, and event) are a budget check even
+    // for a registered filterer. Nitro maps an inner burner OOG to `ErrExecutionReverted` at
+    // ArbOS v11+, then `FreeAccessPrecompile` restores the filterer's gas. Use `Revert` rather
+    // than revm's raw `OutOfGas` so the journal unwinds without consuming the restored gas.
+    if !result.gas.record_regular_cost(journal.burned) {
+        result.result = revm::interpreter::InstructionResult::Revert;
+        result.output = Bytes::new();
     }
+    result
 }
