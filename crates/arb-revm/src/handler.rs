@@ -38,7 +38,8 @@ struct ArbOsPhaseTimer {
 
 impl Drop for ArbOsPhaseTimer {
     fn drop(&mut self) {
-        self.histogram.record(self.started_at.elapsed().as_secs_f64());
+        let elapsed = self.started_at.elapsed().as_secs_f64();
+        self.histogram.record(elapsed);
     }
 }
 
@@ -67,14 +68,16 @@ fn arbos_phase_timer<EVM: EvmTr>(
     phase: &'static str,
     mode: &'static str,
 ) -> ArbOsPhaseTimer {
+    let tx_type = tx_type_label(evm.ctx().tx().tx_type());
+    let histogram = metrics::histogram!(
+        "arb_revm.arbos.handler_phase_seconds",
+        "phase" => phase,
+        "tx_type" => tx_type,
+        "mode" => mode,
+    );
     ArbOsPhaseTimer {
         started_at: Instant::now(),
-        histogram: metrics::histogram!(
-            "arb_revm.arbos.handler_phase_seconds",
-            "phase" => phase,
-            "tx_type" => tx_type_label(evm.ctx().tx().tx_type()),
-            "mode" => mode,
-        ),
+        histogram,
     }
 }
 
