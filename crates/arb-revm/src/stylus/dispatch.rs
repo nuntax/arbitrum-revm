@@ -192,7 +192,12 @@ where
         // ran its sub-frames out-of-band via `run_exec_loop`). Then restore the parent accumulator.
         let frame_sub_refund = self.0.ctx.chain().stylus_sub_refund;
         self.0.ctx.chain_mut().stylus_sub_refund = saved_refund;
-        result.gas.record_refund(frame_sub_refund);
+        // Nitro keeps refunds in StateDB's journal, so reverting or halting the enclosing
+        // Stylus call also reverts refunds produced by otherwise-successful EVM sub-calls.
+        // Our out-of-band sub-frame accumulator is not journaled, so enforce that rollback here.
+        if result.result.is_ok() {
+            result.gas.record_refund(frame_sub_refund);
+        }
         // Restore the open-pages high-water to its pre-call value (Nitro's deferred
         // SetStylusPagesOpen); the `ever` mark set during the run persists across the tx.
         self.0.ctx.chain_mut().stylus_pages_open = pages_open;
@@ -305,9 +310,8 @@ where
             );
         }
 
-        // EIP-150 63/64 cap on the gas forwarded to the sub-call.
-        let gas_limit = min(gas_left - gas_left / 64, gas_req);
-        let mut gas = Gas::new(gas_limit);
+        // Nitro charges the call's static/dynamic cost before applying EIP-150.
+        let mut gas = Gas::new(gas_left);
 
         // EIP-2929 account access cost (cold 2600 / warm 100).
         let is_cold = self
@@ -325,7 +329,7 @@ where
         // (DELEGATECALL inherits the parent's, STATICCALL forbids it). Nitro's Stylus
         // `call_contract` runs the sub-call through geth's CALL, so the program's ink is billed
         // CallValueTransferGas (9000), plus CallNewAccountGas (25000) when the transfer would
-        // create an empty recipient. No callee stipend is credited back (matches Nitro).
+        // create an empty recipient. The 2300-gas callee stipend is added after the EIP-150 cap.
         if matches!(req_type, EvmApiMethod::ContractCall) && !value.is_zero() {
             let mut transfer_cost = 9000u64;
             let recipient_empty = self
@@ -359,10 +363,20 @@ where
             }
         };
 
+        // Nitro's Stylus bridge intentionally uses floor(available * 63 / 64), which differs by
+        // one from geth's usual `available - available / 64` expression when there is a remainder.
+        let mut gas_limit = stylus_call_gas_limit(gas.remaining(), gas_req);
+        // Match CALL's value stipend. It is part of the callee budget and only costs the caller
+        // to the extent that the callee consumes it.
+        if matches!(req_type, EvmApiMethod::ContractCall) && !value.is_zero() {
+            gas_limit = gas_limit.saturating_add(2300);
+        }
+        let base_cost = gas.total_gas_spent();
+
         let frame_input = FrameInput::Call(Box::new(CallInputs {
             input: CallInput::Bytes(calldata),
             return_memory_offset: 0..0,
-            gas_limit: gas.remaining(),
+            gas_limit,
             reservoir: 0,
             bytecode_address,
             known_bytecode: (kb_hash, kb_bytecode),
@@ -382,8 +396,6 @@ where
                 .get()
                 .process_next_action(&mut self.0.ctx, InterpreterAction::NewFrame(frame_input));
         let original_frame_stack = mem::replace(&mut self.0.frame_stack, FrameStack::new());
-        gas.spend_all();
-
         if let Ok(ItemOrResult::Item(frame_init)) = frame_result {
             let result = self.run_exec_loop(frame_init);
             self.0.frame_stack = original_frame_stack;
@@ -395,7 +407,6 @@ where
                 .free_child_context();
 
             if let Ok(FrameResult::Call(outcome)) = result {
-                gas.erase_cost(outcome.gas().remaining());
                 let status = if outcome.instruction_result().is_ok() {
                     EvmApiStatus::Success
                 } else {
@@ -405,11 +416,18 @@ where
                 // Nitro applies an EVM sub-call's gas refund to the statedb refund counter; carry
                 // it up so `frame_run_stylus` folds it onto the tx (refunds are applied at tx end,
                 // not deducted from the WASM ink budget).
-                self.0.ctx.chain_mut().stylus_sub_refund += outcome.gas().refunded();
-                return (vec![status as u8], VecReader::new(output), ArbGas(gas.total_gas_spent()));
+                if outcome.instruction_result().is_ok() {
+                    self.0.ctx.chain_mut().stylus_sub_refund += outcome.gas().refunded();
+                }
+                let call_cost = gas_limit.saturating_sub(outcome.gas().remaining());
+                return (
+                    vec![status as u8],
+                    VecReader::new(output),
+                    ArbGas(base_cost.saturating_add(call_cost)),
+                );
             }
         }
-        fail(gas.total_gas_spent())
+        fail(gas_left)
     }
 
     /// Stylus `Create1`/`Create2` hostio: run a revm create sub-frame and return the result.
@@ -542,10 +560,34 @@ fn num_words(len: usize) -> u64 {
     (len as u64).div_ceil(32)
 }
 
+/// Nitro's Stylus-specific EIP-150 cap. This is deliberately not expressed as
+/// `available - available / 64`: that form rounds up when `available` is not divisible by 64.
+fn stylus_call_gas_limit(available: u64, requested: u64) -> u64 {
+    min(((available as u128) * 63 / 64) as u64, requested)
+}
+
 fn revert(gas_limit: u64, output: Vec<u8>) -> InterpreterAction {
     InterpreterAction::Return(InterpreterResult {
         result: InstructionResult::Revert,
         output: output.into(),
         gas: Gas::new(gas_limit),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stylus_call_gas_limit;
+
+    #[test]
+    fn stylus_eip150_cap_matches_nitro_rounding() {
+        // Regression for Arbitrum One block 482292023, tx 42. The call has 417140 gas before
+        // its 2600 cold-account cost. Nitro forwards floor(414540 * 63 / 64) = 408062.
+        assert_eq!(stylus_call_gas_limit(414_540, u64::MAX), 408_062);
+        assert_eq!(stylus_call_gas_limit(398_531, u64::MAX), 392_303);
+    }
+
+    #[test]
+    fn stylus_eip150_cap_respects_requested_gas() {
+        assert_eq!(stylus_call_gas_limit(64_000, 12_345), 12_345);
+    }
 }
