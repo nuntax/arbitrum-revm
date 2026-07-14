@@ -321,6 +321,28 @@ where
             return fail(gas.total_gas_spent());
         }
 
+        // Value-transfer surcharges, mirroring the EVM CALL opcode: only a real CALL moves value
+        // (DELEGATECALL inherits the parent's, STATICCALL forbids it). Nitro's Stylus
+        // `call_contract` runs the sub-call through geth's CALL, so the program's ink is billed
+        // CallValueTransferGas (9000), plus CallNewAccountGas (25000) when the transfer would
+        // create an empty recipient. No callee stipend is credited back (matches Nitro).
+        if matches!(req_type, EvmApiMethod::ContractCall) && !value.is_zero() {
+            let mut transfer_cost = 9000u64;
+            let recipient_empty = self
+                .0
+                .ctx
+                .journal_mut()
+                .load_account(target_address)
+                .map(|acc| acc.is_empty())
+                .unwrap_or(false);
+            if recipient_empty {
+                transfer_cost += 25000;
+            }
+            if !gas.record_regular_cost(transfer_cost) {
+                return fail(gas.total_gas_spent());
+            }
+        }
+
         // Load the bytecode + hash for `bytecode_address` so revm's sub-frame executes
         // the correct code. Mirrors revm 41's CALL opcode (contract.rs: load_acc_and_calc_gas
         // → known_bytecode: (bytecode_hash, bytecode)). Uses load_account_with_code to ensure
