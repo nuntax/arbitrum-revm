@@ -34,11 +34,11 @@ alloy-rpc-types-eth = "2.0"
 alloy-rpc-types-trace = "2.0"
 alloy-network-primitives = "2.0"
 url = "2.5"
-arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "c49c1729668dbda31594b7c2524846f1c9a0bf21", features = ["k256"] }
-arbitrum-alloy-sequencer = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "c49c1729668dbda31594b7c2524846f1c9a0bf21" }
-arbitrum-alloy-precompiles = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "c49c1729668dbda31594b7c2524846f1c9a0bf21" }
-arbitrum-alloy-rpc-types = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "c49c1729668dbda31594b7c2524846f1c9a0bf21" }
-arbitrum-alloy-network = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "c49c1729668dbda31594b7c2524846f1c9a0bf21" }
+arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f713b3c5beccb5cafa27e4123bf22e8435224102", features = ["k256"] }
+arbitrum-alloy-sequencer = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f713b3c5beccb5cafa27e4123bf22e8435224102" }
+arbitrum-alloy-precompiles = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f713b3c5beccb5cafa27e4123bf22e8435224102" }
+arbitrum-alloy-rpc-types = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f713b3c5beccb5cafa27e4123bf22e8435224102" }
+arbitrum-alloy-network = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f713b3c5beccb5cafa27e4123bf22e8435224102" }
 # Brotli + the Stylus runtime (Nitro's forked wasmer + prover) are VENDORED under vendor/nitro so
 # the crate is self-contained: it builds from a fresh checkout with no sibling ../nitro and travels
 # with the repo through a git dependency (arb-reth fetches it from GitHub). brotli is Nitro's copy so
