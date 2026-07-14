@@ -29,11 +29,18 @@ use revm::{
     },
     primitives::{Address, Bytes, U256, hardfork::SpecId, keccak256},
 };
-use std::time::Instant;
+use std::{
+    cell::Cell,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 struct ArbOsPhaseTimer {
     started_at: Instant,
-    histogram: metrics::Histogram,
+    histogram: &'static metrics::Histogram,
 }
 
 impl Drop for ArbOsPhaseTimer {
@@ -43,21 +50,103 @@ impl Drop for ArbOsPhaseTimer {
     }
 }
 
+const TX_TYPE_LABELS: [&str; 12] = [
+    "legacy",
+    "eip2930",
+    "eip1559",
+    "eip4844",
+    "eip7702",
+    "deposit",
+    "unsigned",
+    "contract",
+    "retry",
+    "submit_retryable",
+    "internal",
+    "unknown",
+];
+
 #[inline]
-fn tx_type_label(tx_type: u8) -> &'static str {
+const fn tx_type_metric_index(tx_type: u8) -> usize {
     match tx_type {
-        0x00 => "legacy",
-        0x01 => "eip2930",
-        0x02 => "eip1559",
-        0x03 => "eip4844",
-        0x04 => "eip7702",
-        0x64 => "deposit",
-        0x65 => "unsigned",
-        0x66 => "contract",
-        0x68 => "retry",
-        0x69 => "submit_retryable",
-        0x6a => "internal",
-        _ => "unknown",
+        0x00 => 0,
+        0x01 => 1,
+        0x02 => 2,
+        0x03 => 3,
+        0x04 => 4,
+        0x64 => 5,
+        0x65 => 6,
+        0x66 => 7,
+        0x68 => 8,
+        0x69 => 9,
+        0x6a => 10,
+        _ => 11,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ArbOsPhase {
+    PreExecution,
+    Execution,
+    ValidateAndDeduct,
+    LastFrameResult,
+    ReimburseCaller,
+    Refund,
+    EndTxHook,
+}
+
+impl ArbOsPhase {
+    const COUNT: usize = 7;
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn label(self) -> &'static str {
+        [
+            "pre_execution",
+            "execution",
+            "validate_and_deduct",
+            "last_frame_result",
+            "reimburse_caller",
+            "refund",
+            "end_tx_hook",
+        ][self.index()]
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ExecutionMode {
+    Execute,
+    Inspect,
+}
+
+impl ExecutionMode {
+    const COUNT: usize = 2;
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn label(self) -> &'static str {
+        ["execute", "inspect"][self.index()]
+    }
+}
+
+fn sample_handler_metrics(tx_type_index: usize) -> bool {
+    static SAMPLE_RATE: OnceLock<u64> = OnceLock::new();
+    static COUNTERS: [AtomicU64; TX_TYPE_LABELS.len()] =
+        [const { AtomicU64::new(0) }; TX_TYPE_LABELS.len()];
+
+    let sample_rate = *SAMPLE_RATE.get_or_init(|| {
+        std::env::var("ARB_EXECUTION_METRICS_SAMPLE_RATE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1)
+    });
+    match sample_rate {
+        0 => false,
+        1 => true,
+        rate => COUNTERS[tx_type_index].fetch_add(1, Ordering::Relaxed) % rate == 0,
     }
 }
 
@@ -65,20 +154,33 @@ fn tx_type_label(tx_type: u8) -> &'static str {
 #[inline]
 fn arbos_phase_timer<EVM: EvmTr>(
     evm: &mut EVM,
-    phase: &'static str,
-    mode: &'static str,
-) -> ArbOsPhaseTimer {
-    let tx_type = tx_type_label(evm.ctx().tx().tx_type());
-    let histogram = metrics::histogram!(
-        "arb_revm.arbos.handler_phase_seconds",
-        "phase" => phase,
-        "tx_type" => tx_type,
-        "mode" => mode,
-    );
-    ArbOsPhaseTimer {
+    phase: ArbOsPhase,
+    mode: ExecutionMode,
+    sampled: bool,
+) -> Option<ArbOsPhaseTimer> {
+    if !sampled {
+        return None;
+    }
+
+    const METRIC_COUNT: usize = ArbOsPhase::COUNT * ExecutionMode::COUNT * TX_TYPE_LABELS.len();
+    static METRICS: [OnceLock<metrics::Histogram>; METRIC_COUNT] =
+        [const { OnceLock::new() }; METRIC_COUNT];
+
+    let tx_type_index = tx_type_metric_index(evm.ctx().tx().tx_type());
+    let index =
+        (mode.index() * ArbOsPhase::COUNT + phase.index()) * TX_TYPE_LABELS.len() + tx_type_index;
+    let histogram = METRICS[index].get_or_init(|| {
+        metrics::histogram!(
+            "arb_revm.arbos.handler_phase_seconds",
+            "phase" => phase.label(),
+            "tx_type" => TX_TYPE_LABELS[tx_type_index],
+            "mode" => mode.label(),
+        )
+    });
+    Some(ArbOsPhaseTimer {
         started_at: Instant::now(),
         histogram,
-    }
+    })
 }
 
 /// Arbitrum handler that composes mainnet logic and overrides Arbitrum-specific
@@ -87,6 +189,8 @@ fn arbos_phase_timer<EVM: EvmTr>(
 pub struct ArbHandler<EVM, ERROR, FRAME> {
     /// Mainnet behavior reused where Arbitrum does not diverge.
     pub mainnet: MainnetHandler<EVM, ERROR, FRAME>,
+    /// Whether the current transaction was selected for detailed handler timing.
+    metrics_sampled: Cell<bool>,
 }
 
 impl<EVM, ERROR, FRAME> ArbHandler<EVM, ERROR, FRAME> {
@@ -94,6 +198,7 @@ impl<EVM, ERROR, FRAME> ArbHandler<EVM, ERROR, FRAME> {
     pub fn new() -> Self {
         Self {
             mainnet: MainnetHandler::default(),
+            metrics_sampled: Cell::new(true),
         }
     }
 }
@@ -165,12 +270,17 @@ fn is_filtered_post_start_tx<EVM>(evm: &mut EVM) -> bool
 where
     EVM: EvmTr<Context: ArbContextTr>,
 {
-    let tx_hash = match evm.ctx().tx().encoded_2718_bytes() {
-        Some(bytes) => keccak256(bytes),
-        None => return false,
+    let tx_hash = evm
+        .ctx()
+        .tx()
+        .tx_hash()
+        .or_else(|| evm.ctx().tx().encoded_2718_bytes().map(keccak256));
+    let Some(tx_hash) = tx_hash else {
+        return false;
     };
+    let arbos_version = evm.ctx().chain().arbos_version;
     let journal = evm.ctx_mut().journal_mut();
-    is_tx_hash_filtered(tx_hash, journal).unwrap_or(false)
+    is_tx_hash_filtered(tx_hash, arbos_version, journal).unwrap_or(false)
 }
 
 fn filtered_tx_frame_result(gas_limit: u64) -> FrameResult {
@@ -191,6 +301,7 @@ where
     type HaltReason = HaltReason;
 
     fn validate(&self, evm: &mut Self::Evm) -> Result<InitialAndFloorGas, Self::Error> {
+        evm.ctx_mut().chain_mut().arbos_version = None;
         if is_protocol_short_circuit_tx(evm) {
             self.validate_env(evm)?;
             evm.ctx_mut().chain_mut().intrinsic_gas = 0;
@@ -286,7 +397,15 @@ where
         evm: &mut Self::Evm,
         init_and_floor_gas: &mut InitialAndFloorGas,
     ) -> Result<u64, Self::Error> {
-        let _timer = arbos_phase_timer(evm, "pre_execution", "execute");
+        let metrics_sampled =
+            sample_handler_metrics(tx_type_metric_index(evm.ctx().tx().tx_type()));
+        self.metrics_sampled.set(metrics_sampled);
+        let _timer = arbos_phase_timer(
+            evm,
+            ArbOsPhase::PreExecution,
+            ExecutionMode::Execute,
+            metrics_sampled,
+        );
         if is_protocol_env_bypass_tx(evm) {
             // Protocol txs (internal/deposit/submit-retryable/retry) carry no L1 poster cost and
             // skip the GasChargingHook below, but they still execute EVM and must obey EIP-2929.
@@ -337,10 +456,12 @@ where
             ctx.chain_mut().reset_poster_state();
 
             let arbos_state = ArbosState::open();
+            let cached_arbos_version = ctx.chain().arbos_version;
             let journal = ctx.journal_mut();
 
-            let spec =
-                ArbSpecId::from_arbos_version(arbos_state.arbos_version.get(journal).unwrap_or(0));
+            let arbos_version = cached_arbos_version
+                .unwrap_or_else(|| arbos_state.arbos_version.get(journal).unwrap_or(0));
+            let spec = ArbSpecId::from_arbos_version(arbos_version);
             if paid_gas_price.is_zero() {
                 let collect_tips_flag = arbos_state.collect_tips.get(journal).unwrap_or(0);
                 let delayed_inbox = coinbase != BATCH_POSTER_ADDRESS;
@@ -457,7 +578,12 @@ where
         evm: &mut Self::Evm,
         init_and_floor_gas: &InitialAndFloorGas,
     ) -> Result<FrameResult, Self::Error> {
-        let _timer = arbos_phase_timer(evm, "execution", "execute");
+        let _timer = arbos_phase_timer(
+            evm,
+            ArbOsPhase::Execution,
+            ExecutionMode::Execute,
+            self.metrics_sampled.get(),
+        );
         if evm.ctx().chain().filtered_tx {
             return Ok(filtered_tx_frame_result(evm.ctx().tx().gas_limit()));
         }
@@ -543,7 +669,12 @@ where
         evm: &mut Self::Evm,
         _init_and_floor_gas: &mut InitialAndFloorGas,
     ) -> Result<(), Self::Error> {
-        let _timer = arbos_phase_timer(evm, "validate_and_deduct", "execute");
+        let _timer = arbos_phase_timer(
+            evm,
+            ArbOsPhase::ValidateAndDeduct,
+            ExecutionMode::Execute,
+            self.metrics_sampled.get(),
+        );
         if is_protocol_env_bypass_tx(evm) {
             // Nitro internal/deposit/submit-retryable/retry txs are protocol actions,
             // not regular fee-paying user transactions.
@@ -584,8 +715,8 @@ where
             let ctx = evm.ctx_mut();
             let arbos_state = ArbosState::open();
             let journal = ctx.journal_mut();
-            let spec =
-                ArbSpecId::from_arbos_version(arbos_state.arbos_version.get(journal).unwrap_or(0));
+            let arbos_version = arbos_state.arbos_version.get(journal).unwrap_or(0);
+            let spec = ArbSpecId::from_arbos_version(arbos_version);
             let collect_tips_flag = arbos_state.collect_tips.get(journal).unwrap_or(0);
             let delayed_inbox = ctx.block().beneficiary() != BATCH_POSTER_ADDRESS;
             let collect_tips = collect_tips_enabled(spec, delayed_inbox, collect_tips_flag);
@@ -601,6 +732,7 @@ where
             // effective/basefee price. Collapsing this to `paid` would let an
             // unfunded caller through whenever basefee is zero.
             let max_for_check = max_fee_per_gas.max(paid);
+            ctx.chain_mut().arbos_version = Some(arbos_version);
             (paid, max_for_check)
         };
 
@@ -644,7 +776,12 @@ where
         original_reservoir: u64,
         frame_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
     ) -> Result<(), Self::Error> {
-        let _timer = arbos_phase_timer(evm, "last_frame_result", "execute");
+        let _timer = arbos_phase_timer(
+            evm,
+            ArbOsPhase::LastFrameResult,
+            ExecutionMode::Execute,
+            self.metrics_sampled.get(),
+        );
         if is_protocol_short_circuit_tx(evm) {
             let status = frame_result.interpreter_result().result;
             // A submit-retryable may legitimately fail its funds checks: Nitro records it as
@@ -672,7 +809,12 @@ where
         evm: &mut Self::Evm,
         frame_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
     ) -> Result<(), Self::Error> {
-        let _timer = arbos_phase_timer(evm, "reimburse_caller", "execute");
+        let _timer = arbos_phase_timer(
+            evm,
+            ArbOsPhase::ReimburseCaller,
+            ExecutionMode::Execute,
+            self.metrics_sampled.get(),
+        );
         if is_protocol_env_bypass_tx(evm) {
             return Ok(());
         }
@@ -707,7 +849,12 @@ where
         frame_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
         eip7702_refund: i64,
     ) {
-        let _timer = arbos_phase_timer(evm, "refund", "execute");
+        let _timer = arbos_phase_timer(
+            evm,
+            ArbOsPhase::Refund,
+            ExecutionMode::Execute,
+            self.metrics_sampled.get(),
+        );
         // Nitro caps SSTORE-style refunds against (gasUsed - posterGas), where poster gas is
         // nonrefundable. Revm's default cap uses gasUsed only, so we specialize it here.
         // Use tx-level total_gas_spent (which includes intrinsic, unlike frame-level).
@@ -737,7 +884,12 @@ where
         evm: &mut Self::Evm,
         frame_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
     ) -> Result<(), Self::Error> {
-        let _timer = arbos_phase_timer(evm, "end_tx_hook", "execute");
+        let _timer = arbos_phase_timer(
+            evm,
+            ArbOsPhase::EndTxHook,
+            ExecutionMode::Execute,
+            self.metrics_sampled.get(),
+        );
         // Protocol short-circuit txs (internal/deposit/submit-retryable) fully bypass.
         // Retry txs get their own EndTxHook below.
         if is_protocol_short_circuit_tx(evm) {
@@ -807,10 +959,11 @@ where
         let compute_gas = gas_used.saturating_sub(poster_gas);
         let compute_cost = basefee.saturating_mul(U256::from(compute_gas));
 
+        let cached_arbos_version = evm.ctx().chain().arbos_version;
         let arbos_state = ArbosState::open();
         let journal = evm.ctx_mut().journal_mut();
-
-        let arbos_version = arbos_state.arbos_version.get(journal).unwrap_or(0);
+        let arbos_version = cached_arbos_version
+            .unwrap_or_else(|| arbos_state.arbos_version.get(journal).unwrap_or(0));
         let spec = ArbSpecId::from_arbos_version(arbos_version);
         let paid_gas_price = if paid_gas_price == 0 {
             basefee_u128
@@ -1166,7 +1319,12 @@ where
         evm: &mut Self::Evm,
         init_and_floor_gas: &InitialAndFloorGas,
     ) -> Result<FrameResult, Self::Error> {
-        let _timer = arbos_phase_timer(evm, "execution", "inspect");
+        let _timer = arbos_phase_timer(
+            evm,
+            ArbOsPhase::Execution,
+            ExecutionMode::Inspect,
+            self.metrics_sampled.get(),
+        );
         if evm.ctx().chain().filtered_tx {
             return Ok(filtered_tx_frame_result(evm.ctx().tx().gas_limit()));
         }

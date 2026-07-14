@@ -177,11 +177,11 @@ pub(crate) fn apply_submit_retryable_tx<CTX: ArbContextTr>(
     // fallback for directly constructed unit-test transactions.
     let ticket_id = ctx
         .tx()
-        .encoded_2718_bytes()
-        .map(keccak256)
+        .tx_hash()
+        .or_else(|| ctx.tx().encoded_2718_bytes().map(keccak256))
         .unwrap_or_else(|| compute_submit_retryable_ticket_id(chain_id, from, &call));
 
-    let is_filtered = is_tx_hash_filtered(ticket_id, ctx.journal_mut())
+    let is_filtered = is_tx_hash_filtered(ticket_id, None, ctx.journal_mut())
         .map_err(|e| format!("[ARBITRUM] submit-retryable filter read failed: {e}"))?;
     if is_filtered {
         let recipient = filtered_funds_recipient_or_default(ctx.journal_mut()).map_err(|e| {

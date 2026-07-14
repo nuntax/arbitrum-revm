@@ -28,6 +28,10 @@ pub struct ArbChainContext {
     /// Snapshot of the tx gas price actually paid by the caller for this tx.
     /// Must remain stable for prepay/refund/reward hooks even if ArbOS config mutates mid-tx.
     pub paid_gas_price: u128,
+    /// ArbOS version read during normal-transaction validation. The current version cannot change
+    /// during a regular transaction, so later gas, filter, and settlement hooks reuse this value.
+    /// Protocol transactions leave it unset and use their existing state-read paths.
+    pub arbos_version: Option<u64>,
     /// Stylus memory-page high-water tracking for the current tx (Nitro `statedb` StylusPages).
     /// `open` = pages currently active; `ever` = max ever active. Used by the Stylus memory
     /// model to price page growth across the tx's (possibly nested) Stylus calls.
@@ -63,6 +67,7 @@ impl ArbChainContext {
             hold_gas: 0,
             poster_fee: U256::ZERO,
             paid_gas_price: 0,
+            arbos_version: None,
             stylus_pages_open: 0,
             stylus_pages_ever: 0,
             stylus_sub_refund: 0,

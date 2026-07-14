@@ -6,7 +6,7 @@ use crate::{
 use revm::{
     Database as _,
     context_interface::{Block, ContextTr, JournalTr, Transaction, journaled_state::account::JournaledAccountTr},
-    primitives::{Address, B256, Bytes, I256, U256, keccak256},
+    primitives::{Address, B256, Bytes, I256, U256},
     state::Bytecode,
 };
 
@@ -23,11 +23,11 @@ const INITIAL_PER_BATCH_GAS_COST_V12: i64 = 210_000;
 /// Nitro: l2pricing.InitialPerTxGasLimitV50
 const INITIAL_PER_TX_GAS_LIMIT_V50: u64 = 32 * 1_000_000;
 
-const START_BLOCK_SELECTOR_TEXT: &[u8] = b"startBlock(uint256,uint64,uint64,uint64)";
-const BATCH_POSTING_REPORT_SELECTOR_TEXT: &[u8] =
-    b"batchPostingReport(uint256,address,uint64,uint64,uint256)";
-const BATCH_POSTING_REPORT_V2_SELECTOR_TEXT: &[u8] =
-    b"batchPostingReportV2(uint256,address,uint64,uint64,uint64,uint64,uint256)";
+// ABI selectors are protocol constants. Keeping them as bytes avoids hashing the signatures while
+// constructing and executing every internal transaction.
+const START_BLOCK_SELECTOR: [u8; 4] = [0x6b, 0xf6, 0xa4, 0x2d];
+const BATCH_POSTING_REPORT_SELECTOR: [u8; 4] = [0xb6, 0x69, 0x37, 0x71];
+const BATCH_POSTING_REPORT_V2_SELECTOR: [u8; 4] = [0x99, 0x98, 0x26, 0x9e];
 
 const START_BLOCK_CALLDATA_WORDS: usize = 4;
 const BATCH_POSTING_REPORT_CALLDATA_WORDS: usize = 5;
@@ -37,18 +37,15 @@ const ABI_WORD_SIZE: usize = 32;
 const SELECTOR_SIZE: usize = 4;
 
 pub(crate) fn start_block_selector() -> [u8; 4] {
-    let hash = keccak256(START_BLOCK_SELECTOR_TEXT);
-    [hash[0], hash[1], hash[2], hash[3]]
+    START_BLOCK_SELECTOR
 }
 
 pub(crate) fn batch_posting_report_selector() -> [u8; 4] {
-    let hash = keccak256(BATCH_POSTING_REPORT_SELECTOR_TEXT);
-    [hash[0], hash[1], hash[2], hash[3]]
+    BATCH_POSTING_REPORT_SELECTOR
 }
 
 pub(crate) fn batch_posting_report_v2_selector() -> [u8; 4] {
-    let hash = keccak256(BATCH_POSTING_REPORT_V2_SELECTOR_TEXT);
-    [hash[0], hash[1], hash[2], hash[3]]
+    BATCH_POSTING_REPORT_V2_SELECTOR
 }
 
 pub(crate) fn apply_internal_tx<CTX: ArbContextTr>(ctx: &mut CTX) -> Result<(), String> {
@@ -662,4 +659,30 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use revm::primitives::keccak256;
+
+    fn selector(signature: &[u8]) -> [u8; 4] {
+        keccak256(signature)[..4].try_into().unwrap()
+    }
+
+    #[test]
+    fn internal_transaction_selectors_match_signatures() {
+        assert_eq!(
+            START_BLOCK_SELECTOR,
+            selector(b"startBlock(uint256,uint64,uint64,uint64)")
+        );
+        assert_eq!(
+            BATCH_POSTING_REPORT_SELECTOR,
+            selector(b"batchPostingReport(uint256,address,uint64,uint64,uint256)")
+        );
+        assert_eq!(
+            BATCH_POSTING_REPORT_V2_SELECTOR,
+            selector(b"batchPostingReportV2(uint256,address,uint64,uint64,uint64,uint64,uint256)")
+        );
+    }
 }

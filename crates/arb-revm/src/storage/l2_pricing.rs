@@ -622,7 +622,7 @@ mod tests {
     fn retryable_single_dim_shrink_updates_multi_constraint_weights() {
         let mut ctx = fresh();
         let journal = ctx.journal_mut();
-        let pricing = ArbosState::open().l2_pricing;
+        let pricing = &ArbosState::open().l2_pricing;
         let mut weights = [0_u64; NUM_RESOURCE_KINDS];
         weights[usize::from(RESOURCE_KIND_SINGLE_DIM)] = 3;
         pricing
@@ -638,13 +638,13 @@ mod tests {
     fn retryable_shrink_cost_matches_nitro_models_and_version_boundaries() {
         let mut legacy_ctx = fresh();
         let legacy_journal = legacy_ctx.journal_mut();
-        let legacy = ArbosState::open().l2_pricing;
+        let legacy = &ArbosState::open().l2_pricing;
         legacy.gas_backlog.set(1_000, legacy_journal).unwrap();
         assert_eq!(legacy.shrink_backlog(100, 49, legacy_journal).unwrap(), 20_800);
 
         let mut v50_ctx = fresh();
         let v50_journal = v50_ctx.journal_mut();
-        let v50 = ArbosState::open().l2_pricing;
+        let v50 = &ArbosState::open().l2_pricing;
         v50.add_gas_constraint(100, 10, 1_000, v50_journal).unwrap();
         // v50's historical reservation is 21600, but model lookup + traversal + a nonzero write
         // actually cost 22400. Nitro therefore runs out of gas in this configuration.
@@ -652,7 +652,7 @@ mod tests {
 
         let mut v51_ctx = fresh();
         let v51_journal = v51_ctx.journal_mut();
-        let v51 = ArbosState::open().l2_pricing;
+        let v51 = &ArbosState::open().l2_pricing;
         for backlog in [50, 100, 1_000] {
             v51.add_gas_constraint(100, 10, backlog, v51_journal).unwrap();
         }
@@ -670,7 +670,7 @@ mod tests {
     fn normal_tx_never_silently_skips_active_multi_constraint_growth() {
         let mut ctx = fresh();
         let journal = ctx.journal_mut();
-        let pricing = ArbosState::open().l2_pricing;
+        let pricing = &ArbosState::open().l2_pricing;
         let mut weights = [0_u64; NUM_RESOURCE_KINDS];
         weights[1] = 1;
         pricing
@@ -693,7 +693,7 @@ mod tests {
     fn multi_constraint_exponents_match_nitro_vector() {
         let mut ctx = fresh();
         let journal = ctx.journal_mut();
-        let pricing = ArbosState::open().l2_pricing;
+        let pricing = &ArbosState::open().l2_pricing;
 
         let mut first = [0_u64; NUM_RESOURCE_KINDS];
         first[1] = 1; // Computation

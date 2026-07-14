@@ -16,9 +16,10 @@ use revm::{
     context::{BlockEnv, CfgEnv, TxEnv},
     context_interface::{Block, ContextTr, JournalTr},
     handler::{EvmTr, SYSTEM_ADDRESS, SystemCallCommitEvm, SystemCallEvm},
-    primitives::{Bytes, Log, TxKind, U256, keccak256},
+    primitives::{B256, Bytes, Log, TxKind, U256, keccak256},
 };
 use std::collections::VecDeque;
+use std::sync::OnceLock;
 
 /// Error type for stateless message execution.
 pub type ArbExecError<DB> = revm::context_interface::result::EVMError<
@@ -36,6 +37,25 @@ struct QueuedTx {
 const REDEEM_SCHEDULED_EVENT_SIGNATURE: &[u8] =
     b"RedeemScheduled(bytes32,bytes32,uint64,uint64,address,uint256,uint256)";
 const ABI_WORD_SIZE: usize = 32;
+
+#[inline]
+fn redeem_scheduled_event_signature() -> B256 {
+    static SIGNATURE: OnceLock<B256> = OnceLock::new();
+    *SIGNATURE.get_or_init(|| keccak256(REDEEM_SCHEDULED_EVENT_SIGNATURE))
+}
+
+/// Returns whether a log can schedule a same-block retry transaction.
+///
+/// This is also used by block producers to retain only the uncommon retry event instead of
+/// cloning every log emitted by every successful transaction.
+#[inline]
+pub fn is_redeem_scheduled_log(log: &Log) -> bool {
+    if log.address != ARB_RETRYABLE_TX_ADDRESS {
+        return false;
+    }
+    let topics = log.topics();
+    topics.len() == 4 && topics[0] == redeem_scheduled_event_signature()
+}
 
 fn build_block_env(
     parent: crate::executor::contract::ArbParentHeader,
@@ -85,19 +105,19 @@ pub fn scheduled_retries_from_redeem_logs<CTX>(
 where
     CTX: ContextTr<Journal: JournalTr>,
 {
+    if logs.is_empty() {
+        return Vec::new();
+    }
+
     let mut scheduled = Vec::new();
-    let signature_hash = keccak256(REDEEM_SCHEDULED_EVENT_SIGNATURE);
     let base_fee = U256::from(ctx.block().basefee());
     let arbos_state = ArbosState::open();
 
     for log in logs {
-        if log.address != ARB_RETRYABLE_TX_ADDRESS {
+        if !is_redeem_scheduled_log(log) {
             continue;
         }
         let topics = log.topics();
-        if topics.len() != 4 || topics[0] != signature_hash {
-            continue;
-        }
 
         let data = log.data.data.as_ref();
         if data.len() != ABI_WORD_SIZE * 4 {

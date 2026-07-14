@@ -36,10 +36,13 @@ pub(crate) fn apply_deposit_tx<CTX: ArbContextTr>(ctx: &mut CTX) -> Result<Depos
     // Filtered-transaction enforcement: a deposit whose hash was pre-registered via
     // ArbFilteredTransactionsManager has its funds diverted to the filtered-funds recipient. The
     // filter read is free (no gas), matching Nitro's `IsFilteredFree`.
-    let tx_hash = ctx.tx().encoded_2718_bytes().map(keccak256);
+    let tx_hash = ctx
+        .tx()
+        .tx_hash()
+        .or_else(|| ctx.tx().encoded_2718_bytes().map(keccak256));
     let mut filtered = false;
     if let Some(tx_hash) = tx_hash {
-        let is_filtered = is_tx_hash_filtered(tx_hash, ctx.journal_mut())
+        let is_filtered = is_tx_hash_filtered(tx_hash, None, ctx.journal_mut())
             .map_err(|e| format!("[ARBITRUM] deposit filter read failed: {e}"))?;
         if is_filtered {
             to = filtered_funds_recipient_or_default(ctx.journal_mut())

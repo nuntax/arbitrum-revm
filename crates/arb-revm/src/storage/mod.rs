@@ -157,7 +157,12 @@ mod tests {
 
     use revm::primitives::FixedBytes;
 
-    use super::{StorageSpace, Subspace};
+    use super::{ArbosState, StorageSpace, Subspace};
+
+    #[test]
+    fn reuses_arbos_storage_layout() {
+        assert!(core::ptr::eq(ArbosState::open(), ArbosState::open()));
+    }
 
     #[test]
     fn calculates_known_root_slots() {

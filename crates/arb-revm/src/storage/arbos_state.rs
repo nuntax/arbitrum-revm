@@ -1,4 +1,5 @@
 use revm::primitives::{Address, B256, U256};
+use std::sync::OnceLock;
 
 use super::{
     AddressSet, AddressTable, ArbFeatures, ArbosMetadataOffset, ArbosPrograms, BlockHashes,
@@ -63,7 +64,17 @@ pub struct ArbosState {
 }
 
 impl ArbosState {
-    pub fn open() -> Self {
+    /// Returns the immutable ArbOS storage layout.
+    ///
+    /// The account, subspace keys, and concrete slots are protocol constants. Building the layout
+    /// hashes every subspace and slot, so doing it for every transaction is needlessly expensive.
+    /// State values are still read through the transaction's journal and are never cached here.
+    pub fn open() -> &'static Self {
+        static STATE: OnceLock<ArbosState> = OnceLock::new();
+        STATE.get_or_init(Self::build)
+    }
+
+    fn build() -> Self {
         let root = StorageSpace::arbos();
         Self {
             arbos_version: root.storage_backed(ArbosMetadataOffset::Version as u8),

@@ -98,6 +98,7 @@ impl TryFrom<&ArbTxEnvelope> for ArbTransaction<TxEnv> {
         Ok(ArbTransaction {
             base,
             retry_meta,
+            tx_hash: Some(tx.hash()),
             encoded_2718: Some(Bytes::from(tx.encoded_2718())),
         })
     }
@@ -118,6 +119,11 @@ pub trait ArbTxTr: Transaction {
         None
     }
 
+    /// Returns the consensus transaction hash when available.
+    fn tx_hash(&self) -> Option<B256> {
+        None
+    }
+
     /// Returns canonical EIP-2718 transaction bytes when available.
     fn encoded_2718_bytes(&self) -> Option<&[u8]> {
         None
@@ -131,6 +137,8 @@ pub struct ArbTransaction<T: Transaction> {
     pub base: T,
     /// Arbitrum transaction extensions that are not part of base `TxEnv`.
     pub retry_meta: Option<RetryTxMeta>,
+    /// Consensus transaction hash, if the transaction came from an envelope.
+    pub tx_hash: Option<B256>,
     /// Canonical EIP-2718 envelope bytes for this tx, if known.
     pub encoded_2718: Option<Bytes>,
 }
@@ -141,6 +149,7 @@ impl<T: Transaction> ArbTransaction<T> {
         Self {
             base,
             retry_meta: None,
+            tx_hash: None,
             encoded_2718: None,
         }
     }
@@ -148,6 +157,12 @@ impl<T: Transaction> ArbTransaction<T> {
     /// Attaches retry metadata.
     pub fn with_retry_meta(mut self, retry_meta: RetryTxMeta) -> Self {
         self.retry_meta = Some(retry_meta);
+        self
+    }
+
+    /// Attaches a consensus transaction hash.
+    pub fn with_tx_hash(mut self, tx_hash: B256) -> Self {
+        self.tx_hash = Some(tx_hash);
         self
     }
 
@@ -176,6 +191,7 @@ impl Default for ArbTransaction<TxEnv> {
         Self {
             base: TxEnv::default(),
             retry_meta: None,
+            tx_hash: None,
             encoded_2718: None,
         }
     }
@@ -190,6 +206,7 @@ impl<TX: Transaction + SystemCallTx> SystemCallTx for ArbTransaction<TX> {
         Self {
             base: TX::new_system_tx_with_caller(caller, system_contract_address, data),
             retry_meta: None,
+            tx_hash: None,
             encoded_2718: None,
         }
     }
@@ -198,6 +215,10 @@ impl<TX: Transaction + SystemCallTx> SystemCallTx for ArbTransaction<TX> {
 impl<T: Transaction> ArbTxTr for ArbTransaction<T> {
     fn retry_meta(&self) -> Option<&RetryTxMeta> {
         self.retry_meta.as_ref()
+    }
+
+    fn tx_hash(&self) -> Option<B256> {
+        self.tx_hash
     }
 
     fn encoded_2718_bytes(&self) -> Option<&[u8]> {
@@ -317,6 +338,7 @@ impl ArbTransactionBuilder {
         ArbTransaction {
             base: self.base.build_fill(),
             retry_meta: None,
+            tx_hash: None,
             encoded_2718: None,
         }
     }
@@ -326,6 +348,7 @@ impl ArbTransactionBuilder {
         Ok(ArbTransaction {
             base: self.base.build()?,
             retry_meta: None,
+            tx_hash: None,
             encoded_2718: None,
         })
     }

@@ -1,7 +1,7 @@
 use crate::{
     arb_journal::ArbJournal,
     constants::FILTERED_TRANSACTIONS_STATE_ADDRESS,
-    storage::{ArbosMetadataOffset, StorageSpace},
+    storage::{ArbosState, StorageSpace},
 };
 use revm::primitives::{Address, B256, U256};
 
@@ -15,16 +15,17 @@ pub(crate) const ARBOS_VERSION_TRANSACTION_FILTERING: u64 = 60;
 /// EVM gas cost.
 pub(crate) fn is_tx_hash_filtered<J: ArbJournal>(
     tx_hash: B256,
+    arbos_version: Option<u64>,
     journal: &mut J,
 ) -> Result<bool, String> {
-    // This check runs on every regular and retry transaction. Opening the whole typed ArbOS tree
-    // derives slots for every unrelated subspace; only the version metadata word is required here.
-    if StorageSpace::arbos()
-        .storage_backed::<u64>(ArbosMetadataOffset::Version as u8)
-        .get(journal)
-        .map_err(|err| format!("failed to read ArbOS version: {err:?}"))?
-        < ARBOS_VERSION_TRANSACTION_FILTERING
-    {
+    let arbos_version = match arbos_version {
+        Some(version) => version,
+        None => ArbosState::open()
+            .arbos_version
+            .get(journal)
+            .map_err(|err| format!("failed to read ArbOS version: {err:?}"))?,
+    };
+    if arbos_version < ARBOS_VERSION_TRANSACTION_FILTERING {
         return Ok(false);
     }
     Ok(StorageSpace::new(FILTERED_TRANSACTIONS_STATE_ADDRESS)
@@ -39,14 +40,14 @@ pub(crate) fn is_tx_hash_filtered<J: ArbJournal>(
 pub(crate) fn filtered_funds_recipient_or_default<J: ArbJournal>(
     journal: &mut J,
 ) -> Result<Address, String> {
-    let arbos = StorageSpace::arbos();
+    let arbos = ArbosState::open();
     let recipient = arbos
-        .storage_backed::<Address>(ArbosMetadataOffset::FilteredFundsRecipient as u8)
+        .filtered_funds_recipient
         .get(journal)
         .map_err(|err| format!("failed to read filtered-funds recipient: {err:?}"))?;
     if recipient == Address::ZERO {
         arbos
-            .storage_backed::<Address>(ArbosMetadataOffset::NetworkFeeAccount as u8)
+            .network_fee_account
             .get(journal)
             .map_err(|err| format!("failed to read network-fee account: {err:?}"))
     } else {
