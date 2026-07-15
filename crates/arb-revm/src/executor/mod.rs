@@ -12,6 +12,6 @@ pub use digest::{digest_message, digest_message_envelope};
 pub use hooks::{ArbExecutionHooks, ArbStartBlockDerived, ArbSystemCall, DefaultArbExecutionHooks};
 pub use run::{
     ArbExecError, execute_message, execute_message_with_hooks, is_redeem_scheduled_log,
-    scheduled_retries_from_redeem_logs,
+    message_cfg_env, scheduled_retries_from_redeem_logs,
 };
 pub use runner::{ArbRunner, ArbRunnerError};

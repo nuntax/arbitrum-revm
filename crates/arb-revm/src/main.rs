@@ -2,20 +2,20 @@
 #![allow(clippy::field_reassign_with_default)]
 
 use alloy_provider::{Provider, ProviderBuilder};
-use arbitrum_alloy_consensus::transactions::{ArbTxEnvelope, TxRetry};
 use arb_revm::{
     ArbBuilder, ArbChainContext, ArbContext, ArbExecCfg, ArbExecOutcome, ArbExecutionHooks,
-    ArbExecutionInput, ArbParentHeader, ArbRunner, ArbRunnerError,
-    ArbStartBlockDerived, ArbTransaction, ArbosState, DefaultArb, DefaultArbExecutionHooks,
+    ArbExecutionInput, ArbParentHeader, ArbRunner, ArbRunnerError, ArbStartBlockDerived,
+    ArbTransaction, ArbosState, DefaultArb, DefaultArbExecutionHooks,
     constants::{ARB_RETRYABLE_TX_ADDRESS, ARBITRUM_INTERNAL_TX_TYPE, HISTORY_STORAGE_ADDRESS},
-    executor::{ArbExecError, digest_message_envelope},
+    executor::{ArbExecError, digest_message_envelope, message_cfg_env},
     transaction::arb_envelope_to_tx_env,
 };
+use arbitrum_alloy_consensus::transactions::{ArbTxEnvelope, TxRetry};
 use arbitrum_alloy_sequencer::sequencer::feed::{BroadcastFeedMessage, Root};
 use eyre::{Result, eyre};
 use revm::{
     Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm,
-    context::{BlockEnv, CfgEnv, TxEnv},
+    context::{BlockEnv, TxEnv},
     context_interface::{Block, ContextTr, JournalTr},
     database::CacheDB,
     database_interface::WrapDatabaseAsync,
@@ -569,14 +569,10 @@ where
     let l2_block_number = parent.number.saturating_add(1);
 
     let block = build_block_env(parent, cfg, input);
-    let chain = ArbChainContext::new(message.sequence_number);
+    let chain =
+        ArbChainContext::new(message.sequence_number).with_l1_block_number(message.l1_block_number);
 
-    let mut cfg_env = CfgEnv::new_with_spec(cfg.spec_id)
-        .with_chain_id(cfg.chain_id)
-        .with_disable_priority_fee_check(cfg.disable_priority_fee_check);
-    cfg_env.disable_balance_check = cfg.disable_balance_check;
-    // Nitro exempts Arbitrum from the EIP-7825 per-tx gas cap (Osaka / ArbOS 50+); match it.
-    cfg_env.tx_gas_limit_cap = Some(u64::MAX);
+    let cfg_env = message_cfg_env(db, cfg, next_timestamp);
 
     let context: ArbContext<&mut DB> = ArbContext::arb_with_chain_context(chain)
         .with_db(db)

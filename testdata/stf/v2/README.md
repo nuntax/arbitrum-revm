@@ -5,6 +5,11 @@ This directory stores immutable input-to-output fixtures for the Arbitrum state-
 Expected output is captured only from a pinned Nitro binary through JSON-RPC. Do not construct or
 refresh expected objects with Rust execution code.
 
+The manifest format is currently schema v3. Every case carries the effective ArbOS version decoded
+from Nitro's canonical output header. Offline replay cross-checks that value against the authenticated
+parent ArbOS state and rejects versions that do not have an explicit executor representation. A fixture
+therefore cannot silently run with a nearby, collapsed, or future ArbOS version.
+
 To create a fixture, capture an exact protocol input and run:
 
 ```sh

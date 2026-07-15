@@ -8,7 +8,7 @@ use std::{collections::BTreeSet, fmt, path::Path};
 use serde::{Deserialize, Serialize};
 
 pub const STF_FIXTURE_SCHEMA: &str = "arb-stf-fixture";
-pub const STF_FIXTURE_SCHEMA_VERSION: u32 = 2;
+pub const STF_FIXTURE_SCHEMA_VERSION: u32 = 3;
 
 /// Compression used for a fixture object. Object identity is always over the
 /// decompressed bytes.
@@ -117,6 +117,10 @@ pub struct FixtureCase {
     pub id: String,
     pub labels: Vec<String>,
     pub oracle: FixtureProvenance,
+    /// ArbOS version under which this input must execute. It is decoded from
+    /// Nitro's canonical output header and cross-checked against the fixture's
+    /// authenticated parent state before execution.
+    pub effective_arbos_version: u64,
     pub prestate: FixturePrestate,
     pub input: FixtureInput,
     pub expected: FixtureResult,
@@ -129,6 +133,7 @@ impl FixtureCase {
         id: String,
         labels: Vec<String>,
         oracle: FixtureProvenance,
+        effective_arbos_version: u64,
         prestate: FixturePrestate,
         input: FixtureInput,
         expected: FixtureResult,
@@ -140,6 +145,7 @@ impl FixtureCase {
             id,
             labels,
             oracle,
+            effective_arbos_version,
             prestate,
             input,
             expected,
@@ -156,6 +162,9 @@ impl FixtureCase {
         }
         if self.case_revision == 0 {
             return Err(FixtureError::InvalidCaseRevision);
+        }
+        if self.effective_arbos_version == 0 {
+            return Err(FixtureError::InvalidArbosVersion);
         }
         validate_case_id(&self.id)?;
         validate_sorted_unique("labels", &self.labels)?;
@@ -266,6 +275,7 @@ pub enum FixtureError {
     UnsupportedSchema(String),
     UnsupportedSchemaVersion(u32),
     InvalidCaseRevision,
+    InvalidArbosVersion,
     InvalidCaseId(String),
     InvalidCasePath(String),
     InvalidLabels {
@@ -287,6 +297,7 @@ impl fmt::Display for FixtureError {
                 write!(f, "unsupported fixture schema version {value}")
             }
             Self::InvalidCaseRevision => f.write_str("case revision must be non-zero"),
+            Self::InvalidArbosVersion => f.write_str("effective ArbOS version must be non-zero"),
             Self::InvalidCaseId(value) => write!(f, "invalid case id {value:?}"),
             Self::InvalidCasePath(value) => write!(f, "invalid fixture case path {value:?}"),
             Self::InvalidLabels { field, values } => write!(
@@ -373,6 +384,7 @@ mod tests {
                 binary_sha256: DIGEST.to_owned(),
                 chain_config_sha256: DIGEST.to_owned(),
             },
+            20,
             FixturePrestate::ExecutionWitness { object: object() },
             FixtureInput::DerivedTransactions { object: object() },
             FixtureResult { object: object() },
@@ -401,6 +413,16 @@ mod tests {
         assert!(matches!(
             fixture.validate(),
             Err(FixtureError::InvalidLabels { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_effective_arbos_version() {
+        let mut fixture = case();
+        fixture.effective_arbos_version = 0;
+        assert!(matches!(
+            fixture.validate(),
+            Err(FixtureError::InvalidArbosVersion)
         ));
     }
 }

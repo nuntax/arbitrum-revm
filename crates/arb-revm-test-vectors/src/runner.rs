@@ -6,7 +6,7 @@ use alloy_eips::eip2718::Decodable2718;
 use alloy_trie::Nibbles;
 use arb_revm::{
     ArbExecCfg, ArbExecutionInput, ArbExecutionMode, ArbMessageEnvelope, ArbParentHeader,
-    ArbTxExecution, execute_message,
+    ArbSpecId, ArbTxExecution, ArbosState, StorageBacked, execute_message,
 };
 use arb_stf_fixture::{FixtureCase, FixtureInput, FixturePrestate, ObjectStore};
 use arbitrum_alloy_consensus::transactions::ArbTxEnvelope;
@@ -252,13 +252,14 @@ pub fn run_case(root: impl AsRef<Path>, fixture: &FixtureCase) -> VectorReport {
                     return report;
                 }
             };
-            let (outcome, state_delta) = match execute_with_db(state, input.clone()) {
-                Ok(result) => result,
-                Err(error) => {
-                    report.mismatches.push(error);
-                    return report;
-                }
-            };
+            let (outcome, state_delta) =
+                match execute_with_db(state, input.clone(), fixture.effective_arbos_version) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        report.mismatches.push(error);
+                        return report;
+                    }
+                };
             let root = match post_state_root(prestate, &state_delta) {
                 Ok(root) => root,
                 Err(error) => {
@@ -281,13 +282,14 @@ pub fn run_case(root: impl AsRef<Path>, fixture: &FixtureCase) -> VectorReport {
                 }
             };
             let root_source = state.clone();
-            let (outcome, state_delta) = match execute_with_db(state, input) {
-                Ok(result) => result,
-                Err(error) => {
-                    report.mismatches.push(error);
-                    return report;
-                }
-            };
+            let (outcome, state_delta) =
+                match execute_with_db(state, input, fixture.effective_arbos_version) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        report.mismatches.push(error);
+                        return report;
+                    }
+                };
             let root = match witness_post_state_root(&root_source, &state_delta) {
                 Ok(root) => root,
                 Err(error) => {
@@ -318,14 +320,20 @@ enum LoadedPrestate {
 fn execute_with_db<DB>(
     state: DB,
     input: DerivedTransactionsInput,
+    expected_arbos_version: u64,
 ) -> Result<(arb_revm::ArbExecOutcome, Vec<SequenceAccountDelta>), String>
 where
     DB: revm::DatabaseRef,
     DB::Error: core::fmt::Debug,
 {
-    let spec = arb_revm::ArbSpecId::from_arbos_version(
-        arb_revm::ArbosState::read_effective_version(&state, input.message.l1_timestamp),
-    );
+    let effective_arbos_version = read_effective_arbos_version(&state, input.message.l1_timestamp)?;
+    if effective_arbos_version != expected_arbos_version {
+        return Err(format!(
+            "fixture ArbOS version mismatch: canonical header declares {expected_arbos_version}, \
+             authenticated parent state resolves to {effective_arbos_version}"
+        ));
+    }
+    let spec = exact_arbos_spec(effective_arbos_version)?;
     let input = input
         .into_execution_input(spec)
         .map_err(|error| format!("input decode failed: {error}"))?;
@@ -333,6 +341,49 @@ where
     let outcome =
         execute_message(&mut db, &input).map_err(|error| format!("execution failed: {error:?}"))?;
     Ok((outcome, db.into_deltas()))
+}
+
+/// Reads every slot needed for Nitro's flag-day upgrade selection. Unlike the
+/// production helper, this is deliberately strict: a fixture cannot fall back
+/// to ArbOS 1 when its witness failed to prove one of these state reads.
+fn read_effective_arbos_version<DB>(state: &DB, timestamp: u64) -> Result<u64, String>
+where
+    DB: revm::DatabaseRef,
+    DB::Error: core::fmt::Debug,
+{
+    let arbos = ArbosState::open();
+    let read = |slot: &StorageBacked<u64>, name: &str| -> Result<u64, String> {
+        let (address, key) = slot.account_and_key();
+        let value = state
+            .storage_ref(address, U256::from_be_bytes(key.0))
+            .map_err(|error| format!("fixture cannot prove ArbOS {name} slot: {error:?}"))?;
+        u64::try_from(value).map_err(|_| format!("ArbOS {name} slot exceeds u64"))
+    };
+    let current = read(&arbos.arbos_version, "version")?;
+    if current == 0 {
+        return Err("fixture has no initialized ArbOS version".to_owned());
+    }
+    let upgrade_version = read(&arbos.upgrade_version, "upgrade version")?;
+    let upgrade_timestamp = read(&arbos.upgrade_timestamp, "upgrade timestamp")?;
+    Ok(
+        if upgrade_version > current && timestamp >= upgrade_timestamp {
+            upgrade_version
+        } else {
+            current
+        },
+    )
+}
+
+/// Every version must have an explicit executor representation. This avoids
+/// silently treating ArbOS 59 as 51 or an unknown future version as 61.
+fn exact_arbos_spec(version: u64) -> Result<ArbSpecId, String> {
+    let spec = ArbSpecId::from_arbos_version(version);
+    if spec.arbos_version() != version {
+        return Err(format!(
+            "ArbOS {version} is not explicitly represented by this executor"
+        ));
+    }
+    Ok(spec)
 }
 
 fn decode_object<T: for<'de> Deserialize<'de>>(
@@ -645,5 +696,12 @@ mod tests {
                 .into_execution_input(arb_revm::ArbSpecId::NITRO)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_versions_without_an_explicit_executor_spec() {
+        assert_eq!(exact_arbos_spec(40).unwrap(), ArbSpecId::ARBOS_40);
+        assert!(exact_arbos_spec(59).is_err());
+        assert!(exact_arbos_spec(62).is_err());
     }
 }

@@ -76,6 +76,35 @@ fn build_block_env(
     block
 }
 
+/// Builds the message-scoped EVM configuration from ArbOS state.
+///
+/// This is shared by the production executor and diagnostic raw-feed tooling so
+/// the latter cannot silently select different hardfork or feature rules.
+pub fn message_cfg_env<DB: Database>(
+    db: &mut DB,
+    cfg: ArbExecCfg,
+    block_timestamp: u64,
+) -> CfgEnv<crate::ArbSpecId> {
+    let arbos_version = ArbosState::read_effective_version_db(db, block_timestamp);
+    let spec = if arbos_version == 0 {
+        cfg.spec_id
+    } else {
+        crate::ArbSpecId::from_arbos_version(arbos_version)
+    };
+
+    let mut cfg_env = CfgEnv::new_with_spec(spec)
+        .with_chain_id(cfg.chain_id)
+        .with_disable_priority_fee_check(cfg.disable_priority_fee_check);
+    cfg_env.disable_balance_check = cfg.disable_balance_check;
+    // Nitro applies EIP-7623 only when the ArbOS feature is explicitly enabled.
+    cfg_env.disable_eip7623 = !ArbosState::open()
+        .features
+        .read_calldata_price_increase_db(db);
+    // Nitro exempts Arbitrum from Osaka's generic per-transaction gas cap.
+    cfg_env.tx_gas_limit_cap = Some(u64::MAX);
+    cfg_env
+}
+
 fn start_block_internal_tx(call: ArbSystemCall, chain_id: u64) -> ArbTransaction<TxEnv> {
     let mut tx = TxEnv::default();
     tx.tx_type = ARBITRUM_INTERNAL_TX_TYPE;
@@ -238,28 +267,7 @@ where
     let chain =
         ArbChainContext::new(message.sequence_number).with_l1_block_number(message.l1_block_number);
 
-    // Derive the EVM spec from the block's *effective* ArbOS version (current version,
-    // or a scheduled upgrade due at this block's timestamp). Fall back to the configured
-    // spec when the version is unreadable / uninitialized (e.g. a fresh in-memory DB).
-    let arbos_version = ArbosState::read_effective_version_db(db, next_timestamp);
-    let spec = if arbos_version == 0 {
-        cfg.spec_id
-    } else {
-        crate::ArbSpecId::from_arbos_version(arbos_version)
-    };
-
-    let mut cfg_env = CfgEnv::new_with_spec(spec)
-        .with_chain_id(cfg.chain_id)
-        .with_disable_priority_fee_check(cfg.disable_priority_fee_check);
-    cfg_env.disable_balance_check = cfg.disable_balance_check;
-    // EIP-7623 calldata floor is applied only when the ArbOS `calldata_price_increase` feature
-    // is enabled (Nitro state_transition.go: `IsPrague && IsCalldataPricingIncreaseEnabled()`).
-    // Arbitrum otherwise prices calldata via its own L1 poster fee, so the floor must be off.
-    cfg_env.disable_eip7623 = !ArbosState::open().features.read_calldata_price_increase_db(db);
-    // EIP-7825 caps a single tx at 2^24 gas from Osaka (ArbOS 50+). Nitro exempts Arbitrum from
-    // that cap (state_transition.go: `!IsArbitrum() && isOsaka && ...`), so disable it here or we
-    // would reject high-gas L2 txs that Nitro accepts.
-    cfg_env.tx_gas_limit_cap = Some(u64::MAX);
+    let cfg_env = message_cfg_env(db, cfg, next_timestamp);
 
     let context: ArbContext<&mut DB> = ArbContext::arb_with_chain_context(chain)
         .with_db(db)
@@ -544,7 +552,10 @@ mod tests {
 
         assert_eq!(outcome.txs.len(), 2, "submit should schedule one retry tx");
         assert!(outcome.txs[0].success, "submit tx should succeed");
-        assert!(!outcome.txs[1].success, "create-retry with failing initcode should fail");
+        assert!(
+            !outcome.txs[1].success,
+            "create-retry with failing initcode should fail"
+        );
 
         let nonce = db.basic_ref(sender).unwrap().map(|a| a.nonce).unwrap_or(0);
         assert_eq!(
@@ -618,7 +629,10 @@ mod tests {
 
         let outcome = execute_message(&mut db, &input).expect("message execution should succeed");
         assert_eq!(outcome.txs.len(), 2, "submit should schedule one retry tx");
-        assert!(!outcome.txs[1].success, "colliding create-retry should fail");
+        assert!(
+            !outcome.txs[1].success,
+            "colliding create-retry should fail"
+        );
 
         let nonce = db.basic_ref(sender).unwrap().map(|a| a.nonce).unwrap_or(0);
         assert_eq!(

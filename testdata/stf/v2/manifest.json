@@ -1,6 +1,6 @@
 {
   "schema": "arb-stf-fixture",
-  "schema_version": 2,
+  "schema_version": 3,
   "cases": [
     {
       "id": "opcodes/blobbasefee-halt",

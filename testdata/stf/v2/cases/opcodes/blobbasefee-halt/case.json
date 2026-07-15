@@ -1,6 +1,6 @@
 {
   "schema": "arb-stf-fixture",
-  "schema_version": 2,
+  "schema_version": 3,
   "case_revision": 1,
   "id": "opcodes/blobbasefee-halt",
   "labels": [
@@ -13,6 +13,7 @@
     "binary_sha256": "46785dccb64dc2005ca367ef0c877f090e014086dc7019c73ec2e734518e352a",
     "chain_config_sha256": "f2e9978dfe2bb43d22ef439c3328b73fe314f7503b84cbf60e95bfe91ffb42f8"
   },
+  "effective_arbos_version": 40,
   "prestate": {
     "kind": "execution_witness",
     "object": {

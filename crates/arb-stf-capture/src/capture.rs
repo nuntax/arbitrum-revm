@@ -45,6 +45,7 @@ pub async fn capture_block(args: CaptureArgs) -> Result<()> {
     );
 
     let (block_hash, decoded_block) = resolve_block(&client, &args.block).await?;
+    let effective_arbos_version = decode_arbos_version(&decoded_block)?;
     let raw_block = client
         .request("debug_getRawBlock", json!([block_hash]))
         .await?;
@@ -118,6 +119,7 @@ pub async fn capture_block(args: CaptureArgs) -> Result<()> {
         args.case_id.clone(),
         args.labels,
         oracle,
+        effective_arbos_version,
         FixturePrestate::ExecutionWitness { object: prestate },
         input,
         expected,
@@ -130,6 +132,44 @@ pub async fn capture_block(args: CaptureArgs) -> Result<()> {
         fixture.id
     );
     Ok(())
+}
+
+/// Reads the ArbOS format version from the canonical block header returned by
+/// Nitro. The version is encoded as the big-endian `mixHash[16..24]`; keeping
+/// it in the fixture makes the selected EVM rules an asserted input rather
+/// than an implicit runner default.
+fn decode_arbos_version(block: &Value) -> Result<u64> {
+    let extra_data = decode_header_field(block, "extraData")?;
+    ensure!(
+        extra_data.len() == 32,
+        "canonical block extraData has length {}, expected 32",
+        extra_data.len()
+    );
+    let mix_hash = decode_header_field(block, "mixHash")?;
+    ensure!(
+        mix_hash.len() == 32,
+        "canonical block mixHash has length {}, expected 32",
+        mix_hash.len()
+    );
+    let mut version = [0u8; 8];
+    version.copy_from_slice(&mix_hash[16..24]);
+    let version = u64::from_be_bytes(version);
+    ensure!(
+        version != 0,
+        "canonical block is missing an ArbOS format version"
+    );
+    Ok(version)
+}
+
+fn decode_header_field(block: &Value, field: &str) -> Result<Vec<u8>> {
+    let value = block
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| eyre::eyre!("canonical block has no hexadecimal {field}"))?;
+    let value = value
+        .strip_prefix("0x")
+        .ok_or_else(|| eyre::eyre!("canonical block {field} has no 0x prefix"))?;
+    hex::decode(value).wrap_err_with(|| format!("canonical block {field} is not valid hex"))
 }
 
 async fn capture_witness_prestate(
@@ -358,5 +398,25 @@ mod tests {
     fn recognizes_only_full_hashes() {
         assert!(!is_block_hash("0x1234"));
         assert!(is_block_hash(&format!("0x{}", "ab".repeat(32))));
+    }
+
+    #[test]
+    fn decodes_arbos_version_from_canonical_header_fields() {
+        let block = json!({
+            "extraData": format!("0x{}", "00".repeat(32)),
+            "mixHash": "0x0000000000000000000000000000032c00000000000000280000000000000000",
+        });
+
+        assert_eq!(decode_arbos_version(&block).unwrap(), 40);
+    }
+
+    #[test]
+    fn rejects_a_non_arbitrum_header() {
+        let block = json!({
+            "extraData": format!("0x{}", "00".repeat(32)),
+            "mixHash": format!("0x{}", "00".repeat(32)),
+        });
+
+        assert!(decode_arbos_version(&block).is_err());
     }
 }
