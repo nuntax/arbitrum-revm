@@ -1,0 +1,28 @@
+{
+  "schema": "arb-stf-fixture",
+  "schema_version": 2,
+  "cases": [
+    {
+      "id": "opcodes/blobbasefee-halt",
+      "path": "cases/opcodes/blobbasefee-halt/case.json",
+      "labels": [
+        "arbos-latest",
+        "opcode"
+      ],
+      "prestate_sha256": "96ec87e300e4ed2497ebddf6c23f4fd3a7f367ae9a23492984731f1cf26e27e9",
+      "input_sha256": "944ac3c0d56de64d176d9aefe63e8b2ef6be0cbf52dd889e5da1bc63d1364887",
+      "expected_sha256": "c17235065c522bad3344602e812840837243c2c0b97e725eb91e69a1f12dbbba"
+    },
+    {
+      "id": "opcodes/eip3541-invalid-ef",
+      "path": "cases/opcodes/eip3541-invalid-ef/case.json",
+      "labels": [
+        "arbos-latest",
+        "opcode"
+      ],
+      "prestate_sha256": "50c07fa4c6a315d9abe76a19f82ddf147da1bb6ea873f21e6c8a6bb9530ecf42",
+      "input_sha256": "c433aa6661541e30d3955f4cb139f28fabefe1c501c3966074ff754ed2ce37c4",
+      "expected_sha256": "d2ddb056a5e91efba9b96013d74003c8979549d46812683d33ed0648ff4e5c67"
+    }
+  ]
+}

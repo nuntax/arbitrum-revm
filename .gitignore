@@ -5,6 +5,9 @@
 /testdata/fixtures/*
 !/testdata/fixtures/deposit_message_only.json
 !/testdata/fixtures/submit_retryable_message_only.json
+!/testdata/stf/
+!/testdata/stf/v2/
+!/testdata/stf/v2/**
 Cargo.lock
 *.pyc
 .DS_Store

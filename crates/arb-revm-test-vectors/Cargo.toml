@@ -1,0 +1,23 @@
+[package]
+name = "arb-revm-test-vectors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Offline strict-state STF vectors for arb-revm"
+
+[dependencies]
+arb-revm = { path = "../arb-revm" }
+arb-stf-fixture = { path = "../arb-stf-fixture" }
+alloy-eips = "2.0"
+alloy-consensus = "2.0"
+alloy-rlp = "0.3.12"
+alloy-trie = { version = "0.9.5", features = ["ethereum"] }
+arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "f713b3c5beccb5cafa27e4123bf22e8435224102", features = ["k256"] }
+revm.workspace = true
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json.workspace = true
+
+[features]
+stylus = ["arb-revm/stylus"]

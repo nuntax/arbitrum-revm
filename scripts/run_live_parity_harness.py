@@ -77,7 +77,10 @@ def extract_message_kind(message: dict) -> Optional[int]:
 
 
 def capture_raw_payload(
-    proc: subprocess.Popen, timeout_sec: float, required_kind: Optional[int]
+    proc: subprocess.Popen,
+    timeout_sec: float,
+    required_kind: Optional[int],
+    minimum_sequence: Optional[int],
 ) -> Tuple[int, str, Optional[int]]:
     deadline = time.monotonic() + timeout_sec
     marker = "raw_feed_payload="
@@ -96,20 +99,18 @@ def capture_raw_payload(
             raise RuntimeError("captured raw payload has no messages")
         selected_seq: Optional[int] = None
         selected_kind: Optional[int] = None
+        for message in messages:
+            seq = message.get("sequenceNumber")
+            if not isinstance(seq, int):
+                continue
+            if minimum_sequence is not None and seq < minimum_sequence:
+                continue
 
-        if required_kind is None:
-            selected_seq = messages[0].get("sequenceNumber")
-            selected_kind = extract_kind(payload)
-        else:
-            for message in messages:
-                seq = message.get("sequenceNumber")
-                kind = extract_message_kind(message)
-                if not isinstance(seq, int):
-                    continue
-                if kind == required_kind:
-                    selected_seq = seq
-                    selected_kind = kind
-                    break
+            kind = extract_message_kind(message)
+            if required_kind is None or kind == required_kind:
+                selected_seq = seq
+                selected_kind = kind
+                break
 
         if selected_seq is None:
             first_seq = messages[0].get("sequenceNumber")
@@ -181,6 +182,23 @@ def main() -> int:
         help="Require captured feed message header kind (e.g. 12 for deposit, 9 for submit-retryable)",
     )
     parser.add_argument(
+        "--feed-from-sequence",
+        type=int,
+        default=None,
+        help="Request the feed backlog starting at this sequence number.",
+    )
+    parser.add_argument(
+        "--minimum-sequence",
+        type=int,
+        default=None,
+        help="Ignore feed payloads whose selected sequence is lower than this value.",
+    )
+    parser.add_argument(
+        "--log-all-feed-payloads",
+        action="store_true",
+        help="Emit raw feed payloads for ordinary sequencer messages as well as deposits and retryables.",
+    )
+    parser.add_argument(
         "--no-bridge-trigger",
         action="store_true",
         help="Skip triggering bridge command; only capture next live message",
@@ -188,6 +206,11 @@ def main() -> int:
     args = parser.parse_args()
 
     print("starting sequencer feed capture...")
+    feed_env = os.environ.copy()
+    if args.feed_from_sequence is not None:
+        feed_env["ARB_FEED_FROM_SEQUENCE"] = str(args.feed_from_sequence)
+    if args.log_all_feed_payloads:
+        feed_env["ARB_FEED_LOG_RAW"] = "1"
     feed_proc = subprocess.Popen(
         ["cargo", "run", "-p", "sequencer_client", "--", args.feed_url],
         cwd=args.sequencer_client_dir,
@@ -195,6 +218,7 @@ def main() -> int:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         bufsize=1,
+        env=feed_env,
     )
 
     try:
@@ -215,7 +239,10 @@ def main() -> int:
             print(bridge.stdout)
 
         seq, payload_str, kind = capture_raw_payload(
-            feed_proc, args.capture_timeout, args.required_kind
+            feed_proc,
+            args.capture_timeout,
+            args.required_kind,
+            args.minimum_sequence,
         )
         with open(args.payload_out, "w", encoding="utf-8") as handle:
             handle.write(payload_str)
@@ -230,6 +257,8 @@ def main() -> int:
         "cargo",
         "run",
         "-p",
+        "arb-revm",
+        "--bin",
         "arb-revm",
         "--",
         args.rpc_url,

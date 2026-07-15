@@ -1,0 +1,19 @@
+[package]
+name = "arb-stf-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Capture immutable Arbitrum STF parity fixtures from a Nitro JSON-RPC endpoint"
+
+[dependencies]
+arb-stf-fixture = { path = "../arb-stf-fixture" }
+alloy-primitives = "1.4.3"
+eyre.workspace = true
+hex.workspace = true
+reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true

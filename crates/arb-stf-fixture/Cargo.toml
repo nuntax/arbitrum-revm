@@ -1,0 +1,18 @@
+[package]
+name = "arb-stf-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Neutral schema and content-addressed storage for Arbitrum STF parity fixtures"
+
+[dependencies]
+hex.workspace = true
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23"

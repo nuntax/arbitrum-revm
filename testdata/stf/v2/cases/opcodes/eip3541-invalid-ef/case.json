@@ -1,0 +1,42 @@
+{
+  "schema": "arb-stf-fixture",
+  "schema_version": 2,
+  "case_revision": 1,
+  "id": "opcodes/eip3541-invalid-ef",
+  "labels": [
+    "arbos-latest",
+    "opcode"
+  ],
+  "oracle": {
+    "name": "nitro",
+    "git_revision": "91bf578",
+    "binary_sha256": "46785dccb64dc2005ca367ef0c877f090e014086dc7019c73ec2e734518e352a",
+    "chain_config_sha256": "f2e9978dfe2bb43d22ef439c3328b73fe314f7503b84cbf60e95bfe91ffb42f8"
+  },
+  "prestate": {
+    "kind": "execution_witness",
+    "object": {
+      "sha256": "50c07fa4c6a315d9abe76a19f82ddf147da1bb6ea873f21e6c8a6bb9530ecf42",
+      "compression": "zstd",
+      "uncompressed_length": 77341,
+      "media_type": "application/x-ethereum-execution-witness+json"
+    }
+  },
+  "input": {
+    "kind": "raw_feed",
+    "object": {
+      "sha256": "c433aa6661541e30d3955f4cb139f28fabefe1c501c3966074ff754ed2ce37c4",
+      "compression": "zstd",
+      "uncompressed_length": 501,
+      "media_type": "application/x-arbitrum-feed-payload"
+    }
+  },
+  "expected": {
+    "object": {
+      "sha256": "d2ddb056a5e91efba9b96013d74003c8979549d46812683d33ed0648ff4e5c67",
+      "compression": "zstd",
+      "uncompressed_length": 7977,
+      "media_type": "application/x-arbitrum-stf-output+json"
+    }
+  }
+}

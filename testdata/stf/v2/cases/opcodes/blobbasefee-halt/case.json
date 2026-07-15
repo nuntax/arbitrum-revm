@@ -1,0 +1,42 @@
+{
+  "schema": "arb-stf-fixture",
+  "schema_version": 2,
+  "case_revision": 1,
+  "id": "opcodes/blobbasefee-halt",
+  "labels": [
+    "arbos-latest",
+    "opcode"
+  ],
+  "oracle": {
+    "name": "nitro",
+    "git_revision": "91bf578",
+    "binary_sha256": "46785dccb64dc2005ca367ef0c877f090e014086dc7019c73ec2e734518e352a",
+    "chain_config_sha256": "f2e9978dfe2bb43d22ef439c3328b73fe314f7503b84cbf60e95bfe91ffb42f8"
+  },
+  "prestate": {
+    "kind": "execution_witness",
+    "object": {
+      "sha256": "96ec87e300e4ed2497ebddf6c23f4fd3a7f367ae9a23492984731f1cf26e27e9",
+      "compression": "zstd",
+      "uncompressed_length": 35077,
+      "media_type": "application/x-ethereum-execution-witness+json"
+    }
+  },
+  "input": {
+    "kind": "raw_feed",
+    "object": {
+      "sha256": "944ac3c0d56de64d176d9aefe63e8b2ef6be0cbf52dd889e5da1bc63d1364887",
+      "compression": "zstd",
+      "uncompressed_length": 504,
+      "media_type": "application/x-arbitrum-feed-payload"
+    }
+  },
+  "expected": {
+    "object": {
+      "sha256": "c17235065c522bad3344602e812840837243c2c0b97e725eb91e69a1f12dbbba",
+      "compression": "zstd",
+      "uncompressed_length": 8155,
+      "media_type": "application/x-arbitrum-stf-output+json"
+    }
+  }
+}
