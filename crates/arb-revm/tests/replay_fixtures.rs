@@ -158,3 +158,39 @@ fn recorded_fixtures_replay_with_parity() {
 
     eprintln!("replayed {replayed} captured fixture(s) with parity");
 }
+
+/// Stylus is an optional runtime feature, so its canonical block fixtures live
+/// separately from the baseline suite. This fixture covers the direct
+/// `SetTrieSlots` storage-clear refund path at ArbOS 51.
+#[cfg(feature = "stylus")]
+#[test]
+fn recorded_stylus_fixtures_replay_with_parity() {
+    let dir = fixtures_dir().join("stylus");
+    let entries = fs::read_dir(&dir).unwrap_or_else(|error| {
+        panic!("read Stylus fixture directory {dir:?}: {error}")
+    });
+
+    let mut replayed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let body = fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!("read Stylus fixture {path:?}: {error}")
+        });
+        let fixture: ReplayFixture = serde_json::from_str(&body).unwrap_or_else(|error| {
+            panic!("parse Stylus fixture {path:?}: {error}")
+        });
+
+        let report = replay_fixture(&fixture);
+        assert!(
+            report.is_parity(),
+            "Stylus fixture {path:?} mismatches: {:#?}",
+            report.mismatches
+        );
+        replayed += 1;
+    }
+
+    assert!(replayed > 0, "expected at least one Stylus replay fixture");
+}

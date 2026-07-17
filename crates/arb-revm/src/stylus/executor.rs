@@ -28,7 +28,7 @@ use stylus::{
     run::RunProgram,
 };
 
-use crate::{spec::ArbSpecId, stylus::api::StylusHandler};
+use crate::{chain::ArbChainContext, spec::ArbSpecId, stylus::api::StylusHandler};
 
 /// Assemble the [`EvmData`] passed to a Stylus program for one call, the block, tx and
 /// call-frame context the WASM hostios read from.
@@ -43,7 +43,7 @@ pub fn build_evm_data<CTX>(
     cached: bool,
 ) -> EvmData
 where
-    CTX: ContextTr<Cfg: Cfg<Spec = ArbSpecId>>,
+    CTX: ContextTr<Chain = ArbChainContext, Cfg: Cfg<Spec = ArbSpecId>>,
 {
     let block = ctx.block();
     let basefee = block.basefee();
@@ -51,7 +51,9 @@ where
     let chain_id = ctx.cfg().chain_id();
     let beneficiary = block.beneficiary();
     let gas_limit = block.gas_limit();
-    let number = block.number().saturating_to::<u64>();
+    // Like the patched `NUMBER` opcode, Stylus `block_number` is the L1 block number (Nitro
+    // `evmData.blockNumber = evm.ProcessingHook.L1BlockNumber(...)`), not the L2 number.
+    let number = ctx.chain().l1_block_number;
     let timestamp = block.timestamp().saturating_to::<u64>();
     let tx = ctx.tx();
     let tx_origin = tx.caller();

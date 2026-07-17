@@ -1,4 +1,4 @@
-use revm::primitives::{B256, U256};
+use revm::primitives::{Address, B256, HashMap, U256};
 
 /// Arbitrum chain-scoped execution context carried alongside block/tx/cfg.
 ///
@@ -37,12 +37,21 @@ pub struct ArbChainContext {
     /// model to price page growth across the tx's (possibly nested) Stylus calls.
     pub stylus_pages_open: u16,
     pub stylus_pages_ever: u16,
-    /// Gas refund accrued by EVM sub-calls made from a Stylus program (via the call/create
-    /// hostios). Nitro applies these to the statedb refund counter; revm normally bubbles a
-    /// sub-frame's refund up through `frame_return`, but the Stylus hostio runs its sub-frame
-    /// out-of-band (`run_exec_loop`), so the refund is captured here and folded back onto the
-    /// Stylus frame's result gas (save/restore around each frame keeps nesting correct).
-    pub stylus_sub_refund: i64,
+    /// Gas refund accrued within a Stylus frame. This includes EVM sub-calls made through
+    /// call/create hostios and direct `SetTrieSlots` writes. Nitro journals both in StateDB;
+    /// revm's normal frame return only propagates the former when it owns the sub-frame, so the
+    /// Stylus dispatcher carries the total onto the frame result. Save/restore around each frame
+    /// keeps nested calls from double-counting.
+    pub stylus_refund: i64,
+    /// Open non-delegate call-frame count per acting address for the current tx (Nitro
+    /// `TxProcessor.Programs`, maintained by `PushContract`/`PopContract`). A Stylus program
+    /// entered while its acting address already has an open span (count > 1 including its own
+    /// frame) runs with `EvmData.reentrant` set; programs branch on this (e.g. flash-loan
+    /// callbacks that require being re-entered). DELEGATECALL/CALLCODE frames act as the
+    /// parent's address, whose span is already open, and are not counted; create frames are
+    /// not counted either (EIP-3541 makes a created address never a Stylus program mid-tx and
+    /// address collisions with live code fail before a frame opens).
+    pub stylus_program_spans: HashMap<Address, u32>,
     /// A normal transaction registered in ArbOS's transaction filter. It skips EVM execution
     /// after gas charging and consumes its full gas limit.
     pub filtered_tx: bool,
@@ -70,7 +79,8 @@ impl ArbChainContext {
             arbos_version: None,
             stylus_pages_open: 0,
             stylus_pages_ever: 0,
-            stylus_sub_refund: 0,
+            stylus_refund: 0,
+            stylus_program_spans: HashMap::default(),
             filtered_tx: false,
             pending_zombie_escrow_tickets: Vec::new(),
         }
@@ -90,7 +100,8 @@ impl ArbChainContext {
         self.paid_gas_price = 0;
         self.stylus_pages_open = 0;
         self.stylus_pages_ever = 0;
-        self.stylus_sub_refund = 0;
+        self.stylus_refund = 0;
+        self.stylus_program_spans.clear();
         self.filtered_tx = false;
     }
 

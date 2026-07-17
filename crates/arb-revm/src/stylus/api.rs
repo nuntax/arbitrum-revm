@@ -20,8 +20,14 @@ use arbutil::evm::{
     req::RequestHandler,
 };
 use revm::{
-    context_interface::{ContextTr, JournalTr, context::SStoreResult},
-    primitives::{Address, Bytes, Log, LogData, U256},
+    context_interface::{Cfg, ContextTr, JournalTr, context::SStoreResult},
+    primitives::{Address, Bytes, Log, LogData, U256, hardfork::SpecId},
+};
+
+use crate::{
+    chain::ArbChainContext,
+    storage::ArbosState,
+    stylus::{gas::stylus_call_cost, params::StylusParams},
 };
 
 /// Services one hostio request against the captured EVM context.
@@ -53,10 +59,9 @@ impl RequestHandler<VecReader> for StylusHandler {
     }
 }
 
-// EIP-2929 storage/account access costs. TODO(parity): these are the static EIP-2929
-// values; SSTORE in particular needs the full EIP-2200/3529 transition cost (against the
-// slot's original/current value). Will be tuned exactly against the witness root once
-// execution is wired up, revm 36 no longer exposes standalone `sstore_cost`/`sload_cost`.
+// EIP-2929 storage/account access costs. SSTORE charging is computed from the full
+// EIP-2200 transition below, and its EIP-2200/3529 refund is recorded separately through
+// revm's versioned gas parameters.
 const COLD_SLOAD_COST: u64 = 2100;
 const WARM_STORAGE_READ_COST: u64 = 100;
 const COLD_ACCOUNT_ACCESS_COST: u64 = 2600;
@@ -109,7 +114,7 @@ pub fn handle_request<CTX>(
     req_data: Vec<u8>,
 ) -> (Vec<u8>, VecReader, ArbGas)
 where
-    CTX: ContextTr<Journal: JournalTr>,
+    CTX: ContextTr<Chain = ArbChainContext, Journal: JournalTr>,
 {
     let debug = std::env::var("STYLUS_GAS_DEBUG").is_ok();
     // A valid Stylus program always sends correctly-sized hostio requests. Guard the decoders
@@ -144,6 +149,15 @@ where
                 let value = word(&req_data[off + 32..]);
                 off += 64;
                 if let Ok(load) = ctx.journal_mut().sstore(contract, key, value) {
+                    // The direct storage hostio bypasses revm's SSTORE instruction, which
+                    // normally journals this refund. Preserve the full signed transition
+                    // refund so clears and same-transaction restores agree with Nitro's StateDB.
+                    let eth_spec: SpecId = ctx.cfg().spec().into();
+                    let refund = ctx.cfg().gas_params().sstore_refund(
+                        eth_spec.is_enabled_in(SpecId::ISTANBUL),
+                        &load.data,
+                    );
+                    ctx.chain_mut().stylus_refund += refund;
                     total += sstore_cost(&load.data, load.is_cold);
                 }
             }
@@ -223,7 +237,34 @@ where
             (code_hash.0.to_vec(), empty_reader(), ArbGas(gas))
         }
 
-        // Not yet wired: account_code (returns code via the reader), add_pages, capture, and
+        // `pay_for_memory_grow`: the WASM grew its memory beyond the program footprint. Mirrors
+        // Nitro's `addPages` (api.go): bump the tx page counters first, then charge the memory
+        // model's cost computed against the OLD open/ever values. The page-limit penalty branch
+        // is node-config-gated off-chain behavior and does not apply to consensus execution.
+        EvmApiMethod::AddPages if req_data.len() < 2 => malformed(),
+        EvmApiMethod::AddPages => {
+            let pages = u16::from_be_bytes(req_data[..2].try_into().unwrap());
+            let Ok(params_word) = ArbosState::open().programs.read_params_word(ctx.journal_mut())
+            else {
+                return (Vec::new(), empty_reader(), ArbGas(0));
+            };
+            let params = StylusParams::from_word(&params_word);
+            let old_open = ctx.chain().stylus_pages_open;
+            let old_ever = ctx.chain().stylus_pages_ever;
+            let cost = stylus_call_cost(
+                pages,
+                old_open,
+                old_ever,
+                params.free_pages,
+                params.page_gas,
+            );
+            let new_open = old_open.saturating_add(pages);
+            ctx.chain_mut().stylus_pages_open = new_open;
+            ctx.chain_mut().stylus_pages_ever = old_ever.max(new_open);
+            (Vec::new(), empty_reader(), ArbGas(cost))
+        }
+
+        // Not yet wired: account_code (returns code via the reader), capture, and
         // the call/create family (handled by the executor's frame re-entry). TODO(stage 2).
         _ => (Vec::new(), empty_reader(), ArbGas(0)),
     };

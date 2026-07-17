@@ -14,10 +14,10 @@ use revm::{
     },
     inspector::{InspectorEvmTr, JournalExt},
     interpreter::{
-        Host, Instruction, InstructionContext, InstructionExecResult, InstructionResult,
-        InterpreterResult, interpreter::EthInterpreter,
+        CallScheme, FrameInput, Host, Instruction, InstructionContext, InstructionExecResult,
+        InstructionResult, InterpreterResult, interpreter::EthInterpreter,
     },
-    primitives::{B256, U256},
+    primitives::{Address, B256, U256},
 };
 
 /// Arbitrum `NUMBER` opcode: returns the L1 block number, not the L2 block number.
@@ -189,7 +189,26 @@ where
         ItemOrResult<&mut Self::Frame, <Self::Frame as FrameTr>::FrameResult>,
         ContextError<<<Self::Context as ContextTr>::Db as Database>::Error>,
     > {
-        self.0.frame_init(frame_input)
+        // Track per-address open call-frame spans for the Stylus `reentrant` flag (Nitro
+        // `TxProcessor.PushContract`). Only count when a frame is actually pushed (`Item`);
+        // fast-path results (precompiles, failed pre-checks) never open a geth contract frame.
+        let span = span_address(&frame_input.frame_input);
+        match self.0.frame_init(frame_input)? {
+            ItemOrResult::Item(_) => {}
+            ItemOrResult::Result(result) => return Ok(ItemOrResult::Result(result)),
+        }
+        if let Some(address) = span {
+            *self
+                .0
+                .ctx
+                .chain_mut()
+                .stylus_program_spans
+                .entry(address)
+                .or_insert(0) += 1;
+        }
+        // The pushed frame is the top of the stack, which is exactly what the inner
+        // `frame_init` returned for the `Item` case.
+        Ok(ItemOrResult::Item(self.0.frame_stack.get()))
     }
 
     fn frame_run(
@@ -230,6 +249,40 @@ where
         Option<<Self::Frame as FrameTr>::FrameResult>,
         ContextError<<<Self::Context as ContextTr>::Db as Database>::Error>,
     > {
+        // The inner call pops the top frame iff it is finished (Nitro `PopContract`);
+        // close its span first. Fast-path results arriving here belong to inits that never
+        // pushed a frame - then the top frame is the still-running parent (not finished).
+        let span = {
+            let frame = self.0.frame_stack.get();
+            if frame.is_finished() {
+                span_address(&frame.input)
+            } else {
+                None
+            }
+        };
+        if let Some(address) = span
+            && let Some(count) = self.0.ctx.chain_mut().stylus_program_spans.get_mut(&address)
+        {
+            *count = count.saturating_sub(1);
+        }
         self.0.frame_return_result(result)
+    }
+}
+
+/// The acting address whose context span a new frame opens, per Nitro's `PushContract`:
+/// non-delegate call frames act as their target address; DELEGATECALL/CALLCODE frames act as
+/// the parent's already-open address and are not counted; create frames are exempt (see
+/// [`ArbChainContext::stylus_program_spans`]).
+fn span_address(input: &FrameInput) -> Option<Address> {
+    match input {
+        FrameInput::Call(call)
+            if !matches!(
+                call.scheme,
+                CallScheme::DelegateCall | CallScheme::CallCode
+            ) =>
+        {
+            Some(call.target_address)
+        }
+        _ => None,
     }
 }
