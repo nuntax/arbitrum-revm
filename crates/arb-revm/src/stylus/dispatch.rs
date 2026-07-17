@@ -185,10 +185,11 @@ where
         // Build the hostio bridge capturing the whole EVM (so call/create hostios can re-enter
         // sub-frames), then run the WASM synchronously.
         let evm_api = self.build_stylus_api(target, caller, is_static);
-        // Isolate this Stylus frame's EVM-sub-call refunds: reset the accumulator before the run
-        // and restore the parent's afterward, so nested Stylus frames don't double-count.
-        let saved_refund = self.0.ctx.chain().stylus_sub_refund;
-        self.0.ctx.chain_mut().stylus_sub_refund = 0;
+        // Isolate this Stylus frame's direct-storage and EVM-sub-call refunds: reset the
+        // accumulator before the run and restore the parent's afterward, so nested Stylus
+        // frames don't double-count.
+        let saved_refund = self.0.ctx.chain().stylus_refund;
+        self.0.ctx.chain_mut().stylus_refund = 0;
         let mut result = run_program(
             &serialized,
             compile_config,
@@ -198,16 +199,16 @@ where
             &calldata,
             gas,
         );
-        // Fold the refunds accrued by this frame's call/create hostios onto the result gas so they
-        // reach the tx (revm's `frame_return` does this for ordinary frames, but the Stylus hostio
-        // ran its sub-frames out-of-band via `run_exec_loop`). Then restore the parent accumulator.
-        let frame_sub_refund = self.0.ctx.chain().stylus_sub_refund;
-        self.0.ctx.chain_mut().stylus_sub_refund = saved_refund;
+        // Fold this frame's hostio refunds onto the result gas so they reach the transaction.
+        // `frame_return` does this for ordinary frames, but Stylus direct storage and hostio
+        // sub-frames run outside that path. Then restore the parent accumulator.
+        let frame_refund = self.0.ctx.chain().stylus_refund;
+        self.0.ctx.chain_mut().stylus_refund = saved_refund;
         // Nitro keeps refunds in StateDB's journal, so reverting or halting the enclosing
         // Stylus call also reverts refunds produced by otherwise-successful EVM sub-calls.
         // Our out-of-band sub-frame accumulator is not journaled, so enforce that rollback here.
         if result.result.is_ok() {
-            result.gas.record_refund(frame_sub_refund);
+            result.gas.record_refund(frame_refund);
         }
         // Restore the open-pages high-water to its pre-call value (Nitro's deferred
         // SetStylusPagesOpen); the `ever` mark set during the run persists across the tx.
@@ -436,7 +437,7 @@ where
                 // it up so `frame_run_stylus` folds it onto the tx (refunds are applied at tx end,
                 // not deducted from the WASM ink budget).
                 if outcome.instruction_result().is_ok() {
-                    self.0.ctx.chain_mut().stylus_sub_refund += outcome.gas().refunded();
+                    self.0.ctx.chain_mut().stylus_refund += outcome.gas().refunded();
                 }
                 let call_cost = gas_limit.saturating_sub(outcome.gas().remaining());
                 return (
@@ -561,7 +562,7 @@ where
                 if let Some(address) = outcome.address {
                     gas.erase_cost(outcome.gas().remaining() + gas_stipend);
                     // Carry the create sub-frame's refund up to the tx (see handle_stylus_call).
-                    self.0.ctx.chain_mut().stylus_sub_refund += outcome.gas().refunded();
+                    self.0.ctx.chain_mut().stylus_refund += outcome.gas().refunded();
                     return (
                         [vec![0x01], address.to_vec()].concat(),
                         empty(),
