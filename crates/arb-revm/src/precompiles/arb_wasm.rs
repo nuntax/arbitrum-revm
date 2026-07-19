@@ -20,16 +20,20 @@ const MIN_CACHED_INIT_GAS_UNITS: u64 = 32;
 const COST_SCALAR_PERCENT_UNITS: u64 = 2;
 const ARBOS_VERSION_STYLUS: u64 = 30;
 const ARBOS_VERSION_STYLUS_CHARGING_FIXES: u64 = 32;
+/// Nitro charges this once when `Programs.Params()` reads the packed Stylus parameter word.
+const PARAMS_WARM_READ_GAS: u64 = 100;
+/// Nitro's ArbOS storage abstraction charges the pre-EIP-2929 SLOAD price for a program record.
+const PROGRAM_READ_GAS: u64 = 800;
 
 /// Fixed up-front computation burn ArbWasm.ActivateProgram charges (Nitro `ArbWasm.go`).
 #[cfg(feature = "stylus")]
 const ACTIVATION_FIXED_GAS: u64 = 1_659_168;
 /// ArbOS-storage + warm-read gas Nitro's `ActivateProgram` burns through the programs burner for a
-/// fresh, classic (pre-v60), non-cached program at ArbOS 30-59: Params warm-read (100) + getProgram
-/// read (800) + dataPricer 5 reads (4000) + NetworkFeeAccount read (800) + 4 writes at 20000 each
-/// (moduleHash, demand, lastUpdateTime, program).
+/// fresh, classic (pre-v60), non-cached program at ArbOS 30-59: getProgram read (800) + dataPricer
+/// 5 reads (4000) + NetworkFeeAccount read (800) + 4 writes at 20000 each (moduleHash, demand,
+/// lastUpdateTime, program). The shared Params warm-read is charged by `run_arb_wasm`.
 #[cfg(feature = "stylus")]
-const ACTIVATION_STORAGE_GAS: u64 = 100 + 800 + 4_000 + 800 + 4 * 20_000;
+const ACTIVATION_STORAGE_GAS: u64 = 800 + 4_000 + 800 + 4 * 20_000;
 /// `ProgramActivated(bytes32,bytes32,address,uint256,uint16)` event signature.
 #[cfg(feature = "stylus")]
 const PROGRAM_ACTIVATED_EVENT_SIGNATURE: &[u8] =
@@ -74,7 +78,7 @@ where
         }
     };
 
-    match call {
+    let result = match call {
         ArbWasm::ArbWasmCalls::stylusVersion(_) => {
             let v = unpack_uint(&word, layout::VERSION.0, layout::VERSION.1) as u16;
             ok_result(gas_limit, alloy_core::sol_types::SolValue::abi_encode(&(v,)))
@@ -107,24 +111,25 @@ where
         }
         ArbWasm::ArbWasmCalls::minInitGas(_) => {
             if arbos_version < ARBOS_VERSION_STYLUS_CHARGING_FIXES {
-                return revert_result(
+                revert_result(
                     gas_limit,
                     "ArbWasm: minInitGas unavailable before charging fixes",
-                );
+                )
+            } else {
+                let gas_units =
+                    unpack_uint(&word, layout::MIN_INIT_GAS.0, layout::MIN_INIT_GAS.1) as u64;
+                let cached_units = unpack_uint(
+                    &word,
+                    layout::MIN_CACHED_INIT_GAS.0,
+                    layout::MIN_CACHED_INIT_GAS.1,
+                ) as u64;
+                let gas = gas_units.saturating_mul(MIN_INIT_GAS_UNITS);
+                let cached = cached_units.saturating_mul(MIN_CACHED_INIT_GAS_UNITS);
+                ok_result(
+                    gas_limit,
+                    alloy_core::sol_types::SolValue::abi_encode(&(gas, cached)),
+                )
             }
-            let gas_units =
-                unpack_uint(&word, layout::MIN_INIT_GAS.0, layout::MIN_INIT_GAS.1) as u64;
-            let cached_units = unpack_uint(
-                &word,
-                layout::MIN_CACHED_INIT_GAS.0,
-                layout::MIN_CACHED_INIT_GAS.1,
-            ) as u64;
-            let gas = gas_units.saturating_mul(MIN_INIT_GAS_UNITS);
-            let cached = cached_units.saturating_mul(MIN_CACHED_INIT_GAS_UNITS);
-            ok_result(
-                gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(gas, cached)),
-            )
         }
         ArbWasm::ArbWasmCalls::initCostScalar(_) => {
             let units =
@@ -145,6 +150,9 @@ where
                 unpack_uint(&word, layout::BLOCK_CACHE_SIZE.0, layout::BLOCK_CACHE_SIZE.1) as u16;
             ok_result(gas_limit, alloy_core::sol_types::SolValue::abi_encode(&(v,)))
         }
+        ArbWasm::ArbWasmCalls::codehashVersion(c) => {
+            codehash_version(ctx, gas_limit, &word, c.codehash)
+        }
         ArbWasm::ArbWasmCalls::activateProgram(_c) => {
             #[cfg(feature = "stylus")]
             {
@@ -156,8 +164,7 @@ where
                 revert_result(gas_limit, "ArbWasm: activation requires the stylus feature")
             }
         }
-        ArbWasm::ArbWasmCalls::codehashVersion(_)
-        | ArbWasm::ArbWasmCalls::codehashAsmSize(_)
+        ArbWasm::ArbWasmCalls::codehashAsmSize(_)
         | ArbWasm::ArbWasmCalls::programVersion(_)
         | ArbWasm::ArbWasmCalls::programInitGas(_)
         | ArbWasm::ArbWasmCalls::programMemoryFootprint(_)
@@ -166,7 +173,73 @@ where
             gas_limit,
             "ArbWasm: per-program queries not yet implemented",
         ),
+    };
+    charge_result(result, PARAMS_WARM_READ_GAS)
+}
+
+fn charge_result(mut result: InterpreterResult, cost: u64) -> InterpreterResult {
+    if !result.gas.record_regular_cost(cost) {
+        result.result = InstructionResult::OutOfGas;
+        result.output = Bytes::new();
     }
+    result
+}
+
+fn custom_error_result(gas_limit: u64, signature: &[u8], args: &[u8]) -> InterpreterResult {
+    let selector = keccak256(signature);
+    let mut output = Vec::with_capacity(4 + args.len());
+    output.extend_from_slice(&selector[..4]);
+    output.extend_from_slice(args);
+    InterpreterResult {
+        result: InstructionResult::Revert,
+        output: Bytes::from(output),
+        gas: Gas::new(gas_limit),
+    }
+}
+
+fn codehash_version<CTX>(
+    ctx: &mut CTX,
+    gas_limit: u64,
+    params_word: &[u8; 32],
+    code_hash: B256,
+) -> InterpreterResult
+where
+    CTX: ArbPrecompileCtx,
+{
+    let state = ArbosState::open();
+    let params_version = unpack_uint(params_word, layout::VERSION.0, layout::VERSION.1) as u16;
+    let program = match state.programs.read_program(code_hash, ctx.journal_mut()) {
+        Ok(program) => program,
+        Err(error) => {
+            return fatal_result(gas_limit, &format!("ArbWasm: program read error: {error}"));
+        }
+    };
+    let result = if program.version == 0 {
+        custom_error_result(gas_limit, b"ProgramNotActivated()", &[])
+    } else if program.version != params_version {
+        let args = alloy_core::sol_types::SolValue::abi_encode(&(program.version, params_version));
+        custom_error_result(gas_limit, b"ProgramNeedsUpgrade(uint16,uint16)", &args)
+    } else {
+        let activated_at = ARBITRUM_START_TIME
+            .saturating_add(u64::from(program.activated_at).saturating_mul(3600));
+        let age = ctx.block_timestamp().saturating_sub(activated_at);
+        let expiry_days = u64::from(unpack_uint(
+            params_word,
+            layout::EXPIRY_DAYS.0,
+            layout::EXPIRY_DAYS.1,
+        ));
+        let expiry = expiry_days.saturating_mul(24 * 60 * 60);
+        if age > expiry {
+            let args = alloy_core::sol_types::SolValue::abi_encode(&(age,));
+            custom_error_result(gas_limit, b"ProgramExpired(uint64)", &args)
+        } else {
+            ok_result(
+                gas_limit,
+                alloy_core::sol_types::SolValue::abi_encode(&(program.version,)),
+            )
+        }
+    };
+    charge_result(result, PROGRAM_READ_GAS)
 }
 
 /// `ArbWasm.activateProgram(address)`: compile+instrument the program's WASM, charge the activation

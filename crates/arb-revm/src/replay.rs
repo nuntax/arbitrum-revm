@@ -355,6 +355,8 @@ pub fn replay_fixture(fixture: &ReplayFixture) -> ReplayReport {
         .with_chain_id(fixture.chain_id)
         .with_disable_priority_fee_check(true);
     cfg_env.disable_balance_check = true;
+    // Match production's Stylus bytecode handling. Valid Stylus program code begins with 0xEF.
+    cfg_env.disable_eip3541 = spec.is_enabled_in(ArbSpecId::ARBOS_30);
     // Nitro exempts Arbitrum from the EIP-7825 per-tx gas cap (Osaka / ArbOS 50+); match it.
     cfg_env.tx_gas_limit_cap = Some(u64::MAX);
 

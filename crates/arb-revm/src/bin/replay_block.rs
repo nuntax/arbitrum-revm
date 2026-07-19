@@ -932,6 +932,9 @@ async fn main() -> Result<()> {
     cfg_env.disable_eip7623 = !arb_revm::ArbosState::open()
         .features
         .read_calldata_price_increase_db(&mut db);
+    // Match the current production arb-reth configuration. Stylus program bytecode starts with
+    // 0xEF, so its creation must bypass EIP-3541 from the Stylus ArbOS release onward.
+    cfg_env.disable_eip3541 = spec.is_enabled_in(ArbSpecId::ARBOS_30);
     // Nitro exempts Arbitrum from the EIP-7825 per-tx gas cap (Osaka / ArbOS 50+); match it.
     cfg_env.tx_gas_limit_cap = Some(u64::MAX);
 
