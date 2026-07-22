@@ -313,8 +313,10 @@ mod tests {
         );
         let mut node = Vec::new();
         leaf.encode(&mut node);
-        let mut header = Header::default();
-        header.state_root = keccak256(&node);
+        let header = Header {
+            state_root: keccak256(&node),
+            ..Default::default()
+        };
         let mut rlp = Vec::new();
         header.encode(&mut rlp);
         let witness = ExecutionWitnessPrestate {
