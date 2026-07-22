@@ -1,18 +1,19 @@
 use super::*;
 use crate::arb_journal::{ArbCall, ArbPrecompileCtx};
-use crate::storage::{stylus_param_layout as layout, unpack_uint};
+use crate::storage::{programs::ARBITRUM_START_TIME, stylus_param_layout as layout, unpack_uint};
 #[cfg(feature = "stylus")]
 use crate::{
     arb_journal::ArbJournal,
-    storage::programs::{ARBITRUM_START_TIME, ProgramInfo},
+    storage::programs::ProgramInfo,
     stylus::params::StylusParams,
     stylus::program::{stylus_activate, stylus_code},
 };
 use revm::interpreter::InterpreterResult;
+use revm::primitives::{B256, Bytes, keccak256};
 #[cfg(feature = "stylus")]
 use revm::{
     interpreter::{Gas, InstructionResult},
-    primitives::{B256, Bytes, Log, keccak256},
+    primitives::Log,
 };
 
 const MIN_INIT_GAS_UNITS: u64 = 128;
