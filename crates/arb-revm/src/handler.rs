@@ -16,15 +16,18 @@ use crate::{
 use revm::{
     context_interface::{
         Block, Cfg, ContextTr, JournalTr, Transaction,
+        journaled_state::JournalCheckpoint,
         journaled_state::account::JournaledAccountTr,
         result::{FromStringError, HaltReason, InvalidTransaction},
     },
     handler::{
-        EthFrame, EvmTr, FrameResult, Handler, MainnetHandler, evm::FrameTr, handler::EvmTrError,
+        EthFrame, EvmTr, FrameResult, Handler, MainnetHandler, evm::FrameTr,
+        execution::runtime_oog_unwind, handler::EvmTrError,
+        pre_execution::PreExecutionOutput,
     },
     inspector::{Inspector, InspectorEvmTr, InspectorHandler},
     interpreter::{
-        CallOutcome, Gas, InitialAndFloorGas, InstructionResult, InterpreterResult,
+        CallOutcome, Gas, GasTracker, InitialAndFloorGas, InstructionResult, InterpreterResult,
         interpreter::EthInterpreter, interpreter_action::FrameInit,
     },
     primitives::{Address, Bytes, U256, hardfork::SpecId, keccak256},
@@ -311,17 +314,7 @@ where
         }
         if is_retry_tx(evm) {
             self.validate_env(evm)?;
-            let init_and_floor = {
-                let ctx = evm.ctx();
-                let spec = ctx.cfg().spec().into();
-                revm::handler::validation::validate_initial_tx_gas(
-                    ctx.tx(),
-                    spec,
-                    ctx.cfg().is_eip7623_disabled(),
-                    ctx.cfg().is_amsterdam_eip8037_enabled(),
-                    ctx.cfg().tx_gas_limit_cap(),
-                )?
-            };
+            let init_and_floor = self.mainnet.validate_initial_tx_gas(evm)?;
             evm.ctx_mut().chain_mut().intrinsic_gas = init_and_floor.initial_total_gas();
             return Ok(init_and_floor);
         }
@@ -339,7 +332,9 @@ where
         {
             return Err(InvalidTransaction::GasPriceLessThanBasefee.into());
         }
-        let result = self.mainnet.validate(evm)?;
+        self.validate_env(evm)?;
+        let mut result = self.mainnet.validate_initial_tx_gas(evm)?;
+        self.validate_against_state_and_deduct_caller(evm, &mut result)?;
         // Store intrinsic gas for use in pre_execution (gas limit enforcement)
         // and reward_beneficiary (reconstructing Nitro's computeGas).
         evm.ctx_mut().chain_mut().intrinsic_gas = result.initial_total_gas();
@@ -411,8 +406,8 @@ where
     fn pre_execution(
         &self,
         evm: &mut Self::Evm,
-        init_and_floor_gas: &mut InitialAndFloorGas,
-    ) -> Result<u64, Self::Error> {
+        gas: &mut GasTracker,
+    ) -> Result<Option<PreExecutionOutput>, Self::Error> {
         let metrics_sampled =
             sample_handler_metrics(tx_type_metric_index(evm.ctx().tx().tx_type()));
         self.metrics_sampled.set(metrics_sampled);
@@ -442,12 +437,12 @@ where
                 U256::ZERO,
                 U256::ZERO,
             );
-            return Ok(0);
+            return Ok(Some(PreExecutionOutput {
+                eip7702_refund: 0,
+                checkpoint: evm.ctx_mut().journal_mut().checkpoint(),
+            }));
         }
 
-        // Run the standard pre-execution steps, but through this handler so our
-        // overridden validate_against_state_and_deduct_caller logic is applied.
-        self.validate_against_state_and_deduct_caller(evm, init_and_floor_gas)?;
         self.load_accounts(evm)?;
 
         // --- GasChargingHook (Nitro: tx_processor.go GasChargingHook) ---
@@ -578,22 +573,30 @@ where
         // A filtered transaction consumes all gas without executing or mutating its authorities.
         if is_filtered_post_start_tx(evm) {
             evm.ctx_mut().chain_mut().filtered_tx = true;
-            return Ok(0);
+            return Ok(Some(PreExecutionOutput {
+                eip7702_refund: 0,
+                checkpoint: evm.ctx_mut().journal_mut().checkpoint(),
+            }));
         }
 
-        let mainnet_cost = self.apply_eip7702_auth_list(evm, init_and_floor_gas)?;
+        let checkpoint = evm.ctx_mut().journal_mut().checkpoint();
+        let Some(mainnet_cost) = self.apply_eip7702_auth_list(evm, gas)? else {
+            evm.ctx_mut().journal_mut().checkpoint_revert(checkpoint);
+            return Ok(None);
+        };
 
-        // In revm, pre_execution's return value is interpreted as an EIP-7702 refund delta,
-        // not as pre-EVM gas burn. Nitro's poster/hold gas is instead enforced by reducing
-        // the first-frame gas limit in execution().
-        Ok(mainnet_cost)
+        Ok(Some(PreExecutionOutput {
+            eip7702_refund: mainnet_cost,
+            checkpoint,
+        }))
     }
 
     fn execution(
         &mut self,
         evm: &mut Self::Evm,
-        init_and_floor_gas: &InitialAndFloorGas,
-    ) -> Result<FrameResult, Self::Error> {
+        checkpoint: JournalCheckpoint,
+        gas: &mut GasTracker,
+    ) -> Result<Option<FrameResult>, Self::Error> {
         let _timer = arbos_phase_timer(
             evm,
             ArbOsPhase::Execution,
@@ -601,27 +604,31 @@ where
             self.metrics_sampled.get(),
         );
         if evm.ctx().chain().filtered_tx {
-            return Ok(filtered_tx_frame_result(evm.ctx().tx().gas_limit()));
+            evm.ctx_mut().journal_mut().checkpoint_commit();
+            return Ok(Some(filtered_tx_frame_result(evm.ctx().tx().gas_limit())));
         }
         if is_internal_tx(evm) {
             internal_tx::apply_internal_tx(evm.ctx_mut()).map_err(|msg| ERROR::from_string(msg))?;
-            return Ok(internal_success_frame_result());
+            evm.ctx_mut().journal_mut().checkpoint_commit();
+            return Ok(Some(internal_success_frame_result()));
         }
         if is_deposit_tx(evm) {
             let outcome = deposit_tx::apply_deposit_tx(evm.ctx_mut())
                 .map_err(|msg| ERROR::from_string(msg))?;
-            return Ok(match outcome {
+            evm.ctx_mut().journal_mut().checkpoint_commit();
+            return Ok(Some(match outcome {
                 // Normal deposit: success receipt.
                 deposit_tx::DepositOutcome::Applied => internal_success_frame_result(),
                 // Filtered deposit: Nitro records a failed tx (status 0, gasUsed 0) but keeps the
                 // redirected transfer (same shape as a funds-failed submit-retryable).
                 deposit_tx::DepositOutcome::Filtered => submit_retryable_failed_frame_result(0),
-            });
+            }));
         }
         if is_submit_retryable_tx(evm) {
             let outcome = submit_retryable_tx::apply_submit_retryable_tx(evm.ctx_mut())
                 .map_err(|msg| ERROR::from_string(msg))?;
-            return Ok(match outcome {
+            evm.ctx_mut().journal_mut().checkpoint_commit();
+            return Ok(Some(match outcome {
                 // Ticket created: success receipt. gasUsed is `usergas` only when the auto-redeem
                 // was scheduled, else 0 (Nitro `StartTxHook`); the outcome carries the value.
                 submit_retryable_tx::SubmitRetryableOutcome::Created { gas_used } => {
@@ -630,7 +637,7 @@ where
                 submit_retryable_tx::SubmitRetryableOutcome::Failed { gas_used } => {
                     submit_retryable_failed_frame_result(gas_used)
                 }
-            });
+            }));
         }
         if is_retry_tx(evm) {
             retry_tx::apply_retry_tx_pre_execution(evm.ctx_mut())
@@ -639,9 +646,10 @@ where
             // checks the retry envelope hash, consumes the remaining gas, and lets EndTxHook
             // restore the escrow because the retry failed.
             if is_filtered_post_start_tx(evm) {
-                return Ok(filtered_tx_frame_result(evm.ctx().tx().gas_limit()));
+                evm.ctx_mut().journal_mut().checkpoint_commit();
+                return Ok(Some(filtered_tx_frame_result(evm.ctx().tx().gas_limit())));
             }
-            return self.mainnet.execution(evm, init_and_floor_gas);
+            return self.mainnet.execution(evm, checkpoint, gas);
         }
 
         // Nitro charges poster gas before EVM compute starts, and caps the compute gas
@@ -657,8 +665,10 @@ where
                 ctx.chain().hold_gas,
             )
         };
-        let total_initial = init_and_floor_gas
-            .initial_total_gas()
+        let total_initial = evm
+            .ctx()
+            .chain()
+            .intrinsic_gas
             .saturating_add(poster_gas)
             .saturating_add(hold_gas);
         if total_initial > tx_gas_limit {
@@ -669,15 +679,21 @@ where
             .into());
         }
 
-        let first_frame_input =
-            self.mainnet
-                .first_frame_input(evm, tx_gas_limit.saturating_sub(total_initial), 0)?;
-        let mut frame_result = self.mainnet.run_exec_loop(evm, first_frame_input)?;
-        self.mainnet.last_frame_result(evm, 0, &mut frame_result)?;
+        let reserved = poster_gas.saturating_add(hold_gas);
+        if !gas.record_regular_cost(reserved) {
+            return Err(InvalidTransaction::CallGasCostMoreThanGasLimit {
+                initial_gas: total_initial,
+                gas_limit: tx_gas_limit,
+            }
+            .into());
+        }
+        let Some(mut frame_result) = self.mainnet.execution(evm, checkpoint, gas)? else {
+            return Ok(None);
+        };
         // Return the withheld cap gas: it bounded compute but is not part of gasUsed.
         // (frame gas.spent() = intrinsic + poster + hold + compute; this removes hold.)
         frame_result.gas_mut().erase_cost(hold_gas);
-        Ok(frame_result)
+        Ok(Some(frame_result))
     }
 
     fn validate_against_state_and_deduct_caller(
@@ -789,8 +805,8 @@ where
     fn last_frame_result(
         &mut self,
         evm: &mut Self::Evm,
-        original_reservoir: u64,
         frame_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
+        parent_gas: &mut GasTracker,
     ) -> Result<(), Self::Error> {
         let _timer = arbos_phase_timer(
             evm,
@@ -816,8 +832,7 @@ where
             }
             return Ok(());
         }
-        self.mainnet
-            .last_frame_result(evm, original_reservoir, frame_result)
+        self.mainnet.last_frame_result(evm, frame_result, parent_gas)
     }
 
     fn reimburse_caller(
@@ -864,7 +879,7 @@ where
         evm: &mut Self::Evm,
         frame_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
         eip7702_refund: i64,
-    ) {
+    ) -> Result<(), Self::Error> {
         let _timer = arbos_phase_timer(
             evm,
             ArbOsPhase::Refund,
@@ -893,6 +908,7 @@ where
         let max_refund = refundable_spent / max_refund_quotient;
         let current_refund = gas.refunded().max(0) as u64;
         gas.set_refund(current_refund.min(max_refund) as i64);
+        Ok(())
     }
 
     fn reward_beneficiary(
@@ -1335,8 +1351,9 @@ where
     fn inspect_execution(
         &mut self,
         evm: &mut Self::Evm,
-        init_and_floor_gas: &InitialAndFloorGas,
-    ) -> Result<FrameResult, Self::Error> {
+        checkpoint: JournalCheckpoint,
+        gas: &mut GasTracker,
+    ) -> Result<Option<FrameResult>, Self::Error> {
         let _timer = arbos_phase_timer(
             evm,
             ArbOsPhase::Execution,
@@ -1344,40 +1361,45 @@ where
             self.metrics_sampled.get(),
         );
         if evm.ctx().chain().filtered_tx {
-            return Ok(filtered_tx_frame_result(evm.ctx().tx().gas_limit()));
+            evm.ctx_mut().journal_mut().checkpoint_commit();
+            return Ok(Some(filtered_tx_frame_result(evm.ctx().tx().gas_limit())));
         }
         if is_internal_tx(evm) {
             internal_tx::apply_internal_tx(evm.ctx_mut()).map_err(|msg| ERROR::from_string(msg))?;
-            return Ok(internal_success_frame_result());
+            evm.ctx_mut().journal_mut().checkpoint_commit();
+            return Ok(Some(internal_success_frame_result()));
         }
         if is_deposit_tx(evm) {
             let outcome = deposit_tx::apply_deposit_tx(evm.ctx_mut())
                 .map_err(|msg| ERROR::from_string(msg))?;
-            return Ok(match outcome {
+            evm.ctx_mut().journal_mut().checkpoint_commit();
+            return Ok(Some(match outcome {
                 // Normal deposit: success receipt.
                 deposit_tx::DepositOutcome::Applied => internal_success_frame_result(),
                 // Filtered deposit: Nitro records a failed tx (status 0, gasUsed 0) but keeps the
                 // redirected transfer (same shape as a funds-failed submit-retryable).
                 deposit_tx::DepositOutcome::Filtered => submit_retryable_failed_frame_result(0),
-            });
+            }));
         }
         if is_submit_retryable_tx(evm) {
             let outcome = submit_retryable_tx::apply_submit_retryable_tx(evm.ctx_mut())
                 .map_err(|msg| ERROR::from_string(msg))?;
-            return Ok(match outcome {
+            evm.ctx_mut().journal_mut().checkpoint_commit();
+            return Ok(Some(match outcome {
                 submit_retryable_tx::SubmitRetryableOutcome::Created { gas_used } => {
                     submit_retryable_success_frame_result(gas_used)
                 }
                 submit_retryable_tx::SubmitRetryableOutcome::Failed { gas_used } => {
                     submit_retryable_failed_frame_result(gas_used)
                 }
-            });
+            }));
         }
         if is_retry_tx(evm) {
             retry_tx::apply_retry_tx_pre_execution(evm.ctx_mut())
                 .map_err(|msg| ERROR::from_string(msg))?;
             if is_filtered_post_start_tx(evm) {
-                return Ok(filtered_tx_frame_result(evm.ctx().tx().gas_limit()));
+                evm.ctx_mut().journal_mut().checkpoint_commit();
+                return Ok(Some(filtered_tx_frame_result(evm.ctx().tx().gas_limit())));
             }
         }
 
@@ -1391,8 +1413,10 @@ where
                 ctx.chain().hold_gas,
             )
         };
-        let total_initial = init_and_floor_gas
-            .initial_total_gas()
+        let total_initial = evm
+            .ctx()
+            .chain()
+            .intrinsic_gas
             .saturating_add(poster_gas)
             .saturating_add(hold_gas);
         if total_initial > tx_gas_limit {
@@ -1403,13 +1427,23 @@ where
             .into());
         }
 
-        let first_frame_input =
-            self.mainnet
-                .first_frame_input(evm, tx_gas_limit.saturating_sub(total_initial), 0)?;
+        let reserved = poster_gas.saturating_add(hold_gas);
+        if !gas.record_regular_cost(reserved) {
+            return Err(InvalidTransaction::CallGasCostMoreThanGasLimit {
+                initial_gas: total_initial,
+                gas_limit: tx_gas_limit,
+            }
+            .into());
+        }
+        let Some(first_frame_input) = self.mainnet.first_frame_input(evm, gas)? else {
+            runtime_oog_unwind(evm.ctx_mut(), checkpoint)?;
+            return Ok(None);
+        };
+        evm.ctx_mut().journal_mut().checkpoint_commit();
         let mut frame_result = self.inspect_run_exec_loop(evm, first_frame_input)?;
-        self.mainnet.last_frame_result(evm, 0, &mut frame_result)?;
+        self.mainnet.last_frame_result(evm, &mut frame_result, gas)?;
         frame_result.gas_mut().erase_cost(hold_gas);
-        Ok(frame_result)
+        Ok(Some(frame_result))
     }
 }
 
