@@ -1,4 +1,5 @@
 use crate::{
+    ArbSpecId,
     api::exec::ArbContextTr,
     constants::{ARB_RETRYABLE_TX_ADDRESS, ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE, ARBOS_STATE_ADDRESS},
     storage::{ArbosState, RETRYABLE_LIFETIME_SECONDS},
@@ -218,6 +219,11 @@ pub(crate) fn apply_submit_retryable_tx<CTX: ArbContextTr>(
         .map_err(|err| format!("[ARBITRUM] failed to mint retryable deposit value: {err}"))?;
 
     let arbos_state = ArbosState::open();
+    let arbos_version = arbos_state
+        .arbos_version
+        .get(journal)
+        .map_err(|err| format!("[ARBITRUM] failed to read ArbOS version: {err}"))?;
+    let spec = ArbSpecId::from_arbos_version(arbos_version);
     let network_fee_account = arbos_state
         .network_fee_account
         .get(journal)
@@ -379,7 +385,8 @@ pub(crate) fn apply_submit_retryable_tx<CTX: ArbContextTr>(
         .infra_fee_account
         .get(journal)
         .map_err(|err| format!("[ARBITRUM] failed to read infra fee account: {err}"))?;
-    if infra_fee_account != Address::ZERO {
+    // Retryable gas payments only gained the infrastructure-fee split in ArbOS 11.
+    if spec.is_enabled_in(ArbSpecId::ARBOS_11) && infra_fee_account != Address::ZERO {
         let min_base_fee = arbos_state
             .l2_pricing
             .min_base_fee_wei

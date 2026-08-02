@@ -1199,12 +1199,13 @@ where
         let single_gas_cost = effective_base_fee.saturating_mul(U256::from(gas_used));
         remaining_refund = remaining_refund.saturating_sub(single_gas_cost);
 
-        // Refund the unused gas. Nitro carves the infra share out of the gas bucket first, then
-        // refunds infra and network buckets separately, each via `refund()` (deposit cap +
-        // excess to `from`). Not pre-capped by the budget; `retry_fee_refund` applies the cap.
+        // Refund the unused gas. Starting with ArbOS 11, Nitro carves the infra share out of the
+        // gas bucket first, then refunds infra and network buckets separately, each via `refund()`
+        // (deposit cap + excess to `from`). Not pre-capped by the budget; `retry_fee_refund`
+        // applies the cap.
         let mut network_refund = effective_base_fee.saturating_mul(U256::from(gas_left));
 
-        if spec.is_enabled_in(ArbSpecId::ARBOS_5) && infra_account != Address::ZERO {
+        if spec.is_enabled_in(ArbSpecId::ARBOS_11) && infra_account != Address::ZERO {
             let infra_fee = min_base_fee.min(effective_base_fee);
             let infra_refund = infra_fee
                 .saturating_mul(U256::from(gas_left))
