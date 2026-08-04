@@ -186,27 +186,31 @@ impl ArbPrecompilesEnum {
         if method_gated {
             return gated_revert_result(gas_limit);
         }
-        // All manager methods are non-payable, and add/delete are writes. Nitro performs both
-        // checks before `makeContext`; the surrounding free-access wrapper still decides the
-        // final gas charge, but the inner mutation must never run.
-        if arb == ArbPrecompilesEnum::ArbFilteredTransactionsManager {
-            let sel = selector.expect("selector resolved past method gating");
-            if call.value != U256::ZERO || (call.is_static && filtered_manager_method_is_write(sel))
-            {
-                return gated_revert_result(gas_limit);
-            }
-        }
+        // These are Nitro's three generic `Precompile.Call` mutability checks. They execute
+        // before `makeContext`, so every rejection is an empty revert consuming the complete
+        // supplied gas budget. Keep them here rather than in individual precompile handlers:
+        // they apply uniformly to every selector, including otherwise inert explorer helpers.
+        let sel = selector.expect("selector resolved past method gating");
+        let purity = method_purity(arb, sel);
         // Nitro `precompile.go` Call: a non-pure (view/write/payable) method invoked where the
         // acting address is not the precompile itself, i.e. via DELEGATECALL or CALLCODE, reverts
         // consuming all gas (Nitro returns `gasLeft = 0` before makeContext). Pure methods touch
         // no state and stay callable this way. `bytecode_address` is always the precompile here
         // (it keyed this dispatch), so acting != bytecode means a delegate/code call.
         if call.acting_address != call.bytecode_address {
-            // `selector` is `Some`: the `None` case already returned via `method_gated`.
-            let sel = selector.expect("selector resolved past method gating");
-            if !method_is_pure(arb, sel) {
+            if purity != MethodPurity::Pure {
                 return gated_revert_result(gas_limit);
             }
+        }
+        // STATICCALL may execute pure and view methods, but must reject write and payable
+        // methods even if their body would later revert or be a no-op.
+        if call.is_static && matches!(purity, MethodPurity::Write | MethodPurity::Payable) {
+            return gated_revert_result(gas_limit);
+        }
+        // Value is accepted only by Solidity `payable` methods. This particular ordering mirrors
+        // Nitro: an invalid selector has already taken the all-gas method-gate path above.
+        if call.value != U256::ZERO && purity != MethodPurity::Payable {
+            return gated_revert_result(gas_limit);
         }
         let mut result = self.dispatch(ctx, call);
         // A genuine backend/storage fault is fatal: pass the sentinel through untouched (no gas
@@ -398,23 +402,142 @@ fn precompile_min_arbos_version(arb: ArbPrecompilesEnum) -> u64 {
     }
 }
 
+/// Nitro's per-method precompile mutability (`precompiles/precompile.go`'s `purity`).
+///
+/// This belongs beside version gating because the generic wrapper makes its delegate-call,
+/// static-call, value, and `OpenArbosState` decisions before dispatching a method body. Do not
+/// move these checks into individual handlers: an otherwise unimplemented or always-reverting
+/// method still has to obey its ABI mutability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MethodPurity {
+    Pure,
+    View,
+    Write,
+    Payable,
+}
+
+/// Mirrors the state mutability in Nitro's precompile ABI. Methods absent from an interface take
+/// the unknown-selector path in the body dispatcher, so their fallback value is irrelevant after
+/// the method gate; `View` is the conservative default for implemented read-only selectors.
+fn method_purity(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> MethodPurity {
+    match arb {
+        ArbPrecompilesEnum::ArbSys => {
+            if sel == ArbSys::mapL1SenderContractAddressToL2AliasCall::SELECTOR {
+                MethodPurity::Pure
+            } else if sel == ArbSys::sendTxToL1Call::SELECTOR
+                || sel == ArbSys::withdrawEthCall::SELECTOR
+            {
+                MethodPurity::Payable
+            } else {
+                MethodPurity::View
+            }
+        }
+        ArbPrecompilesEnum::ArbAddressTable => {
+            if sel == ArbAddressTable::compressCall::SELECTOR
+                || sel == ArbAddressTable::registerCall::SELECTOR
+            {
+                MethodPurity::Write
+            } else {
+                MethodPurity::View
+            }
+        }
+        ArbPrecompilesEnum::ArbAggregator => {
+            if sel == ArbAggregator::addBatchPosterCall::SELECTOR
+                || sel == ArbAggregator::setFeeCollectorCall::SELECTOR
+                || sel == ArbAggregator::setTxBaseFeeCall::SELECTOR
+            {
+                MethodPurity::Write
+            } else {
+                MethodPurity::View
+            }
+        }
+        ArbPrecompilesEnum::ArbDebug => {
+            if sel == ArbDebug::customRevertCall::SELECTOR
+                || sel == ArbDebug::panicCall::SELECTOR
+                || sel == ArbDebug::legacyErrorCall::SELECTOR
+            {
+                MethodPurity::Pure
+            } else if sel == ArbDebug::eventsCall::SELECTOR {
+                MethodPurity::Payable
+            } else if sel == ArbDebug::becomeChainOwnerCall::SELECTOR
+                || sel == ArbDebug::overwriteContractCodeCall::SELECTOR
+            {
+                MethodPurity::Write
+            } else {
+                MethodPurity::View
+            }
+        }
+        ArbPrecompilesEnum::ArbFunctionTable => {
+            if sel == ArbFunctionTable::uploadCall::SELECTOR {
+                MethodPurity::Write
+            } else {
+                MethodPurity::View
+            }
+        }
+        // The local ArbOwner binding currently exposes the administrative mutation selectors.
+        // Nitro's OwnerPrecompile subsequently makes those calls free for the chain owner, but it
+        // still performs the common mutability checks first.
+        ArbPrecompilesEnum::ArbOwner => MethodPurity::Write,
+        ArbPrecompilesEnum::ArbOwnerPublic => {
+            if sel == ArbOwnerPublic::rectifyChainOwnerCall::SELECTOR {
+                MethodPurity::Write
+            } else {
+                MethodPurity::View
+            }
+        }
+        ArbPrecompilesEnum::ArbRetryableTx => {
+            if sel == ArbRetryableTx::redeemCall::SELECTOR
+                || sel == ArbRetryableTx::keepaliveCall::SELECTOR
+                || sel == ArbRetryableTx::cancelCall::SELECTOR
+                || sel == ArbRetryableTx::submitRetryableCall::SELECTOR
+            {
+                // `keepalive` is non-payable in Nitro's canonical ABI despite an older local
+                // binding having marked it payable. It must reject a nonzero call value.
+                MethodPurity::Write
+            } else {
+                MethodPurity::View
+            }
+        }
+        ArbPrecompilesEnum::ArbWasm => {
+            if sel == ArbWasm::activateProgramCall::SELECTOR
+                || sel == ArbWasm::codehashKeepaliveCall::SELECTOR
+            {
+                MethodPurity::Payable
+            } else {
+                MethodPurity::View
+            }
+        }
+        ArbPrecompilesEnum::ArbWasmCache => {
+            if sel == ArbWasmCache::cacheProgramCall::SELECTOR
+                || sel == ArbWasmCache::evictCodehashCall::SELECTOR
+            {
+                MethodPurity::Write
+            } else {
+                MethodPurity::View
+            }
+        }
+        ArbPrecompilesEnum::ArbNativeTokenManager => MethodPurity::Write,
+        ArbPrecompilesEnum::ArbFilteredTransactionsManager => {
+            if filtered_manager_method_is_write(sel) {
+                MethodPurity::Write
+            } else {
+                MethodPurity::View
+            }
+        }
+        ArbPrecompilesEnum::ArbBls
+        | ArbPrecompilesEnum::ArbInfo
+        | ArbPrecompilesEnum::ArbGasInfo
+        | ArbPrecompilesEnum::ArbStatistics => MethodPurity::View,
+    }
+}
+
 /// Whether an ArbOS precompile method is declared `pure` (Solidity `stateMutability`), mirroring
 /// Nitro's `method.purity == pure`. Pure methods touch no ArbOS state: they skip the
 /// `OpenArbosState` read (Nitro `context.go` makeContext, `purity != pure`) and stay callable via
 /// DELEGATECALL/CALLCODE (Nitro `precompile.go` Call only rejects `purity >= view` there).
-/// Everything not listed here is view/write/payable. These are the only `pure` methods across the
-/// ArbOS precompiles we implement.
+#[inline]
 fn method_is_pure(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> bool {
-    match arb {
-        ArbPrecompilesEnum::ArbSys => {
-            sel == ArbSys::mapL1SenderContractAddressToL2AliasCall::SELECTOR
-        }
-        ArbPrecompilesEnum::ArbDebug => {
-            sel == ArbDebug::customRevertCall::SELECTOR
-                || sel == ArbDebug::legacyErrorCall::SELECTOR
-        }
-        _ => false,
-    }
+    method_purity(arb, sel) == MethodPurity::Pure
 }
 
 /// `(minArbosVersion, maxArbosVersion)` for a precompile method (max 0 = no upper bound). A call
@@ -673,10 +796,12 @@ mod gating_tests {
     // Note: do NOT `use ArbPrecompilesEnum::*` here, the variant names (ArbGasInfo, ArbOwner, …)
     // would shadow the sol-interface modules of the same name and break `Module::methodCall::SELECTOR`.
     use super::{
-        ARB_RETRYABLE_TX, ArbDebug, ArbGasInfo, ArbOwner, ArbOwnerPublic, ArbRetryableTx, ArbSys,
+        ArbAddressTable, ArbAggregator, ArbDebug, ArbFunctionTable, ArbGasInfo, ArbOwner,
+        ArbOwnerPublic, ArbRetryableTx, ArbSys, ArbWasm, ARB_RETRYABLE_TX,
     };
     use super::{
-        ArbPrecompilesEnum as E, method_arbos_bounds, method_is_pure, precompile_min_arbos_version,
+        ArbPrecompilesEnum as E, MethodPurity, method_arbos_bounds, method_is_pure,
+        method_purity, precompile_min_arbos_version,
     };
     use crate::{
         api::default_ctx::{ArbContext, DefaultArb},
@@ -830,6 +955,45 @@ mod gating_tests {
     }
 
     #[test]
+    fn method_mutability_matches_nitro_precompile_abi() {
+        // Nitro `precompiles/precompile.go` uses this ABI metadata for its three common wrapper
+        // checks. Exercise every non-default category, including old precompile methods which
+        // are easy to overlook because their body is inert or always reverts.
+        assert_eq!(
+            method_purity(E::ArbSys, ArbSys::sendTxToL1Call::SELECTOR),
+            MethodPurity::Payable
+        );
+        assert_eq!(
+            method_purity(E::ArbSys, ArbSys::withdrawEthCall::SELECTOR),
+            MethodPurity::Payable
+        );
+        assert_eq!(
+            method_purity(E::ArbWasm, ArbWasm::activateProgramCall::SELECTOR),
+            MethodPurity::Payable
+        );
+        assert_eq!(
+            method_purity(E::ArbDebug, ArbDebug::eventsCall::SELECTOR),
+            MethodPurity::Payable
+        );
+        assert_eq!(
+            method_purity(E::ArbAddressTable, ArbAddressTable::compressCall::SELECTOR),
+            MethodPurity::Write
+        );
+        assert_eq!(
+            method_purity(E::ArbAggregator, ArbAggregator::addBatchPosterCall::SELECTOR),
+            MethodPurity::Write
+        );
+        assert_eq!(
+            method_purity(E::ArbFunctionTable, ArbFunctionTable::uploadCall::SELECTOR),
+            MethodPurity::Write
+        );
+        assert_eq!(
+            method_purity(E::ArbRetryableTx, ArbRetryableTx::keepaliveCall::SELECTOR),
+            MethodPurity::Write
+        );
+    }
+
+    #[test]
     fn submit_retryable_is_recognized_and_returns_not_callable() {
         let input = ArbRetryableTx::submitRetryableCall {
             requestId: B256::ZERO,
@@ -865,5 +1029,35 @@ mod gating_tests {
         );
         // 800 for OpenArbosState + 3 * 12 argument words + 3 * 1 error-output word.
         assert_eq!(result.gas.total_gas_spent(), 839);
+
+        // Arbitrum One block 71,743,403 tx 0x9e43…1ff7 calls this explorer-only method with
+        // 2 wei. Nitro rejects that at the generic non-payable wrapper check, before the handler
+        // can produce NotCallable(). Its receipt consumes the full 50,000 gas and has no output.
+        assert_eq!(
+            method_purity(
+                E::ArbRetryableTx,
+                ArbRetryableTx::submitRetryableCall::SELECTOR
+            ),
+            MethodPurity::Write
+        );
+        let nonpayable_call = ArbCall {
+            value: U256::from(2),
+            ..call
+        };
+        let result = E::ArbRetryableTx.run_active_dispatch(&mut ctx, &nonpayable_call, 10);
+        assert_eq!(result.result, InstructionResult::Revert);
+        assert!(result.output.is_empty());
+        assert_eq!(result.gas.total_gas_spent(), 50_000);
+
+        // The same write method is also rejected by the generic STATICCALL check before it can
+        // enter its always-reverting handler.
+        let static_call = ArbCall {
+            is_static: true,
+            ..call
+        };
+        let result = E::ArbRetryableTx.run_active_dispatch(&mut ctx, &static_call, 10);
+        assert_eq!(result.result, InstructionResult::Revert);
+        assert!(result.output.is_empty());
+        assert_eq!(result.gas.total_gas_spent(), 50_000);
     }
 }
