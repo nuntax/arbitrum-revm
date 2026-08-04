@@ -281,3 +281,27 @@ pub fn compute_poster_info(
         poster_fee,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::tx_type_has_poster_costs;
+    use crate::constants::{
+        ARBITRUM_DEPOSIT_TX_TYPE, ARBITRUM_INTERNAL_TX_TYPE, ARBITRUM_RETRY_TX_TYPE,
+        ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE,
+    };
+
+    #[test]
+    fn protocol_transactions_never_have_l1_poster_costs() {
+        for tx_type in [
+            ARBITRUM_INTERNAL_TX_TYPE,
+            ARBITRUM_DEPOSIT_TX_TYPE,
+            ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE,
+            ARBITRUM_RETRY_TX_TYPE,
+        ] {
+            assert!(!tx_type_has_poster_costs(tx_type));
+        }
+        for tx_type in [0_u8, 1, 2, 3, 4] {
+            assert!(tx_type_has_poster_costs(tx_type));
+        }
+    }
+}

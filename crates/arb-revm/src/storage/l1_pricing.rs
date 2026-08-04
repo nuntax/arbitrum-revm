@@ -115,13 +115,24 @@ impl L1Pricing {
         };
 
         let mut last_update_time = self.last_update_time.get(journal)?;
-        if last_update_time == 0 && update_time > 0 {
-            last_update_time = update_time.saturating_sub(1);
-        }
-        if update_time > current_time || update_time < last_update_time {
-            return Err(eyre!(
-                "invalid ArbOS batch report timestamp: update_time={update_time} current_time={current_time} last_update_time={last_update_time}"
-            ));
+        if arbos_version < ARBOS_VERSION_WITH_LAST_SURPLUS {
+            // The pre-v2 implementation used a stricter upper bound and historically ignored an
+            // invalid timestamp instead of returning an error. Both details are consensus-visible.
+            if last_update_time == 0 && current_time > 0 {
+                last_update_time = update_time.wrapping_sub(1);
+            }
+            if update_time >= current_time || update_time < last_update_time {
+                return Ok(());
+            }
+        } else {
+            if last_update_time == 0 && update_time > 0 {
+                last_update_time = update_time.saturating_sub(1);
+            }
+            if update_time > current_time || update_time < last_update_time {
+                return Err(eyre!(
+                    "invalid ArbOS batch report timestamp: update_time={update_time} current_time={current_time} last_update_time={last_update_time}"
+                ));
+            }
         }
 
         let mut allocation_numerator = update_time.saturating_sub(last_update_time);
@@ -467,5 +478,299 @@ fn div_i256_like_go_bigint(dividend: I256, divisor: I256) -> I256 {
             .unwrap_or(quotient)
     } else {
         quotient
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use revm::{
+        context::journaled_state::account::JournaledAccountTr,
+        context_interface::{ContextTr, JournalTr},
+        database_interface::EmptyDB,
+        primitives::{Address, I256, U256},
+    };
+
+    use super::L1Pricing;
+    use crate::{
+        api::default_ctx::{ArbContext, DefaultArb},
+        arb_journal::ArbJournal,
+        constants::L1_PRICER_FUNDS_POOL_ADDRESS,
+        storage::StorageSpace,
+    };
+
+    const GWEI: u64 = 1_000_000_000;
+    const POSTER: Address = Address::with_last_byte(0x03);
+    const POSTER_PAY_TO: Address = Address::with_last_byte(0x04);
+    const REWARD_RECIPIENT: Address = Address::with_last_byte(0x89);
+
+    fn set_balance(ctx: &mut ArbContext<EmptyDB>, address: Address, balance: U256) {
+        let mut account = ctx.journal_mut().load_account_mut(address).unwrap();
+        account.data.set_balance(balance);
+        ctx.journal_mut().touch_account(address);
+    }
+
+    #[test]
+    fn reward_poster_and_pool_allocation_matches_nitro_vectors() {
+        struct Case {
+            unit_reward: u64,
+            units_per_second: u64,
+            funds_collected_per_second: u64,
+            funds_spent: u64,
+            amortization_cap_bips: u64,
+            expected_reward: u64,
+            expected_poster: u64,
+            expected_pool: u64,
+        }
+
+        let cases = [
+            Case {
+                unit_reward: 10,
+                units_per_second: 78,
+                funds_collected_per_second: 7_800,
+                funds_spent: 3_000,
+                amortization_cap_bips: u64::MAX,
+                expected_reward: 780,
+                expected_poster: 3_000,
+                expected_pool: 19_620,
+            },
+            Case {
+                unit_reward: 10,
+                units_per_second: 78,
+                funds_collected_per_second: 1_313,
+                funds_spent: 3_000,
+                amortization_cap_bips: u64::MAX,
+                expected_reward: 780,
+                expected_poster: 3_000,
+                expected_pool: 159,
+            },
+            Case {
+                unit_reward: 10,
+                units_per_second: 78,
+                funds_collected_per_second: 31,
+                funds_spent: 3_000,
+                amortization_cap_bips: u64::MAX,
+                expected_reward: 93,
+                expected_poster: 0,
+                expected_pool: 0,
+            },
+            Case {
+                unit_reward: 10,
+                units_per_second: 78,
+                funds_collected_per_second: 7_800,
+                funds_spent: 3_000,
+                amortization_cap_bips: 100,
+                expected_reward: 780,
+                expected_poster: 3_000,
+                expected_pool: 19_620,
+            },
+            Case {
+                unit_reward: 0,
+                units_per_second: 78,
+                funds_collected_per_second: 7_800 * GWEI,
+                funds_spent: 3_000 * GWEI,
+                amortization_cap_bips: 100,
+                expected_reward: 0,
+                expected_poster: 7_800_000_000,
+                expected_pool: 23_392_200_000_000,
+            },
+        ];
+
+        for case in cases {
+            let mut ctx = <ArbContext<EmptyDB> as DefaultArb>::arb();
+            let pricing = L1Pricing::open(&StorageSpace::arbos().open_subspace_with_key(0xa1));
+            let journal = ctx.journal_mut();
+            pricing
+                .per_unit_reward
+                .set(case.unit_reward, journal)
+                .unwrap();
+            pricing
+                .pay_rewards_to
+                .set(REWARD_RECIPIENT, journal)
+                .unwrap();
+            pricing
+                .amortized_cost_cap_bips
+                .set(case.amortization_cap_bips, journal)
+                .unwrap();
+            pricing
+                .units_since_update
+                .set(case.units_per_second * 3, journal)
+                .unwrap();
+            let collected = U256::from(case.funds_collected_per_second) * U256::from(3);
+            pricing.l1_fees_available.set(collected, journal).unwrap();
+            pricing
+                .batch_poster_table
+                .add_poster(POSTER, POSTER_PAY_TO, journal)
+                .unwrap();
+            set_balance(&mut ctx, L1_PRICER_FUNDS_POOL_ADDRESS, collected);
+
+            pricing
+                .update_for_batch_poster_spending(
+                    10,
+                    1,
+                    3,
+                    POSTER,
+                    U256::from(case.funds_spent),
+                    U256::from(10 * GWEI),
+                    ctx.journal_mut(),
+                )
+                .unwrap();
+
+            assert_eq!(
+                ctx.journal_mut().account_balance(REWARD_RECIPIENT).unwrap(),
+                U256::from(case.expected_reward)
+            );
+            assert_eq!(
+                ctx.journal_mut().account_balance(POSTER_PAY_TO).unwrap(),
+                U256::from(case.expected_poster)
+            );
+            assert_eq!(
+                ctx.journal_mut()
+                    .account_balance(L1_PRICER_FUNDS_POOL_ADDRESS)
+                    .unwrap(),
+                U256::from(case.expected_pool)
+            );
+            assert_eq!(
+                pricing.units_since_update.get(ctx.journal_mut()).unwrap(),
+                case.units_per_second * 2
+            );
+            assert_eq!(
+                pricing.l1_fees_available.get(ctx.journal_mut()).unwrap(),
+                U256::from(case.expected_pool)
+            );
+            assert_eq!(
+                pricing
+                    .funds_due_for_rewards
+                    .get(ctx.journal_mut())
+                    .unwrap(),
+                I256::from_raw(U256::from(
+                    case.unit_reward * case.units_per_second - case.expected_reward
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn pre_v2_invalid_batch_report_time_is_ignored_but_v2_plus_errors() {
+        let mut ctx = <ArbContext<EmptyDB> as DefaultArb>::arb();
+        let pricing = L1Pricing::open(&StorageSpace::arbos().open_subspace_with_key(0xa2));
+        pricing
+            .batch_poster_table
+            .add_poster(POSTER, POSTER, ctx.journal_mut())
+            .unwrap();
+        pricing.last_update_time.set(10, ctx.journal_mut()).unwrap();
+        pricing
+            .units_since_update
+            .set(99, ctx.journal_mut())
+            .unwrap();
+
+        pricing
+            .update_for_batch_poster_spending(
+                1,
+                9,
+                9,
+                POSTER,
+                U256::ONE,
+                U256::from(GWEI),
+                ctx.journal_mut(),
+            )
+            .unwrap();
+        assert_eq!(pricing.last_update_time.get(ctx.journal_mut()).unwrap(), 10);
+        assert_eq!(
+            pricing.units_since_update.get(ctx.journal_mut()).unwrap(),
+            99
+        );
+        assert_eq!(
+            pricing
+                .batch_poster_table
+                .open_poster_checked(POSTER, ctx.journal_mut(), false)
+                .unwrap()
+                .funds_due(ctx.journal_mut())
+                .unwrap(),
+            U256::ZERO
+        );
+
+        for version in [2, 3, 10] {
+            assert!(
+                pricing
+                    .update_for_batch_poster_spending(
+                        version,
+                        9,
+                        12,
+                        POSTER,
+                        U256::ONE,
+                        U256::from(GWEI),
+                        ctx.journal_mut(),
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn l1_price_equilibrates_up_down_and_constant_like_nitro() {
+        const EQUILIBRATION_UNITS: u64 = 16 * 10_000_000;
+
+        for (initial, equilibrium) in [
+            (1_000_000_000_u64, 5_000_000_000_u64),
+            (5_000_000_000_u64, 1_000_000_000_u64),
+            (2_000_000_000_u64, 2_000_000_000_u64),
+        ] {
+            let mut ctx = <ArbContext<EmptyDB> as DefaultArb>::arb();
+            let pricing = L1Pricing::open(&StorageSpace::arbos().open_subspace_with_key(0xa3));
+            pricing.per_unit_reward.set(0, ctx.journal_mut()).unwrap();
+            pricing
+                .price_per_unit
+                .set(U256::from(initial), ctx.journal_mut())
+                .unwrap();
+            pricing
+                .equilibration_units
+                .set(U256::from(EQUILIBRATION_UNITS), ctx.journal_mut())
+                .unwrap();
+            pricing.inertia.set(10, ctx.journal_mut()).unwrap();
+
+            for i in 0..10_u64 {
+                let old_units = pricing.units_since_update.get(ctx.journal_mut()).unwrap();
+                pricing
+                    .units_since_update
+                    .set(old_units + EQUILIBRATION_UNITS, ctx.journal_mut())
+                    .unwrap();
+                let current_price = pricing.price_per_unit.get(ctx.journal_mut()).unwrap();
+                let old_pool = ctx
+                    .journal_mut()
+                    .account_balance(L1_PRICER_FUNDS_POOL_ADDRESS)
+                    .unwrap();
+                set_balance(
+                    &mut ctx,
+                    L1_PRICER_FUNDS_POOL_ADDRESS,
+                    old_pool + current_price * U256::from(EQUILIBRATION_UNITS),
+                );
+                pricing
+                    .update_for_batch_poster_spending(
+                        3,
+                        10 * (i + 1),
+                        10 * (i + 1) + 5,
+                        POSTER,
+                        U256::from(equilibrium) * U256::from(EQUILIBRATION_UNITS),
+                        U256::from(equilibrium),
+                        ctx.journal_mut(),
+                    )
+                    .unwrap();
+            }
+
+            let actual: u64 = pricing
+                .price_per_unit
+                .get(ctx.journal_mut())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let expected_movement = equilibrium.abs_diff(initial);
+            let actual_movement = actual.abs_diff(initial);
+            assert_eq!(actual.cmp(&initial), equilibrium.cmp(&initial));
+            assert!(
+                u128::from(expected_movement) * 100 <= u128::from(actual_movement) * 101
+                    && u128::from(actual_movement) * 100 <= u128::from(expected_movement) * 101,
+                "initial={initial} equilibrium={equilibrium} actual={actual}"
+            );
+        }
     }
 }

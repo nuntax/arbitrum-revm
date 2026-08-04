@@ -730,4 +730,65 @@ mod tests {
         assert_eq!(exponents[5], 600);
         assert_eq!(exponents[usize::from(RESOURCE_KIND_SINGLE_DIM)], 0);
     }
+
+    #[test]
+    fn multi_gas_fees_commit_every_next_fee_to_current() {
+        let mut ctx = fresh();
+        let journal = ctx.journal_mut();
+        let fees = &ArbosState::open().l2_pricing.multi_gas_fees;
+
+        for kind in 0..NUM_RESOURCE_KINDS {
+            assert_eq!(
+                fees.next[kind].get(journal).unwrap(),
+                revm::primitives::U256::ZERO
+            );
+            assert_eq!(
+                fees.current[kind].get(journal).unwrap(),
+                revm::primitives::U256::ZERO
+            );
+            fees.next[kind]
+                .set(revm::primitives::U256::from(kind + 1), journal)
+                .unwrap();
+        }
+
+        fees.commit_next_to_current(journal).unwrap();
+
+        // Re-open the storage facade so the assertion does not depend on object identity.
+        let reopened = &ArbosState::open().l2_pricing.multi_gas_fees;
+        for kind in 0..NUM_RESOURCE_KINDS {
+            assert_eq!(
+                reopened.current[kind].get(journal).unwrap(),
+                revm::primitives::U256::from(kind + 1)
+            );
+        }
+    }
+
+    #[test]
+    fn gas_constraint_vector_clear_zeros_length_and_element_storage() {
+        let mut ctx = fresh();
+        let journal = ctx.journal_mut();
+        let pricing = &ArbosState::open().l2_pricing;
+
+        for i in 0..100_u64 {
+            pricing
+                .add_gas_constraint(i + 1, i + 2, i + 3, journal)
+                .unwrap();
+        }
+        assert_eq!(pricing.gas_constraints_len(journal).unwrap(), 100);
+        for i in 0..100_u64 {
+            let constraint = pricing.open_gas_constraint(i);
+            assert_eq!(constraint.target.get(journal).unwrap(), i + 1);
+            assert_eq!(constraint.adjustment_window.get(journal).unwrap(), i + 2);
+            assert_eq!(constraint.backlog.get(journal).unwrap(), i + 3);
+        }
+
+        pricing.clear_gas_constraints(journal).unwrap();
+        assert_eq!(pricing.gas_constraints_len(journal).unwrap(), 0);
+        for i in 0..100_u64 {
+            let constraint = pricing.open_gas_constraint(i);
+            assert_eq!(constraint.target.get(journal).unwrap(), 0);
+            assert_eq!(constraint.adjustment_window.get(journal).unwrap(), 0);
+            assert_eq!(constraint.backlog.get(journal).unwrap(), 0);
+        }
+    }
 }

@@ -175,12 +175,19 @@ where
             let current_timestamp: u64 = ctx.block_timestamp();
             let retryable = state.retryables.retryable(c.ticketId);
 
-            let exists = match retryable.exists(current_timestamp, ctx.journal_mut()) {
+            let arbos_version = match state.arbos_version.get(ctx.journal_mut()) {
+                Ok(version) => version,
+                Err(e) => {
+                    return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}"));
+                }
+            };
+
+            let exists = match retryable.exists(current_timestamp, arbos_version, ctx.journal_mut())
+            {
                 Ok(v) => v,
                 Err(e) => return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}")),
             };
             if !exists {
-                let arbos_version = state.arbos_version.get(ctx.journal_mut()).unwrap_or(0);
                 if arbos_version >= 3 {
                     let mut gas = Gas::new(gas_limit);
                     let _ = gas.record_regular_cost(REDEEM_NOT_FOUND_READ_BURNS);

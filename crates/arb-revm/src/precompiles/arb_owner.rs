@@ -107,7 +107,7 @@ where
             .is_member(c.owner, j)
         {
             Ok(true) => set_or_revert_event!(
-                state.chain_owners.remove(c.owner, j),
+                state.chain_owners.remove(c.owner, arbos_version, j),
                 "removeChainOwner",
                 arbos_version >= ARBOS_VERSION_OWNER_EVENTS,
                 "ChainOwnerRemoved(address)",
@@ -143,7 +143,7 @@ where
         ArbOwner::ArbOwnerCalls::removeNativeTokenOwner(c) => {
             match state.native_token_owners.is_member(c.owner, j) {
                 Ok(true) => set_or_revert_event!(
-                    state.native_token_owners.remove(c.owner, j),
+                    state.native_token_owners.remove(c.owner, arbos_version, j),
                     "removeNativeTokenOwner",
                     arbos_version >= ARBOS_VERSION_OWNER_EVENTS,
                     "NativeTokenOwnerRemoved(address)",
@@ -254,7 +254,9 @@ where
         ArbOwner::ArbOwnerCalls::removeTransactionFilterer(c) => {
             match state.transaction_filterers.is_member(c.filterer, j) {
                 Ok(true) => set_or_revert_event!(
-                    state.transaction_filterers.remove(c.filterer, j),
+                    state
+                        .transaction_filterers
+                        .remove(c.filterer, arbos_version, j),
                     "removeTransactionFilterer",
                     true,
                     "TransactionFiltererRemoved(address)",
@@ -760,7 +762,10 @@ where
         ArbOwner::ArbOwnerCalls::removeWasmCacheManager(c) => {
             match state.programs.cache_managers.is_member(c.manager, j) {
                 Ok(true) => set_or_revert!(
-                    state.programs.cache_managers.remove(c.manager, j),
+                    state
+                        .programs
+                        .cache_managers
+                        .remove(c.manager, arbos_version, j),
                     "removeWasmCacheManager"
                 ),
                 Ok(false) => revert_result(gas_limit, "ArbOwner: tried to remove non-manager"),
