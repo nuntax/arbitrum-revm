@@ -672,11 +672,22 @@ where
 mod gating_tests {
     // Note: do NOT `use ArbPrecompilesEnum::*` here, the variant names (ArbGasInfo, ArbOwner, …)
     // would shadow the sol-interface modules of the same name and break `Module::methodCall::SELECTOR`.
-    use super::{ArbDebug, ArbGasInfo, ArbOwner, ArbOwnerPublic, ArbSys};
+    use super::{
+        ARB_RETRYABLE_TX, ArbDebug, ArbGasInfo, ArbOwner, ArbOwnerPublic, ArbRetryableTx, ArbSys,
+    };
     use super::{
         ArbPrecompilesEnum as E, method_arbos_bounds, method_is_pure, precompile_min_arbos_version,
     };
-    use alloy_core::sol_types::SolCall;
+    use crate::{
+        api::default_ctx::{ArbContext, DefaultArb},
+        arb_journal::ArbCall,
+    };
+    use alloy_core::sol_types::{SolCall, SolError};
+    use revm::{
+        database_interface::EmptyDB,
+        interpreter::InstructionResult,
+        primitives::{Address, B256, Bytes, U256},
+    };
 
     #[test]
     fn precompile_level_gates() {
@@ -816,5 +827,43 @@ mod gating_tests {
             E::ArbGasInfo,
             ArbSys::mapL1SenderContractAddressToL2AliasCall::SELECTOR
         ));
+    }
+
+    #[test]
+    fn submit_retryable_is_recognized_and_returns_not_callable() {
+        let input = ArbRetryableTx::submitRetryableCall {
+            requestId: B256::ZERO,
+            l1BaseFee: U256::ZERO,
+            deposit: U256::ZERO,
+            callvalue: U256::ZERO,
+            gasFeeCap: U256::ZERO,
+            gasLimit: 0,
+            maxSubmissionFee: U256::ZERO,
+            feeRefundAddress: Address::ZERO,
+            beneficiary: Address::ZERO,
+            retryTo: Address::ZERO,
+            retryData: Bytes::new(),
+        }
+        .abi_encode();
+        let call = ArbCall {
+            input: &input,
+            gas_limit: 50_000,
+            caller: Address::ZERO,
+            value: U256::ZERO,
+            bytecode_address: ARB_RETRYABLE_TX,
+            acting_address: ARB_RETRYABLE_TX,
+            is_static: false,
+        };
+        let mut ctx = <ArbContext<EmptyDB> as DefaultArb>::arb();
+
+        let result = E::ArbRetryableTx.run_active_dispatch(&mut ctx, &call, 10);
+
+        assert_eq!(result.result, InstructionResult::Revert);
+        assert_eq!(
+            result.output.as_ref(),
+            ArbRetryableTx::NotCallable {}.abi_encode().as_slice()
+        );
+        // 800 for OpenArbosState + 3 * 12 argument words + 3 * 1 error-output word.
+        assert_eq!(result.gas.total_gas_spent(), 839);
     }
 }

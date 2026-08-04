@@ -1,5 +1,6 @@
 use super::*;
 use crate::arb_journal::{ArbCall, ArbJournal, ArbPrecompileCtx};
+use alloy_core::sol_types::SolError;
 use arbitrum_alloy_consensus::transactions::TxRetry;
 use revm::{
     interpreter::{Gas, InstructionResult, InterpreterResult},
@@ -119,6 +120,15 @@ where
                 alloy_core::sol_types::SolValue::abi_encode(&(Address::ZERO,)),
             )
         }
+        ArbRetryableTx::ArbRetryableTxCalls::submitRetryable(_) => InterpreterResult {
+            // This method exists only to represent retryable submissions to explorers. Nitro
+            // recognizes the selector, charges the normal non-pure precompile wrapper costs, and
+            // reverts with the custom `NotCallable()` error. It must not take the unknown-selector
+            // path, which consumes the call's entire gas supply.
+            result: InstructionResult::Revert,
+            gas: Gas::new(gas_limit),
+            output: Bytes::from(ArbRetryableTx::NotCallable {}.abi_encode()),
+        },
         ArbRetryableTx::ArbRetryableTxCalls::keepalive(c) => {
             let record = state.retryables.retryable(c.ticketId);
             let timeout = match record.timeout_with_windows(ctx.journal_mut()) {

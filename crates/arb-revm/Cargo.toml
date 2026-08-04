@@ -36,7 +36,7 @@ alloy-network-primitives = "2.0"
 url = "2.5"
 arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "83593650bf6d07d2255e8627c417a9236cd5d02b", features = ["k256"] }
 arbitrum-alloy-sequencer = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "83593650bf6d07d2255e8627c417a9236cd5d02b" }
-arbitrum-alloy-precompiles = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "83593650bf6d07d2255e8627c417a9236cd5d02b" }
+arbitrum-alloy-precompiles = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "c6f5b2784c72de46dbfc0dbffcc176c7921b9f2e" }
 arbitrum-alloy-rpc-types = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "83593650bf6d07d2255e8627c417a9236cd5d02b" }
 arbitrum-alloy-network = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "83593650bf6d07d2255e8627c417a9236cd5d02b" }
 # Brotli + the Stylus runtime (Nitro's forked wasmer + prover) are VENDORED under vendor/nitro so
