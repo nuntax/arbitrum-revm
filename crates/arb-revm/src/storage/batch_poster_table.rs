@@ -111,3 +111,57 @@ impl BatchPosterState<'_> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use revm::{
+        context_interface::ContextTr,
+        database_interface::EmptyDB,
+        primitives::{Address, U256, address},
+    };
+
+    use super::BatchPosterTable;
+    use crate::{
+        api::default_ctx::{ArbContext, DefaultArb},
+        storage::StorageSpace,
+    };
+
+    #[test]
+    fn poster_registration_and_total_funds_due_round_trip() {
+        const POSTER_1: Address = address!("0000000000000000000000000000000000010203");
+        const PAY_TO_1: Address = address!("0000000000000000000000000000000004050607");
+        const POSTER_2: Address = address!("0000000000000000000000000000000000020406");
+        const PAY_TO_2: Address = address!("00000000000000000000000000000000080a0c0e");
+
+        let mut ctx = <ArbContext<EmptyDB> as DefaultArb>::arb();
+        let table = BatchPosterTable::open(&StorageSpace::arbos().open_subspace_with_key(0xfd));
+        let journal = ctx.journal_mut();
+
+        assert!(
+            !table
+                .poster_address_set
+                .is_member(POSTER_1, journal)
+                .unwrap()
+        );
+        let poster1 = table.add_poster(POSTER_1, PAY_TO_1, journal).unwrap();
+        assert_eq!(poster1.pay_to(journal).unwrap(), PAY_TO_1);
+        assert_eq!(poster1.funds_due(journal).unwrap(), U256::ZERO);
+        assert!(
+            table
+                .poster_address_set
+                .is_member(POSTER_1, journal)
+                .unwrap()
+        );
+
+        let poster2 = table.add_poster(POSTER_2, PAY_TO_2, journal).unwrap();
+        poster1.set_pay_to(POSTER_2, journal).unwrap();
+        assert_eq!(poster1.pay_to(journal).unwrap(), POSTER_2);
+
+        poster1.set_funds_due(U256::from(13), journal).unwrap();
+        poster2.set_funds_due(U256::from(42), journal).unwrap();
+        assert_eq!(table.total_funds_due(journal).unwrap(), U256::from(55));
+
+        poster1.set_funds_due(U256::from(5), journal).unwrap();
+        assert_eq!(table.total_funds_due(journal).unwrap(), U256::from(47));
+    }
+}

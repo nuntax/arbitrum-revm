@@ -1,6 +1,8 @@
 use super::*;
-use crate::arb_journal::ArbPrecompileCtx;
+use crate::arb_journal::{ArbJournal, ArbPrecompileCtx, MeteredJournal};
 use crate::storage::{stylus_param_layout as layout, unpack_uint};
+use revm::interpreter::InstructionResult;
+use revm::primitives::{B256, Bytes, Log, keccak256};
 
 pub(super) fn run_arb_owner_public<CTX>(
     ctx: &mut CTX,
@@ -231,9 +233,94 @@ where
                 alloy_core::sol_types::SolValue::abi_encode(&(u16::from(max_fragments),)),
             )
         }
-        ArbOwnerPublic::ArbOwnerPublicCalls::rectifyChainOwner(_) => revert_result(
-            gas_limit,
-            "ArbOwnerPublic: rectifyChainOwner not yet implemented",
-        ),
+        ArbOwnerPublic::ArbOwnerPublicCalls::rectifyChainOwner(c) => {
+            let mut journal = MeteredJournal::new(ctx.journal_mut());
+            match state.chain_owners.rectify_mapping(c.account, &mut journal) {
+                Ok(()) => {
+                    let mut account_topic = [0_u8; 32];
+                    account_topic[12..].copy_from_slice(c.account.as_slice());
+                    journal.emit_log(Log::new_unchecked(
+                        ARB_OWNER_PUBLIC,
+                        vec![keccak256("ChainOwnerRectified(address)")],
+                        Bytes::copy_from_slice(B256::from(account_topic).as_slice()),
+                    ));
+                    let mut result = ok_result(gas_limit, vec![]);
+                    if !result.gas.record_regular_cost(journal.burned) {
+                        result.result = InstructionResult::OutOfGas;
+                        result.output = Bytes::new();
+                    }
+                    result
+                }
+                Err(e) => {
+                    let mut result = revert_result(
+                        gas_limit,
+                        &format!("ArbOwnerPublic: rectifyChainOwner error: {e}"),
+                    );
+                    if !result.gas.record_regular_cost(journal.burned) {
+                        result.result = InstructionResult::OutOfGas;
+                        result.output = Bytes::new();
+                    }
+                    result
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_core::sol_types::SolCall;
+    use arbitrum_alloy_precompiles::addresses::ARB_OWNER_PUBLIC;
+    use revm::{
+        context_interface::{ContextTr, JournalTr},
+        database_interface::EmptyDB,
+        interpreter::InstructionResult,
+        primitives::{Address, address, keccak256},
+    };
+
+    use super::{ArbOwnerPublic, run_arb_owner_public};
+    use crate::{
+        ArbosState,
+        api::default_ctx::{ArbContext, DefaultArb},
+    };
+
+    const OWNER_1: Address = address!("d345e41ae2cb00311956aa7109fc801ae8c81a52");
+    const OWNER_2: Address = address!("98e4db7e07e584f89a2f6043e7b7c89dc27769ed");
+    const OWNER_3: Address = address!("cf57572261c7c2bcf21ffd220ea7d1a27d40a827");
+
+    #[test]
+    fn rectify_chain_owner_repairs_history_and_emits_canonical_event() {
+        let mut ctx = <ArbContext<EmptyDB> as DefaultArb>::arb();
+        let owners = &ArbosState::open().chain_owners;
+        for owner in [OWNER_1, OWNER_2, OWNER_3] {
+            owners.add(owner, ctx.journal_mut()).unwrap();
+        }
+        owners.remove(OWNER_1, 10, ctx.journal_mut()).unwrap();
+        owners.remove(OWNER_2, 10, ctx.journal_mut()).unwrap();
+        owners.clear_list(ctx.journal_mut()).unwrap();
+
+        let input = ArbOwnerPublic::rectifyChainOwnerCall { account: OWNER_3 }.abi_encode();
+        let result = run_arb_owner_public(&mut ctx, &input, 100_000);
+
+        assert_eq!(result.result, InstructionResult::Return);
+        assert!(result.output.is_empty());
+        assert_eq!(result.gas.total_gas_spent(), 70_806);
+        assert_eq!(
+            owners.all_members(ctx.journal_mut()).unwrap(),
+            vec![OWNER_3]
+        );
+
+        let logs = ctx.journal_mut().logs();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].address, ARB_OWNER_PUBLIC);
+        assert_eq!(
+            logs[0].data.topics(),
+            &[keccak256("ChainOwnerRectified(address)")]
+        );
+        let mut expected_data = [0_u8; 32];
+        expected_data[12..].copy_from_slice(OWNER_3.as_slice());
+        assert_eq!(logs[0].data.data.as_ref(), expected_data);
+
+        assert_eq!(owners.size.get(ctx.journal_mut()).unwrap(), 1);
     }
 }

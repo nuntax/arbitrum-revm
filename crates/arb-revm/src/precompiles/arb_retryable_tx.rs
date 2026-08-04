@@ -1,5 +1,6 @@
 use super::*;
 use crate::arb_journal::{ArbCall, ArbJournal, ArbPrecompileCtx};
+use alloy_core::sol_types::SolError;
 use arbitrum_alloy_consensus::transactions::TxRetry;
 use revm::{
     interpreter::{Gas, InstructionResult, InterpreterResult},
@@ -119,6 +120,15 @@ where
                 alloy_core::sol_types::SolValue::abi_encode(&(Address::ZERO,)),
             )
         }
+        ArbRetryableTx::ArbRetryableTxCalls::submitRetryable(_) => InterpreterResult {
+            // This method exists only to represent retryable submissions to explorers. Nitro
+            // recognizes the selector, charges the normal non-pure precompile wrapper costs, and
+            // reverts with the custom `NotCallable()` error. It must not take the unknown-selector
+            // path, which consumes the call's entire gas supply.
+            result: InstructionResult::Revert,
+            gas: Gas::new(gas_limit),
+            output: Bytes::from(ArbRetryableTx::NotCallable {}.abi_encode()),
+        },
         ArbRetryableTx::ArbRetryableTxCalls::keepalive(c) => {
             let record = state.retryables.retryable(c.ticketId);
             let timeout = match record.timeout_with_windows(ctx.journal_mut()) {
@@ -175,12 +185,19 @@ where
             let current_timestamp: u64 = ctx.block_timestamp();
             let retryable = state.retryables.retryable(c.ticketId);
 
-            let exists = match retryable.exists(current_timestamp, ctx.journal_mut()) {
+            let arbos_version = match state.arbos_version.get(ctx.journal_mut()) {
+                Ok(version) => version,
+                Err(e) => {
+                    return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}"));
+                }
+            };
+
+            let exists = match retryable.exists(current_timestamp, arbos_version, ctx.journal_mut())
+            {
                 Ok(v) => v,
                 Err(e) => return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}")),
             };
             if !exists {
-                let arbos_version = state.arbos_version.get(ctx.journal_mut()).unwrap_or(0);
                 if arbos_version >= 3 {
                     let mut gas = Gas::new(gas_limit);
                     let _ = gas.record_regular_cost(REDEEM_NOT_FOUND_READ_BURNS);

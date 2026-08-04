@@ -73,11 +73,33 @@ where
                 Err(e) => revert_result(gas_limit, &format!("ArbAddressTable: error: {e}")),
             }
         }
-        ArbAddressTable::ArbAddressTableCalls::compress(_)
-        | ArbAddressTable::ArbAddressTableCalls::decompress(_) => revert_result(
-            gas_limit,
-            "ArbAddressTable: compress/decompress not yet implemented",
-        ),
+        ArbAddressTable::ArbAddressTableCalls::compress(c) => {
+            match state.address_table.compress(c.account, &mut journal) {
+                Ok(encoded) => ok_result(
+                    gas_limit,
+                    alloy_core::sol_types::SolValue::abi_encode(&(revm::primitives::Bytes::from(
+                        encoded,
+                    ),)),
+                ),
+                Err(e) => revert_result(gas_limit, &format!("ArbAddressTable: error: {e}")),
+            }
+        }
+        ArbAddressTable::ArbAddressTableCalls::decompress(c) => match usize::try_from(c.offset) {
+            Ok(offset) => match c.buf.get(offset..) {
+                Some(encoded) => match state.address_table.decompress(encoded, &mut journal) {
+                    Ok((address, consumed)) => ok_result(
+                        gas_limit,
+                        alloy_core::sol_types::SolValue::abi_encode(&(
+                            address,
+                            U256::from(consumed),
+                        )),
+                    ),
+                    Err(e) => revert_result(gas_limit, &format!("ArbAddressTable: error: {e}")),
+                },
+                None => revert_result(gas_limit, "ArbAddressTable: invalid offset"),
+            },
+            Err(_) => revert_result(gas_limit, "ArbAddressTable: invalid offset"),
+        },
     };
 
     // Fold the burner total into the call's gas (Nitro bills these per-op through the burner).
@@ -87,4 +109,133 @@ where
         result.output = revm::primitives::Bytes::new();
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_core::sol_types::{SolCall, SolValue};
+    use revm::{
+        database_interface::EmptyDB,
+        interpreter::InstructionResult,
+        primitives::{Address, Bytes, U256, address},
+    };
+
+    use super::{ArbAddressTable, run_arb_address_table};
+    use crate::api::default_ctx::{ArbContext, DefaultArb};
+
+    const ACCOUNT: Address = address!("c5d2460186f7233c927e7db2dcc703c0e500b653");
+
+    fn run(ctx: &mut ArbContext<EmptyDB>, input: Vec<u8>) -> revm::interpreter::InterpreterResult {
+        run_arb_address_table(ctx, &input, 100_000)
+    }
+
+    #[test]
+    fn dispatcher_covers_init_register_lookup_and_bounds() {
+        let mut ctx = <ArbContext<EmptyDB> as DefaultArb>::arb();
+
+        let size = run(&mut ctx, ArbAddressTable::sizeCall {}.abi_encode());
+        assert_eq!(size.result, InstructionResult::Return);
+        assert_eq!(<(U256,)>::abi_decode(&size.output).unwrap().0, U256::ZERO);
+        assert_eq!(size.gas.total_gas_spent(), 800);
+
+        let missing = run(
+            &mut ctx,
+            ArbAddressTable::lookupCall { account: ACCOUNT }.abi_encode(),
+        );
+        assert_eq!(missing.result, InstructionResult::Revert);
+        assert_eq!(missing.gas.total_gas_spent(), 800);
+
+        let registered = run(
+            &mut ctx,
+            ArbAddressTable::registerCall { account: ACCOUNT }.abi_encode(),
+        );
+        assert_eq!(registered.result, InstructionResult::Return);
+        assert_eq!(
+            <(U256,)>::abi_decode(&registered.output).unwrap().0,
+            U256::ZERO
+        );
+        assert_eq!(registered.gas.total_gas_spent(), 61_600);
+
+        let exists = run(
+            &mut ctx,
+            ArbAddressTable::addressExistsCall { account: ACCOUNT }.abi_encode(),
+        );
+        assert!(<(bool,)>::abi_decode(&exists.output).unwrap().0);
+        let by_index = run(
+            &mut ctx,
+            ArbAddressTable::lookupIndexCall { index: U256::ZERO }.abi_encode(),
+        );
+        assert_eq!(
+            <(Address,)>::abi_decode(&by_index.output).unwrap().0,
+            ACCOUNT
+        );
+        let out_of_bounds = run(
+            &mut ctx,
+            ArbAddressTable::lookupIndexCall { index: U256::ONE }.abi_encode(),
+        );
+        assert_eq!(out_of_bounds.result, InstructionResult::Revert);
+    }
+
+    #[test]
+    fn dispatcher_compresses_and_decompresses_with_offsets() {
+        let mut ctx = <ArbContext<EmptyDB> as DefaultArb>::arb();
+        let literal = run(
+            &mut ctx,
+            ArbAddressTable::compressCall { account: ACCOUNT }.abi_encode(),
+        );
+        let literal = <(Bytes,)>::abi_decode(&literal.output).unwrap().0;
+        assert_eq!(literal.len(), 21);
+
+        let decoded = run(
+            &mut ctx,
+            ArbAddressTable::decompressCall {
+                buf: literal.clone(),
+                offset: U256::ZERO,
+            }
+            .abi_encode(),
+        );
+        assert_eq!(
+            <(Address, U256)>::abi_decode(&decoded.output).unwrap(),
+            (ACCOUNT, U256::from(21))
+        );
+
+        run(
+            &mut ctx,
+            ArbAddressTable::registerCall { account: ACCOUNT }.abi_encode(),
+        );
+        let compressed = run(
+            &mut ctx,
+            ArbAddressTable::compressCall { account: ACCOUNT }.abi_encode(),
+        );
+        let compressed = <(Bytes,)>::abi_decode(&compressed.output).unwrap().0;
+        assert_eq!(compressed.as_ref(), &[0x80]);
+
+        let mut padded = vec![99];
+        padded.extend_from_slice(&compressed);
+        padded.push(33);
+        let decoded = run(
+            &mut ctx,
+            ArbAddressTable::decompressCall {
+                buf: Bytes::from(padded.clone()),
+                offset: U256::ONE,
+            }
+            .abi_encode(),
+        );
+        assert_eq!(
+            <(Address, U256)>::abi_decode(&decoded.output).unwrap(),
+            (ACCOUNT, U256::ONE)
+        );
+        assert_eq!(decoded.gas.total_gas_spent(), 1_600);
+
+        let invalid = run(
+            &mut ctx,
+            ArbAddressTable::decompressCall {
+                buf: Bytes::from(padded),
+                offset: U256::from(4),
+            }
+            .abi_encode(),
+        );
+        assert_eq!(invalid.result, InstructionResult::Revert);
+        assert_eq!(invalid.gas.total_gas_spent(), 0);
+    }
 }

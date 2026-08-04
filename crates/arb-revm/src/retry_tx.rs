@@ -35,9 +35,13 @@ pub(crate) fn apply_retry_tx_pre_execution<CTX: ArbContextTr>(ctx: &mut CTX) -> 
 
     let arbos_state = ArbosState::open();
     let journal = ctx.journal_mut();
+    let arbos_version = arbos_state
+        .arbos_version
+        .get(journal)
+        .map_err(|err| format!("[ARBITRUM] failed to read ArbOS version: {err}"))?;
     let retryable = arbos_state.retryables.retryable(ticket_id);
     let exists = retryable
-        .exists(current_timestamp, journal)
+        .exists(current_timestamp, arbos_version, journal)
         .map_err(|err| format!("[ARBITRUM] failed to read retryable existence: {err}"))?;
     if !exists {
         return Err(format!(

@@ -227,3 +227,66 @@ impl StorageBacked<I256> {
         self.slot.set_inner(U256::from(value), journal)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use revm::{
+        context_interface::ContextTr,
+        database_interface::EmptyDB,
+        primitives::{I256, U256},
+    };
+
+    use crate::{
+        api::default_ctx::{ArbContext, DefaultArb},
+        storage::StorageSpace,
+        util::i256_to_u256_twos_complement,
+    };
+
+    #[test]
+    fn signed_storage_matches_nitro_twos_complement_vectors() {
+        let mut ctx = <ArbContext<EmptyDB> as DefaultArb>::arb();
+        let value = StorageSpace::arbos().storage_backed::<I256>(0x7b);
+        let vectors = [
+            I256::ZERO,
+            I256::ONE,
+            I256::unchecked_from(33_i64),
+            I256::unchecked_from(31_591_083_i64),
+            I256::MINUS_ONE,
+            I256::unchecked_from(-33_i64),
+            I256::unchecked_from(-31_591_083_i64),
+            I256::MAX,
+            I256::MIN,
+        ];
+
+        for expected in vectors {
+            value.set_checked(expected, ctx.journal_mut()).unwrap();
+            assert_eq!(value.get(ctx.journal_mut()).unwrap(), expected);
+            assert_eq!(
+                *value.slot.get_inner(ctx.journal_mut()).unwrap(),
+                i256_to_u256_twos_complement(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn pre_arbos_7_signed_storage_writes_absolute_magnitude() {
+        let mut ctx = <ArbContext<EmptyDB> as DefaultArb>::arb();
+        let value = StorageSpace::arbos().storage_backed::<I256>(0x7c);
+
+        for expected in [
+            I256::unchecked_from(33_i64),
+            I256::unchecked_from(-33_i64),
+            I256::unchecked_from(-31_591_083_i64),
+        ] {
+            value.set_pre_version7(expected, ctx.journal_mut()).unwrap();
+            assert_eq!(
+                *value.slot.get_inner(ctx.journal_mut()).unwrap(),
+                U256::from(expected.unsigned_abs())
+            );
+            assert_eq!(
+                value.get(ctx.journal_mut()).unwrap(),
+                I256::from_raw(expected.unsigned_abs())
+            );
+        }
+    }
+}

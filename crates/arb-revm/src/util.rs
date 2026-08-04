@@ -25,24 +25,37 @@ pub fn inverse_remap_l1_address(aliased_address: Address) -> Result<Address> {
 }
 
 pub fn i256_to_u256_twos_complement(value: I256) -> U256 {
-    if value >= I256::ZERO {
-        U256::from(value)
-    } else {
-        let abs = (-value).unsigned_abs();
-        U256::ZERO.wrapping_sub(U256::from(abs))
-    }
+    value.into_raw()
 }
 
 pub fn u256_twos_complement_to_i256(value: U256) -> I256 {
-    let two_to_255 = U256::ONE << 255;
-    if value < two_to_255 {
-        I256::from(value)
-    } else {
-        let abs = U256::MAX - value + U256::ONE;
-        -I256::from(abs)
-    }
+    I256::from_raw(value)
 }
 
 fn fixed_bytes_to_u256<const N: usize>(bytes: FixedBytes<N>) -> U256 {
     U256::from_be_slice(bytes.as_slice())
+}
+
+#[cfg(test)]
+mod tests {
+    use revm::primitives::{Address, address};
+
+    use super::{inverse_remap_l1_address, remap_l1_address};
+
+    #[test]
+    fn l1_address_aliasing_round_trips_and_wraps_at_160_bits() {
+        for address in [
+            Address::ZERO,
+            Address::with_last_byte(1),
+            address!("1234567890abcdef1234567890abcdef12345678"),
+            Address::from([0xff; 20]),
+        ] {
+            let aliased = remap_l1_address(address).unwrap();
+            assert_eq!(inverse_remap_l1_address(aliased).unwrap(), address);
+        }
+        assert_eq!(
+            remap_l1_address(Address::ZERO).unwrap(),
+            address!("1111000000000000000000000000000000001111")
+        );
+    }
 }

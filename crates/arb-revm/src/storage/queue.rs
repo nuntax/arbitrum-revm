@@ -112,3 +112,53 @@ impl StorageQueue {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use revm::{
+        context_interface::ContextTr,
+        database_interface::EmptyDB,
+        primitives::{B256, U256},
+    };
+
+    use super::{QUEUE_INITIAL_OFFSET, StorageQueue};
+    use crate::{
+        api::default_ctx::{ArbContext, DefaultArb},
+        storage::StorageSpace,
+    };
+
+    #[test]
+    fn queue_round_trip_and_shift_clears_entries() {
+        let mut ctx = <ArbContext<EmptyDB> as DefaultArb>::arb();
+        let queue = StorageQueue::open(&StorageSpace::arbos().open_subspace_with_key(0xfe));
+        let journal = ctx.journal_mut();
+        queue.initialize(journal).unwrap();
+
+        assert!(queue.is_empty(journal).unwrap());
+        for value in 0_u64..150 {
+            queue
+                .put(
+                    B256::from(U256::from(value + 853_139_508).to_be_bytes()),
+                    journal,
+                )
+                .unwrap();
+        }
+        assert_eq!(queue.size(journal).unwrap(), 150);
+
+        for value in 0_u64..150 {
+            assert_eq!(
+                queue.get(journal).unwrap(),
+                Some(B256::from(U256::from(value + 853_139_508).to_be_bytes()))
+            );
+        }
+        assert!(queue.is_empty(journal).unwrap());
+        assert_eq!(queue.peek(journal).unwrap(), None);
+        assert!(queue.shift(journal).unwrap());
+        assert_eq!(queue.next_get(journal).unwrap(), QUEUE_INITIAL_OFFSET);
+        assert_eq!(queue.next_put(journal).unwrap(), QUEUE_INITIAL_OFFSET);
+
+        for offset in QUEUE_INITIAL_OFFSET..QUEUE_INITIAL_OFFSET + 150 {
+            assert_eq!(queue.get_entry(offset, journal).unwrap(), B256::ZERO);
+        }
+    }
+}

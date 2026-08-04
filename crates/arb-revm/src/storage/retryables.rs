@@ -156,9 +156,23 @@ impl RetryableRecord {
         }
     }
 
-    pub fn exists<J: ArbJournal>(&self, current_timestamp: u64, journal: &mut J) -> Result<bool> {
+    pub fn exists<J: ArbJournal>(
+        &self,
+        current_timestamp: u64,
+        arbos_version: u64,
+        journal: &mut J,
+    ) -> Result<bool> {
         let timeout = self.timeout.get(journal)?;
-        Ok(timeout != 0 && timeout >= current_timestamp)
+        if timeout == 0 {
+            return Ok(false);
+        }
+        if timeout >= current_timestamp {
+            return Ok(true);
+        }
+        if arbos_version < 60 {
+            return Ok(false);
+        }
+        Ok(self.timeout_with_windows(journal)? >= current_timestamp)
     }
 
     pub fn to<J: ArbJournal>(&self, journal: &mut J) -> Result<Option<Address>> {
@@ -183,6 +197,42 @@ impl RetryableRecord {
         let timeout = self.timeout.get(journal)?;
         let windows = self.timeout_windows_left.get(journal)?;
         Ok(timeout.saturating_add(windows.saturating_mul(RETRYABLE_LIFETIME_SECONDS)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use revm::{context_interface::ContextTr, database_interface::EmptyDB, primitives::B256};
+
+    use crate::{
+        ArbosState,
+        api::default_ctx::{ArbContext, DefaultArb},
+        storage::RETRYABLE_LIFETIME_SECONDS,
+    };
+
+    #[test]
+    fn keepalive_windows_only_extend_existence_from_arbos_60() {
+        let mut ctx = <ArbContext<EmptyDB> as DefaultArb>::arb();
+        let record = ArbosState::open()
+            .retryables
+            .retryable(B256::with_last_byte(0x2a));
+        let journal = ctx.journal_mut();
+        let original_timeout = 1_000_000 + RETRYABLE_LIFETIME_SECONDS;
+        record.timeout.set(original_timeout, journal).unwrap();
+        record.timeout_windows_left.set(1, journal).unwrap();
+
+        let after_original_timeout = original_timeout + 1;
+        assert!(!record.exists(after_original_timeout, 59, journal).unwrap());
+        assert!(record.exists(after_original_timeout, 60, journal).unwrap());
+        assert!(
+            !record
+                .exists(
+                    original_timeout + RETRYABLE_LIFETIME_SECONDS + 1,
+                    60,
+                    journal
+                )
+                .unwrap()
+        );
     }
 }
 
