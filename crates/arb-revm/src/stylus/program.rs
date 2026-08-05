@@ -10,7 +10,7 @@ use arbutil::{Bytes32, evm::api::Ink};
 use lru::LruCache;
 use revm::{
     interpreter::Gas,
-    primitives::{B256, Bytes, FixedBytes},
+    primitives::{Address, B256, Bytes, FixedBytes},
 };
 use stylus::{
     brotli::{self, Dictionary},
@@ -25,9 +25,13 @@ use stylus::{
 };
 use wasmer_types::target::Target;
 
-use super::constants::STYLUS_DISCRIMINANT;
+use super::constants::{
+    ARBOS_VERSION_STYLUS_CONTRACT_LIMIT, STYLUS_DISCRIMINANT, STYLUS_FRAGMENT_DISCRIMINANT,
+    STYLUS_ROOT_DISCRIMINANT,
+};
 
 type ProgramCacheEntry = (Vec<u8>, Module, StylusData);
+const ADDRESS_LEN: usize = 20;
 
 lazy_static::lazy_static! {
     /// Compiled-program cache keyed by code hash: (serialized native module, prover module,
@@ -36,16 +40,121 @@ lazy_static::lazy_static! {
         Mutex::new(LruCache::new(NonZeroUsize::new(1024).unwrap()));
 }
 
-/// Extract (brotli-decompressing) the WASM from a Stylus-prefixed contract bytecode.
-/// `Ok(None)` if the bytecode isn't a Stylus program; `Err(msg)` on a malformed one.
-pub fn stylus_code(bytecode: &[u8]) -> Result<Option<Bytes>, Vec<u8>> {
-    let Some(rest) = bytecode.strip_prefix(STYLUS_DISCRIMINANT) else {
+/// Whether `bytecode` is a directly executable Stylus program at `arbos_version`.
+pub fn is_stylus_program(bytecode: &[u8], arbos_version: u64) -> bool {
+    has_payload(bytecode, STYLUS_DISCRIMINANT)
+        || (arbos_version >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT
+            && has_payload(bytecode, STYLUS_ROOT_DISCRIMINANT))
+}
+
+/// Whether `bytecode` is a Stylus code component accepted at contract creation.
+pub fn is_stylus_component(bytecode: &[u8], arbos_version: u64) -> bool {
+    is_stylus_program(bytecode, arbos_version)
+        || (arbos_version >= ARBOS_VERSION_STYLUS_CONTRACT_LIMIT
+            && has_payload(bytecode, STYLUS_FRAGMENT_DISCRIMINANT))
+}
+
+#[inline]
+fn has_payload(bytecode: &[u8], prefix: &[u8]) -> bool {
+    bytecode.len() > prefix.len() && bytecode.starts_with(prefix)
+}
+
+/// Extract and decompress the WASM for a Stylus program. Root programs are reconstructed by
+/// loading their fragments through `load_fragment`. Limits specific to activation are enforced
+/// only when `activation` is true, matching Nitro's distinction between activation and runtime
+/// cache preparation.
+pub fn stylus_code<F>(
+    bytecode: &[u8],
+    arbos_version: u64,
+    max_wasm_size: u32,
+    max_fragment_count: u8,
+    activation: bool,
+    mut load_fragment: F,
+) -> Result<Option<Bytes>, Vec<u8>>
+where
+    F: FnMut(Address) -> Result<Bytes, Vec<u8>>,
+{
+    if has_payload(bytecode, STYLUS_DISCRIMINANT) {
+        return classic_stylus_code(bytecode, max_wasm_size).map(Some);
+    }
+
+    if arbos_version < ARBOS_VERSION_STYLUS_CONTRACT_LIMIT {
         return Ok(None);
+    }
+    if has_payload(bytecode, STYLUS_FRAGMENT_DISCRIMINANT) {
+        return Err(
+            b"fragmented stylus programs cannot be activated directly; activate the root program instead"
+                .to_vec(),
+        );
+    }
+    if !has_payload(bytecode, STYLUS_ROOT_DISCRIMINANT) {
+        return Ok(None);
+    }
+
+    let root = StylusRoot::parse(bytecode)?;
+    if activation {
+        if root.decompressed_length > max_wasm_size {
+            return Err(format!(
+                "invalid wasm: decompressedLength {} is greater then MaxWasmSize {}",
+                root.decompressed_length, max_wasm_size
+            )
+            .into_bytes());
+        }
+        if root.addresses.len() > usize::from(max_fragment_count) {
+            return Err(format!(
+                "invalid wasm: fragment count exceeds limit of {max_fragment_count}"
+            )
+            .into_bytes());
+        }
+    }
+    if root.addresses.is_empty() {
+        return Err(b"invalid wasm: fragment count cannot be zero".to_vec());
+    }
+
+    let mut compressed = Vec::new();
+    for address in root.addresses {
+        let fragment = load_fragment(address)?;
+        let Some(payload) = fragment.strip_prefix(STYLUS_FRAGMENT_DISCRIMINANT) else {
+            return Err(b"specified bytecode is not a Stylus program fragment".to_vec());
+        };
+        if payload.is_empty() {
+            return Err(b"specified bytecode is not a Stylus program fragment".to_vec());
+        }
+        compressed.extend_from_slice(payload);
+    }
+
+    let wasm = decompress(&compressed, root.dictionary)?;
+    if wasm.len() != root.decompressed_length as usize {
+        return Err(format!(
+            "invalid wasm: decompressed length {} does not match expected length {}",
+            wasm.len(),
+            root.decompressed_length
+        )
+        .into_bytes());
+    }
+    Ok(Some(Bytes::from(wasm)))
+}
+
+fn classic_stylus_code(bytecode: &[u8], max_wasm_size: u32) -> Result<Bytes, Vec<u8>> {
+    let Some(rest) = bytecode.strip_prefix(STYLUS_DISCRIMINANT) else {
+        return Err(b"specified bytecode is not a Stylus program".to_vec());
     };
     let Some((dictionary, compressed)) = rest.split_at_checked(1) else {
         return Err(b"specified bytecode is not a Stylus program".to_vec());
     };
-    let dictionary = match dictionary[0] {
+    let wasm = decompress(compressed, dictionary[0])?;
+    if wasm.len() > max_wasm_size as usize {
+        return Err(format!(
+            "invalid wasm: decompressed length {} exceeds maximum {max_wasm_size}",
+            wasm.len()
+        )
+        .into_bytes());
+    }
+    Ok(Bytes::from(wasm))
+}
+
+fn decompress(compressed: &[u8], dictionary: u8) -> Result<Vec<u8>, Vec<u8>> {
+    let dictionary = match dictionary {
         0x00 => Dictionary::Empty,
         0x01 => Dictionary::StylusProgram,
         t => return Err(format!("unsupported dictionary {t}").into_bytes()),
@@ -58,7 +167,44 @@ pub fn stylus_code(bytecode: &[u8]) -> Result<Option<Bytes>, Vec<u8>> {
             Err(format!("failed decompression: {}", err as u8).into_bytes())
         }
     })?;
-    Ok(Some(Bytes::from(wasm)))
+    Ok(wasm)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StylusRoot {
+    dictionary: u8,
+    decompressed_length: u32,
+    addresses: Vec<Address>,
+}
+
+impl StylusRoot {
+    fn parse(bytecode: &[u8]) -> Result<Self, Vec<u8>> {
+        if !has_payload(bytecode, STYLUS_ROOT_DISCRIMINANT) {
+            return Err(b"specified bytecode is not a Stylus program root".to_vec());
+        }
+        if bytecode.len() < 8 {
+            return Err(format!(
+                "stylus program root too short: need at least 8 bytes, got {}",
+                bytecode.len()
+            )
+            .into_bytes());
+        }
+        let address_data = &bytecode[8..];
+        let (addresses, remainder) = address_data.as_chunks::<ADDRESS_LEN>();
+        if !remainder.is_empty() {
+            return Err(format!(
+                "stylus program root address data has invalid length: {} (must be multiple of {})",
+                address_data.len(),
+                ADDRESS_LEN
+            )
+            .into_bytes());
+        }
+        Ok(Self {
+            dictionary: bytecode[3],
+            decompressed_length: u32::from_be_bytes(bytecode[4..8].try_into().unwrap()),
+            addresses: addresses.iter().copied().map(Address::new).collect(),
+        })
+    }
 }
 
 /// Compile WASM to a serialized native module via Nitro's stylus runtime.
@@ -122,4 +268,158 @@ pub fn cache_program(
 ) {
     let mut cache = PROGRAM_CACHE.lock().unwrap();
     cache.get_or_insert(code_hash, || (serialized, module, stylus_data));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stylus::brotli::{DEFAULT_WINDOW_SIZE, compress};
+    use wasm_encoder::{
+        CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction,
+        MemorySection, MemoryType, Module as WasmModule, TypeSection, ValType,
+    };
+
+    const FIRST: Address = Address::new([0x11; 20]);
+    const SECOND: Address = Address::new([0x22; 20]);
+
+    fn root_code(decompressed_length: usize, addresses: &[Address]) -> Vec<u8> {
+        let mut root = STYLUS_ROOT_DISCRIMINANT.to_vec();
+        root.push(0);
+        root.extend_from_slice(&(decompressed_length as u32).to_be_bytes());
+        for address in addresses {
+            root.extend_from_slice(address.as_slice());
+        }
+        root
+    }
+
+    fn minimal_stylus_wasm() -> Bytes {
+        let mut module = WasmModule::new();
+        let mut types = TypeSection::new();
+        types.ty().function([ValType::I32], [ValType::I32]);
+        module.section(&types);
+
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        module.section(&functions);
+
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 1,
+            maximum: Some(1),
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        module.section(&memories);
+
+        let mut exports = ExportSection::new();
+        exports.export("memory", ExportKind::Memory, 0);
+        exports.export("user_entrypoint", ExportKind::Func, 0);
+        module.section(&exports);
+
+        let mut code = CodeSection::new();
+        let mut entrypoint = Function::new([]);
+        entrypoint.instruction(&Instruction::I32Const(0));
+        entrypoint.instruction(&Instruction::End);
+        code.function(&entrypoint);
+        module.section(&code);
+        Bytes::from(module.finish())
+    }
+
+    #[test]
+    fn stylus_version_three_activates() {
+        let wasm = minimal_stylus_wasm();
+        let activated = stylus_activate(None, &wasm, B256::ZERO, 61, 3, 128, false);
+        assert!(activated.is_ok(), "{activated:?}");
+    }
+
+    #[test]
+    fn root_and_fragment_prefixes_are_version_gated() {
+        let root = root_code(1, &[FIRST]);
+        let fragment = [STYLUS_FRAGMENT_DISCRIMINANT, &[1]].concat();
+
+        assert!(!is_stylus_program(&root, 59));
+        assert!(!is_stylus_component(&fragment, 59));
+        assert!(is_stylus_program(&root, 60));
+        assert!(is_stylus_component(&root, 60));
+        assert!(!is_stylus_program(&fragment, 60));
+        assert!(is_stylus_component(&fragment, 60));
+    }
+
+    #[test]
+    fn root_program_reassembles_and_decompresses_fragments_in_order() {
+        let wasm = b"\0asm\x01\0\0\0root-program";
+        let compressed = compress(wasm, 1, DEFAULT_WINDOW_SIZE, Dictionary::Empty).unwrap();
+        let split = compressed.len() / 2;
+        let first = [STYLUS_FRAGMENT_DISCRIMINANT, &compressed[..split]].concat();
+        let second = [STYLUS_FRAGMENT_DISCRIMINANT, &compressed[split..]].concat();
+        let root = root_code(wasm.len(), &[FIRST, SECOND]);
+        let mut loaded = Vec::new();
+
+        let decoded = stylus_code(&root, 60, 256 * 1024, 4, true, |address| {
+            loaded.push(address);
+            Ok(if address == FIRST {
+                Bytes::from(first.clone())
+            } else {
+                Bytes::from(second.clone())
+            })
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(decoded.as_ref(), wasm);
+        assert_eq!(loaded, [FIRST, SECOND]);
+    }
+
+    #[test]
+    fn root_program_is_not_recognized_before_arbos_60() {
+        let root = root_code(1, &[FIRST]);
+        let decoded = stylus_code(&root, 59, 128 * 1024, 0, true, |_| {
+            panic!("pre-ArbOS 60 must not load fragments")
+        })
+        .unwrap();
+        assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn fragment_cannot_be_activated_directly() {
+        let fragment = [STYLUS_FRAGMENT_DISCRIMINANT, &[1]].concat();
+        let error =
+            stylus_code(&fragment, 60, 256 * 1024, 4, true, |_| unreachable!()).unwrap_err();
+        assert_eq!(
+            error,
+            b"fragmented stylus programs cannot be activated directly; activate the root program instead"
+        );
+    }
+
+    #[test]
+    fn activation_enforces_root_limits() {
+        let too_large = root_code(257 * 1024, &[FIRST]);
+        let error =
+            stylus_code(&too_large, 60, 256 * 1024, 4, true, |_| unreachable!()).unwrap_err();
+        assert!(
+            String::from_utf8(error)
+                .unwrap()
+                .contains("greater then MaxWasmSize")
+        );
+
+        let too_many = root_code(1, &[FIRST, SECOND]);
+        let error =
+            stylus_code(&too_many, 60, 256 * 1024, 1, true, |_| unreachable!()).unwrap_err();
+        assert_eq!(error, b"invalid wasm: fragment count exceeds limit of 1");
+    }
+
+    #[test]
+    fn root_requires_at_least_one_fragment() {
+        let error = stylus_code(
+            &root_code(0, &[]),
+            60,
+            256 * 1024,
+            4,
+            true,
+            |_| unreachable!(),
+        )
+        .unwrap_err();
+        assert_eq!(error, b"invalid wasm: fragment count cannot be zero");
+    }
 }

@@ -7,6 +7,17 @@
 /// interpreter. (`0xEF 0xF0 0x00`, an EOF-like magic.)
 pub const STYLUS_DISCRIMINANT: &[u8] = &[0xEF, 0xF0, 0x00];
 
+/// Code prefix for a fragment of a Stylus program. Fragments are valid Stylus components from
+/// ArbOS 60 onward, but are not directly activatable or executable.
+pub const STYLUS_FRAGMENT_DISCRIMINANT: &[u8] = &[0xEF, 0xF0, 0x01];
+
+/// Code prefix for a Stylus root program. A root stores the compression dictionary, expected
+/// decompressed length, and the addresses of the contracts holding its fragments.
+pub const STYLUS_ROOT_DISCRIMINANT: &[u8] = &[0xEF, 0xF0, 0x02];
+
+/// ArbOS version that introduced root programs and fragments.
+pub const ARBOS_VERSION_STYLUS_CONTRACT_LIMIT: u64 = 60;
+
 // Initial Stylus parameters (Nitro `programs/params.go` const block).
 pub const INITIAL_STYLUS_VERSION: u16 = 2;
 pub const INITIAL_MAX_WASM_SIZE: u32 = 128 * 1024;

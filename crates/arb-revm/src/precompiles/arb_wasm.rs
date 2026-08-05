@@ -21,10 +21,16 @@ const MIN_CACHED_INIT_GAS_UNITS: u64 = 32;
 const COST_SCALAR_PERCENT_UNITS: u64 = 2;
 const ARBOS_VERSION_STYLUS: u64 = 30;
 const ARBOS_VERSION_STYLUS_CHARGING_FIXES: u64 = 32;
+const ARBOS_VERSION_STYLUS_ACTIVATION_GAS: u64 = 59;
+const COLD_ACCOUNT_READ_GAS: u64 = 2_600;
+const WARM_ACCOUNT_READ_GAS: u64 = 100;
+const COPY_WORD_GAS: u64 = 3;
 /// Nitro charges this once when `Programs.Params()` reads the packed Stylus parameter word.
 const PARAMS_WARM_READ_GAS: u64 = 100;
 /// Nitro's ArbOS storage abstraction charges the pre-EIP-2929 SLOAD price for a program record.
 const PROGRAM_READ_GAS: u64 = 800;
+/// Reading the configurable activation-gas slot uses Nitro's pre-EIP-2929 storage price.
+const ACTIVATION_GAS_READ_GAS: u64 = 800;
 
 /// Fixed up-front computation burn ArbWasm.ActivateProgram charges (Nitro `ArbWasm.go`).
 #[cfg(feature = "stylus")]
@@ -308,19 +314,28 @@ where
     let params = StylusParams::from_word(params_word);
     let state = ArbosState::open();
 
+    // ArbOS 59 introduced a configurable activation burn. Reading its storage-backed value also
+    // costs one ArbOS storage read, even when the configured value is zero.
+    let configured_activation_gas = if arbos_version >= ARBOS_VERSION_STYLUS_ACTIVATION_GAS {
+        match state.programs.activation_gas.get(ctx.journal_mut()) {
+            Ok(gas) => gas,
+            Err(e) => {
+                return revert_result(
+                    gas_limit,
+                    &format!("ArbWasm: activation gas read error: {e}"),
+                );
+            }
+        }
+    } else {
+        0
+    };
+
     // Program bytecode + its code hash (Nitro statedb.GetCode / GetCodeHash, not burned here).
     let code = match ctx.journal_mut().account_code(program) {
         Ok(c) => c,
         Err(e) => return revert_result(gas_limit, &format!("ArbWasm: code read error: {e}")),
     };
     let code_hash = keccak256(&code);
-    let wasm = match stylus_code(&code) {
-        Ok(Some(wasm)) => wasm,
-        Ok(None) => return revert_result(gas_limit, "ArbWasm: program is not a Stylus program"),
-        Err(err) => {
-            return revert_result(gas_limit, &String::from_utf8_lossy(&err));
-        }
-    };
 
     // Reject re-activation of an already up-to-date program (Nitro ProgramUpToDateError).
     let existing = match state.programs.read_program(code_hash, ctx.journal_mut()) {
@@ -334,13 +349,78 @@ where
     // Charge the fixed + storage gas up front, then let stylus_activate burn the variable
     // instrumentation gas out of the remainder (Nitro `activateProgram` burns suppliedGas-gasLeft).
     let mut gas = Gas::new(gas_limit);
-    if !gas.record_regular_cost(ACTIVATION_FIXED_GAS + ACTIVATION_STORAGE_GAS) {
+    let activation_gas_read = activation_gas_read_cost(arbos_version);
+    if !gas.record_regular_cost(
+        activation_gas_read
+            .saturating_add(configured_activation_gas)
+            .saturating_add(ACTIVATION_FIXED_GAS)
+            .saturating_add(ACTIVATION_STORAGE_GAS),
+    ) {
         return InterpreterResult {
             result: InstructionResult::OutOfGas,
             output: Bytes::new(),
             gas: Gas::new(gas_limit),
         };
     }
+
+    // Root programs load their fragment contracts from state. Activation alone charges these
+    // reads: reserve enough gas for a maximum-sized fragment before touching state, then burn the
+    // actual cold/warm account access plus three gas per copied 32-byte word.
+    let max_code_size = ctx.max_code_size() as u64;
+    let mut fragment_oog = false;
+    let wasm = match stylus_code(
+        &code,
+        arbos_version,
+        params.max_wasm_size(arbos_version),
+        params.max_fragment_count,
+        true,
+        |address| {
+            let is_cold = ctx
+                .journal_mut()
+                .account_is_cold(address)
+                .map_err(|error| format!("fragment access error: {error}").into_bytes())?;
+            let maximum_cost = fragment_read_gas_cost(is_cold, max_code_size);
+            if gas.remaining() < maximum_cost {
+                gas.spend_all();
+                fragment_oog = true;
+                return Err(b"out of gas reading Stylus fragment".to_vec());
+            }
+            let loaded = ctx
+                .journal_mut()
+                .account_code_load(address)
+                .map_err(|error| format!("fragment code read error: {error}").into_bytes())?;
+            let cost = fragment_read_gas_cost(loaded.is_cold, loaded.data.len() as u64);
+            if !gas.record_regular_cost(cost) {
+                fragment_oog = true;
+                return Err(b"out of gas reading Stylus fragment".to_vec());
+            }
+            Ok(loaded.data)
+        },
+    ) {
+        Ok(Some(wasm)) => wasm,
+        Ok(None) => {
+            return InterpreterResult {
+                result: InstructionResult::Revert,
+                output: Bytes::from_static(b"ArbWasm: program is not a Stylus program"),
+                gas,
+            };
+        }
+        Err(err) => {
+            return InterpreterResult {
+                result: if fragment_oog {
+                    InstructionResult::OutOfGas
+                } else {
+                    InstructionResult::Revert
+                },
+                output: if fragment_oog {
+                    Bytes::new()
+                } else {
+                    Bytes::from(err)
+                },
+                gas,
+            };
+        }
+    };
 
     let debug = state.debug_mode(ctx.journal_mut());
     let (module, stylus_data) = match stylus_activate(
@@ -455,5 +535,44 @@ where
             data_fee,
         ))),
         gas,
+    }
+}
+
+#[cfg(feature = "stylus")]
+fn fragment_read_gas_cost(is_cold: bool, code_size: u64) -> u64 {
+    let access = if is_cold {
+        COLD_ACCOUNT_READ_GAS
+    } else {
+        WARM_ACCOUNT_READ_GAS
+    };
+    access.saturating_add(code_size.div_ceil(32).saturating_mul(COPY_WORD_GAS))
+}
+
+#[cfg(feature = "stylus")]
+const fn activation_gas_read_cost(arbos_version: u64) -> u64 {
+    if arbos_version >= ARBOS_VERSION_STYLUS_ACTIVATION_GAS {
+        ACTIVATION_GAS_READ_GAS
+    } else {
+        0
+    }
+}
+
+#[cfg(all(test, feature = "stylus"))]
+mod tests {
+    use super::{activation_gas_read_cost, fragment_read_gas_cost};
+
+    #[test]
+    fn fragment_read_gas_uses_access_temperature_and_copy_words() {
+        assert_eq!(fragment_read_gas_cost(true, 0), 2_600);
+        assert_eq!(fragment_read_gas_cost(false, 0), 100);
+        assert_eq!(fragment_read_gas_cost(true, 1), 2_603);
+        assert_eq!(fragment_read_gas_cost(false, 33), 106);
+    }
+
+    #[test]
+    fn configurable_activation_gas_read_starts_at_arbos_59() {
+        assert_eq!(activation_gas_read_cost(58), 0);
+        assert_eq!(activation_gas_read_cost(59), 800);
+        assert_eq!(activation_gas_read_cost(61), 800);
     }
 }

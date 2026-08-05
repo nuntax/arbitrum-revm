@@ -5,7 +5,7 @@
 //! and the field offsets via [`crate::storage::programs::stylus_param_layout`]. This decodes
 //! the word into the values the executor needs for `StylusConfig` and the init/page gas model.
 
-use crate::storage::programs::stylus_param_layout as layout;
+use crate::storage::programs::{INITIAL_MAX_WASM_SIZE, stylus_param_layout as layout};
 
 /// Decoded Stylus parameters (mirrors Nitro `StylusParams`).
 #[derive(Debug, Clone, Copy)]
@@ -22,6 +22,7 @@ pub struct StylusParams {
     pub cached_cost_scalar: u8,
     pub block_cache_size: u16,
     pub max_wasm_size: u32,
+    pub max_fragment_count: u8,
 }
 
 impl StylusParams {
@@ -40,6 +41,16 @@ impl StylusParams {
             cached_cost_scalar: word[layout::CACHED_COST_SCALAR.0],
             block_cache_size: be_u16(word, layout::BLOCK_CACHE_SIZE.0),
             max_wasm_size: be_u32(word, layout::MAX_WASM_SIZE.0),
+            max_fragment_count: word[layout::MAX_FRAGMENT_COUNT.0],
+        }
+    }
+
+    /// Nitro did not persist `MaxWasmSize` before ArbOS 40 and used the original 128 KiB limit.
+    pub fn max_wasm_size(self, arbos_version: u64) -> u32 {
+        if arbos_version < 40 {
+            INITIAL_MAX_WASM_SIZE
+        } else {
+            self.max_wasm_size
         }
     }
 }
@@ -57,4 +68,16 @@ fn be_u16(word: &[u8; 32], off: usize) -> u16 {
 
 fn be_u32(word: &[u8; 32], off: usize) -> u32 {
     u32::from_be_bytes([word[off], word[off + 1], word[off + 2], word[off + 3]])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pre_arbos_40_uses_implicit_max_wasm_size() {
+        let params = StylusParams::from_word(&[0; 32]);
+        assert_eq!(params.max_wasm_size(39), INITIAL_MAX_WASM_SIZE);
+        assert_eq!(params.max_wasm_size(40), 0);
+    }
 }

@@ -14,7 +14,7 @@ use arbutil::evm::{
 use revm::{
     Database,
     context::{ContextError, FrameStack},
-    context_interface::{Cfg, ContextTr, JournalTr},
+    context_interface::{Cfg, ContextTr, JournalTr, journaled_state::account::JournaledAccountTr},
     handler::{
         EthFrame, EvmTr, FrameResult, ItemOrResult, PrecompileProvider,
         instructions::InstructionProvider,
@@ -76,12 +76,6 @@ where
             // Bytecode + code hash of the program.
             let code_hash = ctx.journal_mut().code_hash(bytecode_address).ok()?.data;
             let bytecode = ctx.journal_mut().code(bytecode_address).ok()?.data;
-            let wasm = match stylus_code(&bytecode) {
-                Ok(Some(wasm)) => wasm,
-                Ok(None) => return None,
-                Err(err) => return Some(revert(gas_limit, err)),
-            };
-
             // Stylus params + ArbOS version.
             let params_word = ArbosState::open()
                 .programs
@@ -90,6 +84,36 @@ where
             let params = StylusParams::from_word(&params_word);
             let arbos_version = ctx.cfg().spec().arbos_version();
             let debug = ArbosState::open().debug_mode(ctx.journal_mut());
+            let wasm = match stylus_code(
+                &bytecode,
+                arbos_version,
+                params.max_wasm_size(arbos_version),
+                params.max_fragment_count,
+                false,
+                |address| {
+                    let loaded = ctx.journal_mut().code(address).map_err(|error| {
+                        format!("fragment code read error: {error}").into_bytes()
+                    })?;
+                    let was_cold = loaded.is_cold;
+                    let code = loaded.data;
+                    // Runtime preparation reads fragment code without charging or mutating the
+                    // EIP-2929 access list. Restore a cold account after revm's code loader.
+                    if was_cold {
+                        ctx.journal_mut()
+                            .load_account_mut_skip_cold_load(address, false)
+                            .map_err(|error| {
+                                format!("fragment access restore error: {error:?}").into_bytes()
+                            })?
+                            .data
+                            .unsafe_mark_cold();
+                    }
+                    Ok(code)
+                },
+            ) {
+                Ok(Some(wasm)) => wasm,
+                Ok(None) => return None,
+                Err(err) => return Some(revert(gas_limit, err)),
+            };
 
             // Stored program metadata, Nitro's source of truth for init/page gas, set at
             // activation. We still compile/activate below for the executable module, but charge
