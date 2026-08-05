@@ -228,24 +228,18 @@ where
         // Arbitrum: if the current frame runs a Stylus program (bytecode carries the Stylus
         // discriminant), execute it as WASM instead of dispatching to the EVM interpreter.
         #[cfg(feature = "stylus")]
-        if self
-            .0
-            .frame_stack
-            .get()
-            .interpreter
-            .bytecode
-            .bytes()
-            .starts_with(crate::stylus::constants::STYLUS_DISCRIMINANT)
+        if crate::stylus::program::is_stylus_program(
+            &self.0.frame_stack.get().interpreter.bytecode.bytes(),
+            self.0.ctx.cfg().spec().arbos_version(),
+        ) && let Some(action) = self.frame_run_stylus()
         {
-            if let Some(action) = self.frame_run_stylus() {
-                let frame = self.0.frame_stack.get();
-                let context = &mut self.0.ctx;
-                return frame.process_next_action(context, action).inspect(|next| {
-                    if next.is_result() {
-                        frame.set_finished(true);
-                    }
-                });
-            }
+            let frame = self.0.frame_stack.get();
+            let context = &mut self.0.ctx;
+            return frame.process_next_action(context, action).inspect(|next| {
+                if next.is_result() {
+                    frame.set_finished(true);
+                }
+            });
         }
         self.0.frame_run()
     }

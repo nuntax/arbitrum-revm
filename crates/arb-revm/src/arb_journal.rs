@@ -25,9 +25,11 @@
 use alloy_evm::{EvmInternals, EvmInternalsError};
 use revm::{
     context_interface::{
-        Block, ContextTr, Host, JournalTr, Transaction,
+        Block, Cfg, ContextTr, Host, JournalTr, Transaction,
         context::SStoreResult,
-        journaled_state::{StateLoad, TransferError, account::JournaledAccountTr},
+        journaled_state::{
+            JournalLoadError, StateLoad, TransferError, account::JournaledAccountTr,
+        },
     },
     database_interface::Database,
     primitives::{Address, B256, Bytes, Log, StorageKey, StorageValue, U256, keccak256},
@@ -62,6 +64,12 @@ pub trait ArbJournal {
 
     /// Deployed bytecode of `account` (empty if none).
     fn account_code(&mut self, account: Address) -> Result<Bytes, Self::Error>;
+
+    /// Deployed bytecode of `account`, including whether this access first warmed it.
+    fn account_code_load(&mut self, account: Address) -> Result<StateLoad<Bytes>, Self::Error>;
+
+    /// Whether `account` is currently cold without warming it.
+    fn account_is_cold(&mut self, account: Address) -> Result<bool, Self::Error>;
 
     /// Debit `amount` from `account`'s balance, returning `false` if the balance is insufficient
     /// (mirrors revm `Account::decr_balance`). Used by `ArbSys` for L2->L1 value burn.
@@ -171,6 +179,14 @@ impl<J: ArbJournal> ArbJournal for MeteredJournal<'_, J> {
         self.inner.account_code(account)
     }
 
+    fn account_code_load(&mut self, account: Address) -> Result<StateLoad<Bytes>, Self::Error> {
+        self.inner.account_code_load(account)
+    }
+
+    fn account_is_cold(&mut self, account: Address) -> Result<bool, Self::Error> {
+        self.inner.account_is_cold(account)
+    }
+
     fn debit_balance(&mut self, account: Address, amount: U256) -> Result<bool, Self::Error> {
         self.inner.debit_balance(account, amount)
     }
@@ -266,6 +282,18 @@ where
         Ok(self.code(account)?.data)
     }
 
+    fn account_code_load(&mut self, account: Address) -> Result<StateLoad<Bytes>, Self::Error> {
+        self.code(account)
+    }
+
+    fn account_is_cold(&mut self, account: Address) -> Result<bool, Self::Error> {
+        match self.load_account_mut_skip_cold_load(account, true) {
+            Ok(_) => Ok(false),
+            Err(JournalLoadError::ColdLoadSkipped) => Ok(true),
+            Err(JournalLoadError::DBError(error)) => Err(error),
+        }
+    }
+
     fn debit_balance(&mut self, account: Address, amount: U256) -> Result<bool, Self::Error> {
         let mut acct = self
             .load_account_mut_skip_cold_load(account, false)
@@ -337,6 +365,25 @@ impl ArbJournal for ArbInternals<'_, '_> {
             .unwrap_or_default())
     }
 
+    fn account_code_load(&mut self, account: Address) -> Result<StateLoad<Bytes>, Self::Error> {
+        let acct = self.0.load_account_code(account)?;
+        let is_cold = acct.is_cold;
+        let code = acct
+            .data
+            .code()
+            .map(|c| c.original_bytes())
+            .unwrap_or_default();
+        Ok(StateLoad::new(code, is_cold))
+    }
+
+    fn account_is_cold(&mut self, account: Address) -> Result<bool, Self::Error> {
+        match self.0.load_account_mut_skip_cold_load(account, true) {
+            Ok(_) => Ok(false),
+            Err(JournalLoadError::ColdLoadSkipped) => Ok(true),
+            Err(JournalLoadError::DBError(error)) => Err(error),
+        }
+    }
+
     fn debit_balance(&mut self, account: Address, amount: U256) -> Result<bool, Self::Error> {
         let mut acct = self
             .0
@@ -398,6 +445,11 @@ pub trait ArbPrecompileCtx {
 
     /// Current EVM call depth (for `ArbSys.isTopLevelCall`).
     fn call_depth(&self) -> usize;
+
+    /// Maximum deployed code size used to reserve enough gas before reading a new fragment.
+    fn max_code_size(&self) -> usize {
+        24_576
+    }
 }
 
 /// Blanket impl: every revm context is an [`ArbPrecompileCtx`]. Keeps the in-EVM dispatcher and
@@ -442,6 +494,10 @@ where
 
     fn call_depth(&self) -> usize {
         ContextTr::journal_ref(self).depth()
+    }
+
+    fn max_code_size(&self) -> usize {
+        self.cfg().max_code_size()
     }
 }
 

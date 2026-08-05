@@ -16,5 +16,6 @@ pub mod constants;
 pub mod dispatch;
 pub mod executor;
 pub mod gas;
+pub mod native_stack;
 pub mod params;
 pub mod program;

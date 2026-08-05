@@ -86,6 +86,16 @@ fn bytes20(address: Address) -> Bytes20 {
     Bytes20::from(address.into_array())
 }
 
+/// Outcome of one Stylus program run.
+pub enum ProgramRun {
+    /// The program finished; the result is EVM-visible.
+    Finished(InterpreterResult),
+    /// The Wasmer coroutine stack overflowed. This depends on the host, not on the chain, so it
+    /// is never EVM-visible: the caller must restore the pre-call state and retry (Nitro
+    /// `handleNativeStackOverflow`).
+    NativeStackOverflow,
+}
+
 /// Run a compiled Stylus program against the prepared hostio bridge and map the result to
 /// an EVM [`InterpreterResult`].
 ///
@@ -101,18 +111,18 @@ pub fn run_program(
     evm_data: EvmData,
     calldata: &[u8],
     mut gas: Gas,
-) -> InterpreterResult {
+) -> ProgramRun {
     // SAFETY: `serialized` is a module produced by our own `native::compile`.
     let mut instance =
         match unsafe { NativeInstance::deserialize(serialized, compile_config, evm_api, evm_data) }
         {
             Ok(instance) => instance,
             Err(err) => {
-                return InterpreterResult {
+                return ProgramRun::Finished(InterpreterResult {
                     result: InstructionResult::Revert,
                     output: err.to_string().into_bytes().into(),
                     gas,
-                };
+                });
             }
         };
 
@@ -136,12 +146,14 @@ pub fn run_program(
             gas_left = 0;
             InstructionResult::StackOverflow
         }
+        // Host-dependent, so it must not become an EVM result here. The caller retries.
+        UserOutcomeKind::NativeStackOverflow => return ProgramRun::NativeStackOverflow,
     };
     gas.erase_cost(gas_left);
 
-    InterpreterResult {
+    ProgramRun::Finished(InterpreterResult {
         result,
         output: output.into(),
         gas,
-    }
+    })
 }
