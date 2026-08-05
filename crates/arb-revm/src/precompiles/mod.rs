@@ -198,10 +198,8 @@ impl ArbPrecompilesEnum {
         // consuming all gas (Nitro returns `gasLeft = 0` before makeContext). Pure methods touch
         // no state and stay callable this way. `bytecode_address` is always the precompile here
         // (it keyed this dispatch), so acting != bytecode means a delegate/code call.
-        if call.acting_address != call.bytecode_address {
-            if purity != MethodPurity::Pure {
-                return gated_revert_result(gas_limit);
-            }
+        if call.acting_address != call.bytecode_address && purity != MethodPurity::Pure {
+            return gated_revert_result(gas_limit);
         }
         // STATICCALL may execute pure and view methods, but must reject write and payable
         // methods even if their body would later revert or be a no-op.
