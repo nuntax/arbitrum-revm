@@ -136,6 +136,12 @@ pub fn run_program(
             gas_left = 0;
             InstructionResult::StackOverflow
         }
+        // Nitro restores the pre-call state and retries this with a larger native stack and its
+        // Cranelift fallback. Returning an EVM failure here would be consensus-unsafe because the
+        // overflow depends on the host, so stop rather than committing a host-dependent result.
+        UserOutcomeKind::NativeStackOverflow => {
+            panic!("Stylus native stack overflow requires a clean retry")
+        }
     };
     gas.erase_cost(gas_left);
 
