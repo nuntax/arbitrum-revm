@@ -37,7 +37,8 @@ mod arb_wasm_cache;
 mod common;
 
 use self::common::{
-    empty_active_result, fatal_result, gated_revert_result, ok_result, revert_result,
+    empty_active_result, fatal_result, gated_revert_result, ok_result, ordinary_error_result,
+    revert_result,
 };
 pub(super) use crate::{ArbosState, storage::RETRYABLE_LIFETIME_SECONDS};
 pub(super) use alloy_core::sol_types::SolInterface;
@@ -219,6 +220,19 @@ impl ArbPrecompilesEnum {
         if result.result == InstructionResult::FatalExternalError {
             return result;
         }
+        // Nitro's method implementations return plain Go errors separately from Solidity errors.
+        // Normalize the internal marker here, where the active ArbOS version and generic wrapper
+        // policy are available. Before ArbOS 11 a plain error burns all remaining supplied gas;
+        // from ArbOS 11 onward it preserves the method and wrapper remainder. Neither form exposes
+        // revert data. `PrecompileError` must never leave this function.
+        let ordinary_error = result.result == InstructionResult::PrecompileError;
+        if ordinary_error {
+            result.result = InstructionResult::Revert;
+            result.output = Default::default();
+            if arbos_version < 11 {
+                result.gas.spend_all();
+            }
+        }
         // ArbOwner is wrapped by Nitro's `OwnerPrecompile`, which returns `multigas.ZeroGas()`
         // the chain owner is NEVER charged for an ArbOwner call (success or revert), so it pays
         // neither the method gas nor the per-call arg/result-copy + ArbosState-open gas. Reset to
@@ -226,6 +240,11 @@ impl ArbPrecompilesEnum {
         // normally, so only ArbOwner is exempt.)
         if arb == ArbPrecompilesEnum::ArbOwner {
             result.gas = Gas::new(gas_limit);
+            return result;
+        }
+        // A pre-ArbOS 11 ordinary error has already consumed the complete budget. Returning here
+        // preserves a revert result instead of letting the later extra-gas fold rewrite it to OOG.
+        if ordinary_error && arbos_version < 11 {
             return result;
         }
         // Fold the per-call precompile gas (arg/result copy + ArbosState open) into the returned
@@ -796,19 +815,21 @@ mod gating_tests {
     // Note: do NOT `use ArbPrecompilesEnum::*` here, the variant names (ArbGasInfo, ArbOwner, …)
     // would shadow the sol-interface modules of the same name and break `Module::methodCall::SELECTOR`.
     use super::{
-        ArbAddressTable, ArbAggregator, ArbDebug, ArbFunctionTable, ArbGasInfo, ArbOwner,
-        ArbOwnerPublic, ArbRetryableTx, ArbSys, ArbWasm, ARB_RETRYABLE_TX,
+        ARB_ADDRESS_TABLE, ARB_RETRYABLE_TX, ArbAddressTable, ArbAggregator, ArbDebug,
+        ArbFunctionTable, ArbGasInfo, ArbOwner, ArbOwnerPublic, ArbRetryableTx, ArbSys, ArbWasm,
     };
     use super::{
-        ArbPrecompilesEnum as E, MethodPurity, method_arbos_bounds, method_is_pure,
-        method_purity, precompile_min_arbos_version,
+        ArbPrecompilesEnum as E, MethodPurity, method_arbos_bounds, method_is_pure, method_purity,
+        precompile_min_arbos_version,
     };
     use crate::{
         api::default_ctx::{ArbContext, DefaultArb},
         arb_journal::ArbCall,
+        storage::ArbosState,
     };
     use alloy_core::sol_types::{SolCall, SolError};
     use revm::{
+        context_interface::ContextTr,
         database_interface::EmptyDB,
         interpreter::InstructionResult,
         primitives::{Address, B256, Bytes, U256},
@@ -980,7 +1001,10 @@ mod gating_tests {
             MethodPurity::Write
         );
         assert_eq!(
-            method_purity(E::ArbAggregator, ArbAggregator::addBatchPosterCall::SELECTOR),
+            method_purity(
+                E::ArbAggregator,
+                ArbAggregator::addBatchPosterCall::SELECTOR
+            ),
             MethodPurity::Write
         );
         assert_eq!(
@@ -991,6 +1015,40 @@ mod gating_tests {
             method_purity(E::ArbRetryableTx, ArbRetryableTx::keepaliveCall::SELECTOR),
             MethodPurity::Write
         );
+    }
+
+    #[test]
+    fn ordinary_precompile_errors_change_at_arbos_11() {
+        fn missing_index(version: u64) -> revm::interpreter::InterpreterResult {
+            let input = ArbAddressTable::lookupIndexCall { index: U256::ONE }.abi_encode();
+            let call = ArbCall {
+                input: &input,
+                gas_limit: 100_000,
+                caller: Address::ZERO,
+                value: U256::ZERO,
+                bytecode_address: ARB_ADDRESS_TABLE,
+                acting_address: ARB_ADDRESS_TABLE,
+                is_static: true,
+            };
+            let mut ctx = <ArbContext<EmptyDB> as DefaultArb>::arb();
+            ArbosState::open()
+                .arbos_version
+                .set(version, ctx.journal_mut())
+                .unwrap();
+
+            E::ArbAddressTable.run_dispatch(&mut ctx, &call)
+        }
+
+        let before = missing_index(10);
+        assert_eq!(before.result, InstructionResult::Revert);
+        assert_eq!(before.gas.total_gas_spent(), 100_000);
+        assert!(before.output.is_empty());
+
+        let after = missing_index(11);
+        assert_eq!(after.result, InstructionResult::Revert);
+        // AddressTable length read (800) + OpenArbosState (800) + one argument word (3).
+        assert_eq!(after.gas.total_gas_spent(), 1_603);
+        assert!(after.output.is_empty());
     }
 
     #[test]

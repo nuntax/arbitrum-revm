@@ -45,6 +45,22 @@ pub(super) fn revert_result(gas_limit: u64, msg: &str) -> InterpreterResult {
     }
 }
 
+/// Build an internal marker for an ordinary error returned by an ArbOS precompile method.
+///
+/// Nitro distinguishes plain Go errors from Solidity errors in the shared precompile wrapper. A
+/// plain error burns all remaining gas before ArbOS 11; from ArbOS 11 onward it preserves the
+/// remaining gas. Both versions return empty revert data. The method body does not own that version
+/// policy, so [`super::ArbPrecompilesEnum::run_active_dispatch`] normalizes this marker before the
+/// result can leave the precompile provider.
+#[inline]
+pub(super) fn ordinary_error_result(gas_limit: u64) -> InterpreterResult {
+    InterpreterResult {
+        result: InstructionResult::PrecompileError,
+        gas: Gas::new(gas_limit),
+        output: Bytes::new(),
+    }
+}
+
 /// A call to an ArbOS precompile that is not yet active at the current ArbOS version.
 /// Nitro (`precompile.go` Call, `arbosVersion < p.arbosVersion`) treats this exactly like a
 /// call to an account with no code: empty return, success, and **no gas consumed**.

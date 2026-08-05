@@ -31,7 +31,7 @@ where
                     gas_limit,
                     alloy_core::sol_types::SolValue::abi_encode(&(opt.is_some(),)),
                 ),
-                Err(e) => revert_result(gas_limit, &format!("ArbAddressTable: error: {e}")),
+                Err(_) => ordinary_error_result(gas_limit),
             }
         }
         ArbAddressTable::ArbAddressTableCalls::lookup(c) => {
@@ -40,19 +40,19 @@ where
                     gas_limit,
                     alloy_core::sol_types::SolValue::abi_encode(&(U256::from(idx),)),
                 ),
-                Ok(None) => revert_result(gas_limit, "ArbAddressTable: address not registered"),
-                Err(e) => revert_result(gas_limit, &format!("ArbAddressTable: error: {e}")),
+                Ok(None) | Err(_) => ordinary_error_result(gas_limit),
             }
         }
         ArbAddressTable::ArbAddressTableCalls::lookupIndex(c) => {
-            let idx: u64 = c.index.try_into().unwrap_or(u64::MAX);
+            let Ok(idx) = u64::try_from(c.index) else {
+                return ordinary_error_result(gas_limit);
+            };
             match state.address_table.lookup_index(idx, &mut journal) {
                 Ok(Some(addr)) => ok_result(
                     gas_limit,
                     alloy_core::sol_types::SolValue::abi_encode(&(addr,)),
                 ),
-                Ok(None) => revert_result(gas_limit, "ArbAddressTable: index out of bounds"),
-                Err(e) => revert_result(gas_limit, &format!("ArbAddressTable: error: {e}")),
+                Ok(None) | Err(_) => ordinary_error_result(gas_limit),
             }
         }
         ArbAddressTable::ArbAddressTableCalls::size(_) => {
@@ -61,7 +61,7 @@ where
                     gas_limit,
                     alloy_core::sol_types::SolValue::abi_encode(&(U256::from(num_items),)),
                 ),
-                Err(e) => revert_result(gas_limit, &format!("ArbAddressTable: error: {e}")),
+                Err(_) => ordinary_error_result(gas_limit),
             }
         }
         ArbAddressTable::ArbAddressTableCalls::register(c) => {
@@ -70,7 +70,7 @@ where
                     gas_limit,
                     alloy_core::sol_types::SolValue::abi_encode(&(U256::from(idx),)),
                 ),
-                Err(e) => revert_result(gas_limit, &format!("ArbAddressTable: error: {e}")),
+                Err(_) => ordinary_error_result(gas_limit),
             }
         }
         ArbAddressTable::ArbAddressTableCalls::compress(c) => {
@@ -81,7 +81,7 @@ where
                         encoded,
                     ),)),
                 ),
-                Err(e) => revert_result(gas_limit, &format!("ArbAddressTable: error: {e}")),
+                Err(_) => ordinary_error_result(gas_limit),
             }
         }
         ArbAddressTable::ArbAddressTableCalls::decompress(c) => match usize::try_from(c.offset) {
@@ -94,11 +94,11 @@ where
                             U256::from(consumed),
                         )),
                     ),
-                    Err(e) => revert_result(gas_limit, &format!("ArbAddressTable: error: {e}")),
+                    Err(_) => ordinary_error_result(gas_limit),
                 },
-                None => revert_result(gas_limit, "ArbAddressTable: invalid offset"),
+                None => ordinary_error_result(gas_limit),
             },
-            Err(_) => revert_result(gas_limit, "ArbAddressTable: invalid offset"),
+            Err(_) => ordinary_error_result(gas_limit),
         },
     };
 
@@ -142,7 +142,7 @@ mod tests {
             &mut ctx,
             ArbAddressTable::lookupCall { account: ACCOUNT }.abi_encode(),
         );
-        assert_eq!(missing.result, InstructionResult::Revert);
+        assert_eq!(missing.result, InstructionResult::PrecompileError);
         assert_eq!(missing.gas.total_gas_spent(), 800);
 
         let registered = run(
@@ -173,7 +173,7 @@ mod tests {
             &mut ctx,
             ArbAddressTable::lookupIndexCall { index: U256::ONE }.abi_encode(),
         );
-        assert_eq!(out_of_bounds.result, InstructionResult::Revert);
+        assert_eq!(out_of_bounds.result, InstructionResult::PrecompileError);
     }
 
     #[test]
@@ -235,7 +235,7 @@ mod tests {
             }
             .abi_encode(),
         );
-        assert_eq!(invalid.result, InstructionResult::Revert);
+        assert_eq!(invalid.result, InstructionResult::PrecompileError);
         assert_eq!(invalid.gas.total_gas_spent(), 0);
     }
 }
