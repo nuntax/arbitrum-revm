@@ -8,13 +8,17 @@
 use std::{cmp::min, mem, sync::Arc};
 
 use arbutil::evm::{
+    EvmData,
     api::{EvmApiMethod, EvmApiStatus, Gas as ArbGas, VecReader},
     req::EvmApiRequestor,
 };
 use revm::{
     Database,
     context::{ContextError, FrameStack},
-    context_interface::{Cfg, ContextTr, JournalTr, journaled_state::account::JournaledAccountTr},
+    context_interface::{
+        Cfg, ContextTr, JournalTr,
+        journaled_state::{JournalCheckpoint, account::JournaledAccountTr},
+    },
     handler::{
         EthFrame, EvmTr, FrameResult, ItemOrResult, PrecompileProvider,
         instructions::InstructionProvider,
@@ -24,7 +28,7 @@ use revm::{
         InstructionResult, InterpreterAction, InterpreterResult, interpreter::EthInterpreter,
         interpreter_action::FrameInit,
     },
-    primitives::{Address, Bytes, KECCAK_EMPTY, U256},
+    primitives::{Address, B256, Bytes, KECCAK_EMPTY, U256},
     state::Bytecode,
 };
 use stylus::prover::programs::config::{CompileConfig, StylusConfig};
@@ -35,12 +39,30 @@ use crate::{
     storage::ArbosState,
     stylus::{
         api::{HostCallFunc, StylusHandler, handle_request},
-        executor::{build_evm_data, run_program},
+        executor::{ProgramRun, build_evm_data, run_program},
         gas::{cached_gas_cost, init_gas_cost, stylus_call_cost},
+        native_stack,
         params::StylusParams,
-        program::{PROGRAM_CACHE, stylus_activate, stylus_code, stylus_compile},
+        program::{PROGRAM_CACHE, cranelift_program, stylus_activate, stylus_code, stylus_compile},
     },
 };
+
+/// Inputs a native stack overflow retry needs to re-run the program from clean state.
+struct NativeStackRetry<'a> {
+    target: Address,
+    caller: Address,
+    is_static: bool,
+    code_hash: B256,
+    wasm: &'a Bytes,
+    compile_config: CompileConfig,
+    stylus_config: StylusConfig,
+    evm_data: EvmData,
+    calldata: &'a Bytes,
+    gas: Gas,
+    checkpoint: JournalCheckpoint,
+    pages_open: u16,
+    pages_ever: u16,
+}
 
 impl<CTX, INSP, I, P> ArbEvm<CTX, INSP, I, P, EthFrame<EthInterpreter>>
 where
@@ -70,7 +92,7 @@ where
 
         // All context-dependent setup. Scoped so the `&mut self.0.ctx` borrow is released
         // before `self.build_stylus_api`, which needs `&mut self` to re-enter sub-frames.
-        let (serialized, compile_config, stylus_config, evm_data, gas, pages_open) = {
+        let (serialized, wasm, code_hash, compile_config, stylus_config, evm_data, gas, pages_open) = {
             let ctx = &mut self.0.ctx;
 
             // Bytecode + code hash of the program.
@@ -212,6 +234,8 @@ where
                 StylusConfig::new(params.version, params.max_stack_depth, params.ink_price);
             (
                 serialized,
+                wasm,
+                code_hash,
                 compile_config,
                 stylus_config,
                 evm_data,
@@ -228,15 +252,44 @@ where
         // frames don't double-count.
         let saved_refund = self.0.ctx.chain().stylus_refund;
         self.0.ctx.chain_mut().stylus_refund = 0;
-        let mut result = run_program(
+
+        // Nitro `saveState`: capture the pre-call state so a native stack overflow can be retried
+        // from a clean slate. `checkpoint()` increments journal depth and `checkpoint_commit()`
+        // decrements it again, so committing immediately keeps the revert indices while leaving
+        // depth untouched. Depth has to stay exact for the duration of the run: ArbOS reads it for
+        // acting-address aliasing and top-level-call checks.
+        let checkpoint = self.0.ctx.journal_mut().checkpoint();
+        self.0.ctx.journal_mut().checkpoint_commit();
+        let pages_ever = self.0.ctx.chain().stylus_pages_ever;
+
+        let mut result = match run_program(
             &serialized,
-            compile_config,
+            compile_config.clone(),
             stylus_config,
             evm_api,
             evm_data,
             &calldata,
             gas,
-        );
+        ) {
+            ProgramRun::Finished(result) => result,
+            ProgramRun::NativeStackOverflow => {
+                self.recover_native_stack_overflow(NativeStackRetry {
+                    target,
+                    caller,
+                    is_static,
+                    code_hash,
+                    wasm: &wasm,
+                    compile_config,
+                    stylus_config,
+                    evm_data,
+                    calldata: &calldata,
+                    gas,
+                    checkpoint,
+                    pages_open,
+                    pages_ever,
+                })
+            }
+        };
         // Fold this frame's hostio refunds onto the result gas so they reach the transaction.
         // `frame_return` does this for ordinary frames, but Stylus direct storage and hostio
         // sub-frames run outside that path. Then restore the parent accumulator.
@@ -252,6 +305,82 @@ where
         // SetStylusPagesOpen); the `ever` mark set during the run persists across the tx.
         self.0.ctx.chain_mut().stylus_pages_open = pages_open;
         Some(InterpreterAction::Return(result))
+    }
+
+    /// Recovers from a native stack overflow, mirroring Nitro `handleNativeStackOverflow`:
+    /// compile the program with Cranelift, double the process-wide coroutine stack once, restore
+    /// the pre-call state, and run again.
+    ///
+    /// Nitro panics when the overflow survives recovery, and so does this. An activated program
+    /// that this node cannot execute would produce state that differs from every node that can
+    /// execute it, which is a consensus failure rather than a transaction failure. The overflow
+    /// is therefore never turned into an EVM-visible result.
+    fn recover_native_stack_overflow(&mut self, retry: NativeStackRetry<'_>) -> InterpreterResult {
+        let NativeStackRetry {
+            target,
+            caller,
+            is_static,
+            code_hash,
+            wasm,
+            compile_config,
+            stylus_config,
+            evm_data,
+            calldata,
+            gas,
+            checkpoint,
+            pages_open,
+            pages_ever,
+        } = retry;
+
+        // Depth is invariant across recovery by construction, so reading it once is accurate and
+        // keeps the panic path from borrowing the context.
+        let depth = self.0.ctx.journal_ref().depth();
+        let give_up = move |reason: &str| -> ! {
+            panic!(
+                "Stylus native stack overflow not resolved ({reason}): program={target}, \
+                 code_hash={code_hash}, depth={depth}, allow_fallback={}, stack_size={}",
+                native_stack::allow_fallback(),
+                native_stack::native_stack_size(),
+            )
+        };
+
+        if !native_stack::allow_fallback() {
+            give_up("fallback disabled");
+        }
+        let cranelift = match cranelift_program(code_hash, wasm, &compile_config) {
+            Ok(serialized) if !serialized.is_empty() => serialized,
+            Ok(_) => give_up("Cranelift module empty"),
+            Err(error) => give_up(&format!("Cranelift compilation failed: {error}")),
+        };
+
+        // One-shot, process-wide, and permanent, as in Nitro. A later overflow retries with
+        // Cranelift at the already-raised size.
+        native_stack::double_native_stack_size();
+
+        // Nitro `savedState.restore`: revert the state the failed attempt reached through its
+        // hostios, then restore the counters that are not journaled. `checkpoint()` re-raises the
+        // depth that `checkpoint_revert` drops, so depth is unchanged overall.
+        self.0.ctx.journal_mut().checkpoint();
+        self.0.ctx.journal_mut().checkpoint_revert(checkpoint);
+        self.0.ctx.chain_mut().stylus_pages_open = pages_open;
+        self.0.ctx.chain_mut().stylus_pages_ever = pages_ever;
+        // Unlike Nitro, whose refunds live in the StateDB journal and revert with the snapshot,
+        // this accumulator is out of band, so the failed attempt's refunds are dropped here.
+        self.0.ctx.chain_mut().stylus_refund = 0;
+
+        let evm_api = self.build_stylus_api(target, caller, is_static);
+        match run_program(
+            &cranelift,
+            compile_config,
+            stylus_config,
+            evm_api,
+            evm_data,
+            calldata,
+            gas,
+        ) {
+            ProgramRun::Finished(result) => result,
+            ProgramRun::NativeStackOverflow => give_up("overflowed again under Cranelift"),
+        }
     }
 
     /// Builds the Stylus hostio bridge for a call executing as `contract` (entered by
@@ -642,7 +771,41 @@ fn revert(gas_limit: u64, output: Vec<u8>) -> InterpreterAction {
 
 #[cfg(test)]
 mod tests {
+    use revm::{
+        context_interface::{ContextTr, JournalTr},
+        database_interface::EmptyDB,
+        primitives::{Address, Bytes, Log, LogData},
+    };
+
     use super::stylus_call_gas_limit;
+    use crate::api::default_ctx::{ArbContext, DefaultArb};
+
+    /// Native stack overflow recovery saves state before the run and restores it on retry using
+    /// revm checkpoints, which also move journal depth. ArbOS reads depth for acting-address
+    /// aliasing and top-level-call checks, so both halves of the idiom must leave it untouched
+    /// while still reverting state.
+    #[test]
+    fn overflow_save_and_restore_revert_state_without_moving_depth() {
+        let mut ctx = <ArbContext<EmptyDB> as DefaultArb>::arb();
+        let depth_before = ctx.journal_mut().depth();
+
+        // Save: commit immediately so the indices survive without a depth change.
+        let checkpoint = ctx.journal_mut().checkpoint();
+        ctx.journal_mut().checkpoint_commit();
+        assert_eq!(ctx.journal_mut().depth(), depth_before);
+
+        ctx.journal_mut().log(Log {
+            address: Address::ZERO,
+            data: LogData::new_unchecked(Vec::new(), Bytes::new()),
+        });
+        assert_eq!(ctx.journal_mut().logs().len(), 1);
+
+        // Restore: re-raise the depth that the revert drops.
+        ctx.journal_mut().checkpoint();
+        ctx.journal_mut().checkpoint_revert(checkpoint);
+        assert_eq!(ctx.journal_mut().depth(), depth_before);
+        assert!(ctx.journal_mut().logs().is_empty());
+    }
 
     #[test]
     fn stylus_eip150_cap_matches_nitro_rounding() {

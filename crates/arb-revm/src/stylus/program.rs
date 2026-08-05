@@ -38,6 +38,11 @@ lazy_static::lazy_static! {
     /// Stylus metadata). Mirrors Nitro's in-memory program cache.
     pub static ref PROGRAM_CACHE: Mutex<LruCache<FixedBytes<32>, ProgramCacheEntry>> =
         Mutex::new(LruCache::new(NonZeroUsize::new(1024).unwrap()));
+
+    /// Cranelift-compiled modules keyed by code hash, populated only by native stack overflow
+    /// recovery. Small because overflowing programs are rare.
+    static ref CRANELIFT_CACHE: Mutex<LruCache<FixedBytes<32>, Vec<u8>>> =
+        Mutex::new(LruCache::new(NonZeroUsize::new(16).unwrap()));
 }
 
 /// Whether `bytecode` is a directly executable Stylus program at `arbos_version`.
@@ -207,16 +212,48 @@ impl StylusRoot {
     }
 }
 
-/// Compile WASM to a serialized native module via Nitro's stylus runtime.
+/// Compile WASM to a serialized native module via Nitro's stylus runtime, using the
+/// single-pass compiler.
 pub fn stylus_compile(wasm: &Bytes, compile_config: &CompileConfig) -> Result<Vec<u8>, String> {
+    compile_with(wasm, compile_config, false)
+}
+
+/// Compile WASM with Cranelift instead of single-pass. Nitro reaches for this only to recover
+/// from a native stack overflow, because Cranelift's generated code uses less native stack.
+pub fn stylus_compile_cranelift(
+    wasm: &Bytes,
+    compile_config: &CompileConfig,
+) -> Result<Vec<u8>, String> {
+    compile_with(wasm, compile_config, true)
+}
+
+fn compile_with(
+    wasm: &Bytes,
+    compile_config: &CompileConfig,
+    cranelift: bool,
+) -> Result<Vec<u8>, String> {
     native::compile(
         wasm,
         compile_config.version,
         compile_config.debug.debug_funcs,
         Target::default(),
-        false,
+        cranelift,
     )
     .map_err(|e| e.to_string())
+}
+
+/// Cranelift module for `code_hash`, compiling and caching it on first use. Mirrors Nitro
+/// `getCraneliftAsm`, which checks the activated-ASM cache and the persistent wasm store before
+/// compiling. Kept separate from [`PROGRAM_CACHE`] so the ordinary single-pass path is unchanged.
+pub fn cranelift_program(
+    code_hash: B256,
+    wasm: &Bytes,
+    compile_config: &CompileConfig,
+) -> Result<Vec<u8>, String> {
+    let mut cache = CRANELIFT_CACHE.lock().unwrap();
+    cache
+        .try_get_or_insert(code_hash, || stylus_compile_cranelift(wasm, compile_config))
+        .cloned()
 }
 
 /// Activate (validate + instrument) a Stylus program, charging activation gas out of `gas`
@@ -331,6 +368,23 @@ mod tests {
         let wasm = minimal_stylus_wasm();
         let activated = stylus_activate(None, &wasm, B256::ZERO, 61, 3, 128, false);
         assert!(activated.is_ok(), "{activated:?}");
+    }
+
+    /// Native stack overflow recovery is only possible if the Cranelift path actually produces a
+    /// module, and if the cache returns the same bytes rather than recompiling.
+    #[test]
+    fn cranelift_fallback_compiles_and_caches() {
+        let wasm = minimal_stylus_wasm();
+        let config = CompileConfig::version(3, false);
+        let code_hash = B256::repeat_byte(0x5a);
+
+        let direct = stylus_compile_cranelift(&wasm, &config).expect("cranelift compile");
+        assert!(!direct.is_empty());
+
+        let first = cranelift_program(code_hash, &wasm, &config).expect("cranelift program");
+        let second = cranelift_program(code_hash, &wasm, &config).expect("cached program");
+        assert_eq!(first, second);
+        assert!(!first.is_empty());
     }
 
     #[test]
