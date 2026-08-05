@@ -200,6 +200,32 @@ impl RetryableRecord {
     }
 }
 
+fn nil_address_representation() -> U256 {
+    U256::from(1_u8) << 255
+}
+
+fn retryable_escrow_address(ticket_id: B256) -> Address {
+    let mut preimage = Vec::with_capacity(RETRYABLE_ESCROW_TAG.len() + ticket_id.len());
+    preimage.extend_from_slice(RETRYABLE_ESCROW_TAG);
+    preimage.extend_from_slice(ticket_id.as_slice());
+    let hash = keccak256(preimage);
+    Address::from_slice(&hash[12..])
+}
+
+fn map_transfer_error(transfer_error: Option<TransferError>, label: &str) -> Result<()> {
+    match transfer_error {
+        None => Ok(()),
+        Some(TransferError::OutOfFunds) => {
+            eyre::bail!("{label} failed: out of funds");
+        }
+        Some(TransferError::OverflowPayment) => {
+            eyre::bail!("{label} failed: overflow payment");
+        }
+        Some(TransferError::CreateCollision) => {
+            eyre::bail!("{label} failed: create collision");
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use revm::{context_interface::ContextTr, database_interface::EmptyDB, primitives::B256};
@@ -233,32 +259,5 @@ mod tests {
                 )
                 .unwrap()
         );
-    }
-}
-
-fn nil_address_representation() -> U256 {
-    U256::from(1_u8) << 255
-}
-
-fn retryable_escrow_address(ticket_id: B256) -> Address {
-    let mut preimage = Vec::with_capacity(RETRYABLE_ESCROW_TAG.len() + ticket_id.len());
-    preimage.extend_from_slice(RETRYABLE_ESCROW_TAG);
-    preimage.extend_from_slice(ticket_id.as_slice());
-    let hash = keccak256(preimage);
-    Address::from_slice(&hash[12..])
-}
-
-fn map_transfer_error(transfer_error: Option<TransferError>, label: &str) -> Result<()> {
-    match transfer_error {
-        None => Ok(()),
-        Some(TransferError::OutOfFunds) => {
-            eyre::bail!("{label} failed: out of funds");
-        }
-        Some(TransferError::OverflowPayment) => {
-            eyre::bail!("{label} failed: overflow payment");
-        }
-        Some(TransferError::CreateCollision) => {
-            eyre::bail!("{label} failed: create collision");
-        }
     }
 }

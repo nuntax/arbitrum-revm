@@ -21,15 +21,21 @@ const MIN_CACHED_INIT_GAS_UNITS: u64 = 32;
 const COST_SCALAR_PERCENT_UNITS: u64 = 2;
 const ARBOS_VERSION_STYLUS: u64 = 30;
 const ARBOS_VERSION_STYLUS_CHARGING_FIXES: u64 = 32;
+// Only the activation path reads these, and that path is behind the `stylus` feature.
+#[cfg(feature = "stylus")]
 const ARBOS_VERSION_STYLUS_ACTIVATION_GAS: u64 = 59;
+#[cfg(feature = "stylus")]
 const COLD_ACCOUNT_READ_GAS: u64 = 2_600;
+#[cfg(feature = "stylus")]
 const WARM_ACCOUNT_READ_GAS: u64 = 100;
+#[cfg(feature = "stylus")]
 const COPY_WORD_GAS: u64 = 3;
 /// Nitro charges this once when `Programs.Params()` reads the packed Stylus parameter word.
 const PARAMS_WARM_READ_GAS: u64 = 100;
 /// Nitro's ArbOS storage abstraction charges the pre-EIP-2929 SLOAD price for a program record.
 const PROGRAM_READ_GAS: u64 = 800;
 /// Reading the configurable activation-gas slot uses Nitro's pre-EIP-2929 storage price.
+#[cfg(feature = "stylus")]
 const ACTIVATION_GAS_READ_GAS: u64 = 800;
 
 /// Fixed up-front computation burn ArbWasm.ActivateProgram charges (Nitro `ArbWasm.go`).
