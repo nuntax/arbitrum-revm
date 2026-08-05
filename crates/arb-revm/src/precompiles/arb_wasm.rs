@@ -559,7 +559,117 @@ const fn activation_gas_read_cost(arbos_version: u64) -> u64 {
 
 #[cfg(all(test, feature = "stylus"))]
 mod tests {
-    use super::{activation_gas_read_cost, fragment_read_gas_cost};
+    use alloy_core::sol_types::SolCall;
+    use revm::{
+        context_interface::{ContextTr, JournalTr},
+        database_interface::EmptyDB,
+        interpreter::InstructionResult,
+        primitives::{Address, U256, address},
+        state::Bytecode,
+    };
+
+    use super::{
+        ACTIVATION_FIXED_GAS, ACTIVATION_STORAGE_GAS, ArbWasm, activation_gas_read_cost,
+        fragment_read_gas_cost, run_arb_wasm,
+    };
+    use crate::{
+        api::default_ctx::{ArbContext, DefaultArb},
+        arb_journal::ArbCall,
+        arbos_init::{ArbosInitConfig, initialize_arbos_state},
+        stylus::constants::STYLUS_ROOT_DISCRIMINANT,
+    };
+
+    const PROGRAM: Address = address!("00000000000000000000000000000000deadbeef");
+    const FRAGMENT: Address = address!("000000000000000000000000000000000000f00d");
+    const ARB_WASM: Address = address!("0000000000000000000000000000000000000071");
+
+    /// Everything ArbWasm.activateProgram charges before it reaches the first fragment read.
+    const UPFRONT_GAS: u64 = ACTIVATION_FIXED_GAS + ACTIVATION_STORAGE_GAS + 800;
+
+    fn ctx_with_root_program(arbos_version: u64) -> ArbContext<EmptyDB> {
+        let mut ctx = <ArbContext<EmptyDB> as DefaultArb>::arb();
+        initialize_arbos_state(
+            &ArbosInitConfig {
+                initial_arbos_version: arbos_version,
+                initial_chain_owner: Address::ZERO,
+                chain_id: U256::from(412_346_u64),
+                genesis_block_number: 0,
+                initial_l1_base_fee: U256::from(50_000_000_000_u64),
+                serialized_chain_config: b"{\"chainId\":412346}".to_vec(),
+                debug_precompiles: false,
+            },
+            ctx.journal_mut(),
+        )
+        .expect("initialize ArbOS state");
+
+        // A root program naming one fragment contract. The fragment's code is never reached in
+        // the out-of-gas case, which is the point: the reservation happens first.
+        let mut root = STYLUS_ROOT_DISCRIMINANT.to_vec();
+        root.push(0);
+        root.extend_from_slice(&64u32.to_be_bytes());
+        root.extend_from_slice(FRAGMENT.as_slice());
+        // `set_code` assumes the account is already loaded.
+        ctx.journal_mut()
+            .load_account(PROGRAM)
+            .expect("load program");
+        ctx.journal_mut()
+            .set_code(PROGRAM, Bytecode::new_raw(root.into()));
+        ctx
+    }
+
+    fn activate(
+        ctx: &mut ArbContext<EmptyDB>,
+        gas_limit: u64,
+    ) -> revm::interpreter::InterpreterResult {
+        let input = ArbWasm::activateProgramCall { program: PROGRAM }.abi_encode();
+        let call = ArbCall {
+            input: &input,
+            gas_limit,
+            caller: Address::ZERO,
+            value: U256::ZERO,
+            bytecode_address: ARB_WASM,
+            acting_address: ARB_WASM,
+            is_static: false,
+        };
+        run_arb_wasm(ctx, &input, gas_limit, &call)
+    }
+
+    /// Nitro's `canReadNewFragment` refuses to touch state unless the caller can afford a
+    /// maximum-sized fragment, and an activation that cannot is out of gas rather than a revert:
+    /// it consumes everything and returns no message.
+    #[test]
+    fn fragment_read_reservation_runs_out_of_gas_before_touching_state() {
+        let mut ctx = ctx_with_root_program(61);
+        // Enough for the fixed activation charges, but well under a cold max-sized fragment read.
+        let gas_limit = UPFRONT_GAS + 1_000;
+        let reservation = fragment_read_gas_cost(true, 24_576);
+        assert!(reservation > 1_000, "reservation should exceed the surplus");
+
+        let result = activate(&mut ctx, gas_limit);
+
+        assert_eq!(result.result, InstructionResult::OutOfGas);
+        assert!(result.output.is_empty(), "out of gas carries no message");
+        assert_eq!(result.gas.remaining(), 0, "out of gas consumes everything");
+    }
+
+    /// The same activation one gas below the fixed charges fails earlier, proving the previous
+    /// case really did get past them and fail on the fragment reservation.
+    ///
+    /// The two paths report gas differently: the fixed-charge path returns the unspent remainder
+    /// because `record_regular_cost` leaves it alone on failure, while the fragment reservation
+    /// spends it explicitly. Neither is observable, since revm consumes all gas for any
+    /// `OutOfGas` result, but the difference is what separates the two failures here.
+    #[test]
+    fn activation_below_the_fixed_charges_fails_before_the_fragment_reservation() {
+        let mut ctx = ctx_with_root_program(61);
+        let result = activate(&mut ctx, UPFRONT_GAS - 1);
+
+        assert_eq!(result.result, InstructionResult::OutOfGas);
+        assert!(
+            result.gas.remaining() > 0,
+            "failed on the fixed charges, not the fragment reservation",
+        );
+    }
 
     #[test]
     fn fragment_read_gas_uses_access_temperature_and_copy_words() {

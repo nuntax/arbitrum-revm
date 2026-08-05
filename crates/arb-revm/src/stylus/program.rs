@@ -476,4 +476,133 @@ mod tests {
         .unwrap_err();
         assert_eq!(error, b"invalid wasm: fragment count cannot be zero");
     }
+
+    /// A root header is 3 prefix bytes, 1 dictionary byte, and a 4-byte length, followed by whole
+    /// 20-byte addresses. Anything else is malformed and must be rejected before any state read.
+    #[test]
+    fn malformed_root_headers_are_rejected() {
+        let truncated = [STYLUS_ROOT_DISCRIMINANT, &[0, 0, 0, 1]].concat();
+        assert_eq!(truncated.len(), 7);
+        let error =
+            stylus_code(&truncated, 60, 256 * 1024, 4, true, |_| unreachable!()).unwrap_err();
+        assert!(
+            String::from_utf8(error)
+                .unwrap()
+                .contains("stylus program root too short"),
+        );
+
+        // A root with a complete header but no addresses is the zero-fragment case, not a
+        // malformed one, so cut a whole address short instead.
+        let mut partial_address = root_code(1, &[FIRST]);
+        partial_address.pop();
+        let error = stylus_code(
+            &partial_address,
+            60,
+            256 * 1024,
+            4,
+            true,
+            |_| unreachable!(),
+        )
+        .unwrap_err();
+        assert!(
+            String::from_utf8(error)
+                .unwrap()
+                .contains("address data has invalid length: 19"),
+        );
+    }
+
+    /// The reassembled program must decompress to exactly the length the root declares. This is
+    /// checked after decompression, so it applies to the runtime path as well as activation.
+    #[test]
+    fn declared_decompressed_length_must_match() {
+        let wasm = b"\0asm\x01\0\0\0length-mismatch";
+        let compressed = compress(wasm, 1, DEFAULT_WINDOW_SIZE, Dictionary::Empty).unwrap();
+        let fragment = [STYLUS_FRAGMENT_DISCRIMINANT, &compressed].concat();
+        let root = root_code(wasm.len() + 1, &[FIRST]);
+
+        for activation in [true, false] {
+            let error = stylus_code(&root, 60, 256 * 1024, 4, activation, |_| {
+                Ok(Bytes::from(fragment.clone()))
+            })
+            .unwrap_err();
+            assert_eq!(
+                String::from_utf8(error).unwrap(),
+                format!(
+                    "invalid wasm: decompressed length {} does not match expected length {}",
+                    wasm.len(),
+                    wasm.len() + 1
+                ),
+            );
+        }
+    }
+
+    /// Every fragment a root names must actually carry the fragment prefix and a payload.
+    #[test]
+    fn fragments_must_carry_a_prefix_and_payload() {
+        let root = root_code(1, &[FIRST]);
+
+        let error = stylus_code(&root, 60, 256 * 1024, 4, true, |_| {
+            Ok(Bytes::from_static(b"not a fragment"))
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            b"specified bytecode is not a Stylus program fragment"
+        );
+
+        let empty = Bytes::from(STYLUS_FRAGMENT_DISCRIMINANT.to_vec());
+        let error = stylus_code(&root, 60, 256 * 1024, 4, true, |_| Ok(empty.clone())).unwrap_err();
+        assert_eq!(
+            error,
+            b"specified bytecode is not a Stylus program fragment"
+        );
+    }
+
+    /// Nitro enforces MaxWasmSize and MaxFragmentCount only when activating. Runtime cache
+    /// preparation re-reads programs that were activated under older, looser limits, so it must
+    /// keep loading them.
+    #[test]
+    fn runtime_path_skips_activation_only_limits() {
+        let wasm = b"\0asm\x01\0\0\0runtime-load";
+        let compressed = compress(wasm, 1, DEFAULT_WINDOW_SIZE, Dictionary::Empty).unwrap();
+        let split = compressed.len() / 2;
+        let first = [STYLUS_FRAGMENT_DISCRIMINANT, &compressed[..split]].concat();
+        let second = [STYLUS_FRAGMENT_DISCRIMINANT, &compressed[split..]].concat();
+        let root = root_code(wasm.len(), &[FIRST, SECOND]);
+
+        let load = |address: Address| {
+            Ok(Bytes::from(if address == FIRST {
+                first.clone()
+            } else {
+                second.clone()
+            }))
+        };
+
+        // Both limits are violated: the declared length exceeds MaxWasmSize, and there are more
+        // fragments than allowed.
+        let activating = stylus_code(&root, 60, 1, 1, true, load).unwrap_err();
+        assert!(
+            String::from_utf8(activating)
+                .unwrap()
+                .contains("greater then MaxWasmSize"),
+        );
+
+        let decoded = stylus_code(&root, 60, 1, 1, false, load).unwrap().unwrap();
+        assert_eq!(decoded.as_ref(), wasm);
+    }
+
+    #[test]
+    fn unsupported_dictionary_is_rejected() {
+        let mut root = STYLUS_ROOT_DISCRIMINANT.to_vec();
+        root.push(0x02);
+        root.extend_from_slice(&1u32.to_be_bytes());
+        root.extend_from_slice(FIRST.as_slice());
+
+        let fragment = [STYLUS_FRAGMENT_DISCRIMINANT, b"payload"].concat();
+        let error = stylus_code(&root, 60, 256 * 1024, 4, true, |_| {
+            Ok(Bytes::from(fragment.clone()))
+        })
+        .unwrap_err();
+        assert_eq!(error, b"unsupported dictionary 2");
+    }
 }
