@@ -13,13 +13,16 @@ pub struct ArbChainContext {
     /// `opNumber` to read `ProcessingHook.L1BlockNumber` while keeping the L2
     /// number for chain rules. Block-scoped: set once when the block is built.
     pub l1_block_number: u64,
-    /// The block's real base fee, when the block env no longer carries it (Nitro
+    /// The block's real base fee, for when the block env no longer carries it (Nitro
     /// `BlockContext.BaseFeeInBlock`).
     ///
     /// geth lowers the block base fee to zero for a simulated call that names no fee, and reth
     /// does the same for `eth_call`/`debug_traceCall`. ArbOS must still price L1 calldata at the
-    /// real fee, so Nitro keeps it here and `GasChargingHook` reads it in preference to
-    /// `BaseFee`. `None` on the consensus path, where the block env's base fee is the real one.
+    /// real fee, so Nitro keeps it here and `GasChargingHook` reads it in preference to `BaseFee`.
+    ///
+    /// Read only when the block env's base fee is zero, so a caller that sets this and then
+    /// changes the block env's own base fee cannot silently price transactions off a stale value.
+    /// Leave it `None` on the consensus path.
     pub base_fee_in_block: Option<u64>,
     /// Intrinsic gas cost for the current transaction (from validate()).
     /// Used in EndTxHook to reconstruct the full gasUsed seen by Nitro.

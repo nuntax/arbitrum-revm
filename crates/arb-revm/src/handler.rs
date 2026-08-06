@@ -480,11 +480,14 @@ where
             //
             // Nitro's BaseFeeInBlock: a simulated call that names no fee runs with the block base
             // fee lowered to zero, but ArbOS still prices L1 calldata at the real fee, so poster
-            // gas (posterCost / gasPrice) does not silently become free. Unset on the consensus
-            // path, where the block env's base fee is the real one.
-            let base_fee_in_block = evm.ctx().chain().base_fee_in_block;
-            let basefee_u128 =
-                base_fee_in_block.unwrap_or_else(|| evm.ctx().block().basefee()) as u128;
+            // gas (posterCost / gasPrice) does not silently become free. Only consulted for a
+            // zeroed block base fee, so a stale value cannot reach the consensus path.
+            let block_basefee = evm.ctx().block().basefee();
+            let basefee_u128 = if block_basefee == 0 {
+                evm.ctx().chain().base_fee_in_block.unwrap_or(0) as u128
+            } else {
+                block_basefee as u128
+            };
             let gas_price = U256::from(evm.ctx().tx().effective_gas_price(basefee_u128));
             let tx_gas_limit = evm.ctx().tx().gas_limit();
             let tx_bytes = encode_tx_bytes(evm.ctx().tx());
@@ -1991,6 +1994,13 @@ mod tests {
         assert!(
             charged(0, Some(BASE_FEE)) > free,
             "the L1 calldata cost must not be free: {free} with the base fee zeroed"
+        );
+        // A block env that still carries a base fee is authoritative, so a stale BaseFeeInBlock
+        // cannot reprice a transaction.
+        assert_eq!(
+            charged(BASE_FEE, Some(BASE_FEE / 4)),
+            charged(BASE_FEE, None),
+            "a non-zero block base fee must win over BaseFeeInBlock"
         );
     }
 
