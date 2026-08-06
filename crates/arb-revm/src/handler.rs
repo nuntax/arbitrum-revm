@@ -477,7 +477,17 @@ where
             // Use effective_gas_price (= min(max_fee, basefee + priority_fee)) for the poster
             // cost, consistent with what validate_against_state_and_deduct_caller and
             // reimburse_caller use. For legacy txs gas_price() == effective_gas_price().
-            let basefee_u128 = evm.ctx().block().basefee() as u128;
+            //
+            // Nitro's BaseFeeInBlock: a simulated call that names no fee runs with the block base
+            // fee lowered to zero, but ArbOS still prices L1 calldata at the real fee, so poster
+            // gas (posterCost / gasPrice) does not silently become free. Only consulted for a
+            // zeroed block base fee, so a stale value cannot reach the consensus path.
+            let block_basefee = evm.ctx().block().basefee();
+            let basefee_u128 = if block_basefee == 0 {
+                evm.ctx().chain().base_fee_in_block.unwrap_or(0) as u128
+            } else {
+                block_basefee as u128
+            };
             let gas_price = U256::from(evm.ctx().tx().effective_gas_price(basefee_u128));
             let tx_gas_limit = evm.ctx().tx().gas_limit();
             let tx_bytes = encode_tx_bytes(evm.ctx().tx());
@@ -1479,7 +1489,7 @@ where
 mod tests {
     use super::{
         ARBITRUM_DEPOSIT_TX_TYPE, ARBITRUM_INTERNAL_TX_TYPE, ARBITRUM_RETRY_TX_TYPE,
-        ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE,
+        ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE, BATCH_POSTER_ADDRESS,
     };
     use crate::{
         ArbBuilder, ArbChainContext, ArbSpecId, ArbTransaction,
@@ -1925,6 +1935,72 @@ mod tests {
                 ))
             ),
             "an unfunded caller must not pass validation during real execution"
+        );
+    }
+
+    /// L1 calldata is priced at the block's real base fee even when the block env no longer
+    /// carries it (Nitro `BaseFeeInBlock`). Without that, `posterCost / gasPrice` divides by the
+    /// zeroed base fee and the L1 cost silently becomes free, so a simulated call reports less gas
+    /// than the same call needs on Nitro.
+    #[test]
+    fn a_zeroed_block_base_fee_still_prices_l1_calldata() {
+        const BASE_FEE: u64 = 100_000_000;
+
+        // Gas used by a call whose calldata carries an L1 cost, under a given block base fee and
+        // `base_fee_in_block`.
+        fn charged(block_base_fee: u64, base_fee_in_block: Option<u64>) -> u64 {
+            let mut db = InMemoryDB::default();
+            db.insert_account_info(ARBOS_STATE_ADDRESS, AccountInfo::default());
+            let state = ArbosState::open();
+            let (_, price_slot) = state.l1_pricing.price_per_unit.account_and_key();
+            db.insert_account_storage(
+                ARBOS_STATE_ADDRESS,
+                U256::from_be_bytes(price_slot.0),
+                U256::from(1_000_000_000_u64),
+            )
+            .expect("should seed the L1 price per unit");
+
+            let mut chain = ArbChainContext::default();
+            if let Some(base_fee_in_block) = base_fee_in_block {
+                chain = chain.with_base_fee_in_block(base_fee_in_block);
+            }
+            let mut evm = Context::mainnet()
+                .with_tx(ArbTransaction::<TxEnv>::default())
+                .with_cfg(simulation_cfg(true))
+                .with_block(BlockEnv {
+                    basefee: block_base_fee,
+                    // Only a batch-poster block carries an L1 data cost.
+                    beneficiary: BATCH_POSTER_ADDRESS,
+                    ..Default::default()
+                })
+                .with_chain(chain)
+                .with_db(db)
+                .build_arb();
+
+            let mut tx = simulated_tx(0);
+            tx.base.gas_limit = 200_000;
+            tx.base.data = Bytes::from(vec![0x5a_u8; 128]);
+            evm.transact_one(tx)
+                .expect("simulation executes")
+                .tx_gas_used()
+        }
+
+        let free = charged(0, None);
+        assert_eq!(
+            charged(0, Some(BASE_FEE)),
+            charged(BASE_FEE, None),
+            "a zeroed base fee plus BaseFeeInBlock must charge what the real base fee charges"
+        );
+        assert!(
+            charged(0, Some(BASE_FEE)) > free,
+            "the L1 calldata cost must not be free: {free} with the base fee zeroed"
+        );
+        // A block env that still carries a base fee is authoritative, so a stale BaseFeeInBlock
+        // cannot reprice a transaction.
+        assert_eq!(
+            charged(BASE_FEE, Some(BASE_FEE / 4)),
+            charged(BASE_FEE, None),
+            "a non-zero block base fee must win over BaseFeeInBlock"
         );
     }
 
