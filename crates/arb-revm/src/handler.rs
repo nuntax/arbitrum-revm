@@ -1294,7 +1294,13 @@ where
 /// `budget` is the remaining L1-deposit allowance: `min(amount, budget)` is reimbursed to
 /// `refund_to` (and decrements `budget`), while the EXCESS, which can't be charged against the
 /// deposit, is returned to `from` (the retryable's sender). Both transfers come from
-/// `refund_from` (a fee account). Balances are read first to avoid `OutOfFunds`.
+/// `refund_from` (a fee account).
+///
+/// Each leg is all-or-nothing, as Nitro's `util.TransferBalance` is: a fee account that cannot
+/// cover the full amount pays nothing at all and Nitro logs "fee address doesn't have enough funds
+/// to give user refund". Paying out whatever the account happens to hold instead diverges (arb1
+/// block 150,466,739, where the network fee account held 1752 wei against a 2.08e13 wei refund).
+/// The budget is spent either way, matching Nitro's `takeFunds` before the transfer.
 fn retry_fee_refund<J: JournalTr>(
     journal: &mut J,
     refund_from: Address,
@@ -1311,30 +1317,21 @@ fn retry_fee_refund<J: JournalTr>(
     if refund_from == Address::ZERO {
         return;
     }
-    if to_refund_addr > U256::ZERO {
-        let actual = available_balance(journal, refund_from, to_refund_addr);
-        if actual > U256::ZERO {
-            let _ = journal.transfer(refund_from, refund_to, actual);
-        }
+    if to_refund_addr > U256::ZERO && can_cover(journal, refund_from, to_refund_addr) {
+        let _ = journal.transfer(refund_from, refund_to, to_refund_addr);
     }
     let excess = amount.saturating_sub(to_refund_addr);
-    if excess > U256::ZERO {
-        let actual = available_balance(journal, refund_from, excess);
-        if actual > U256::ZERO {
-            let _ = journal.transfer(refund_from, from, actual);
-        }
+    if excess > U256::ZERO && can_cover(journal, refund_from, excess) {
+        let _ = journal.transfer(refund_from, from, excess);
     }
 }
 
-/// Returns the transferable amount: `min(amount, src_balance)`.
-///
-/// Callers should then call `journal.transfer(src, dst, actual)` to move funds
-/// atomically. We read balance first to avoid `OutOfFunds` errors from `transfer`.
-fn available_balance<J: JournalTr>(journal: &mut J, src: Address, amount: U256) -> U256 {
+/// Whether `src` holds at least `amount`, so a transfer of the full amount will not overdraft.
+fn can_cover<J: JournalTr>(journal: &mut J, src: Address, amount: U256) -> bool {
     let Ok(account_load) = journal.load_account(src) else {
-        return U256::ZERO;
+        return false;
     };
-    amount.min(account_load.data.info.balance)
+    account_load.data.info.balance >= amount
 }
 
 fn internal_success_frame_result() -> FrameResult {
@@ -1489,7 +1486,7 @@ where
 mod tests {
     use super::{
         ARBITRUM_DEPOSIT_TX_TYPE, ARBITRUM_INTERNAL_TX_TYPE, ARBITRUM_RETRY_TX_TYPE,
-        ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE, BATCH_POSTER_ADDRESS,
+        ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE, BATCH_POSTER_ADDRESS, JournalTr, retry_fee_refund,
     };
     use crate::{
         ArbBuilder, ArbChainContext, ArbSpecId, ArbTransaction,
@@ -2002,6 +1999,72 @@ mod tests {
             charged(BASE_FEE, None),
             "a non-zero block base fee must win over BaseFeeInBlock"
         );
+    }
+
+    /// A fee account that cannot cover the full refund pays nothing, as Nitro's
+    /// `util.TransferBalance` does. Paying out its whole balance instead was the arb1 divergence at
+    /// block 150,466,739: the network fee account held 1752 wei against a 2.08e13 wei refund, and
+    /// draining it moved 1752 wei that Nitro leaves in place.
+    #[test]
+    fn a_fee_account_short_of_the_refund_pays_nothing() {
+        const FEE_ACCOUNT: Address = Address::with_last_byte(0x51);
+        const REFUND_TO: Address = Address::with_last_byte(0x52);
+        const FROM: Address = Address::with_last_byte(0x53);
+
+        // Runs one refund against a fee account holding `funded`, returning the balances of
+        // (fee account, refund_to, from) afterwards.
+        fn refund(funded: u128, amount: u128, budget: U256) -> (U256, U256, U256) {
+            let mut db = InMemoryDB::default();
+            db.insert_account_info(
+                FEE_ACCOUNT,
+                AccountInfo {
+                    balance: U256::from(funded),
+                    ..AccountInfo::default()
+                },
+            );
+            let mut ctx = Context::mainnet()
+                .with_tx(ArbTransaction::<TxEnv>::default())
+                .with_cfg(CfgEnv::new_with_spec(ArbSpecId::NITRO).with_chain_id(42161))
+                .with_block(BlockEnv::default())
+                .with_chain(ArbChainContext::default())
+                .with_db(db);
+            let journal = ctx.journal_mut();
+            let mut budget = budget;
+            retry_fee_refund(
+                journal,
+                FEE_ACCOUNT,
+                U256::from(amount),
+                REFUND_TO,
+                FROM,
+                &mut budget,
+            );
+            let mut read = |a| {
+                JournalTr::load_account(journal, a)
+                    .expect("load account")
+                    .data
+                    .info
+                    .balance
+            };
+            (read(FEE_ACCOUNT), read(REFUND_TO), read(FROM))
+        }
+
+        // Short: the whole leg is skipped, nothing moves.
+        let (fee, to, from) = refund(1752, 20_803_300_000_000, U256::MAX);
+        assert_eq!(fee, U256::from(1752), "a short fee account must keep its balance");
+        assert_eq!(to, U256::ZERO, "no partial refund may reach refund_to");
+        assert_eq!(from, U256::ZERO, "no partial refund may reach from");
+
+        // Covered: the full amount moves to refund_to while the budget allows it.
+        let (fee, to, from) = refund(20_803_300_000_000, 20_803_300_000_000, U256::MAX);
+        assert_eq!(fee, U256::ZERO, "a covered refund is paid in full");
+        assert_eq!(to, U256::from(20_803_300_000_000_u128));
+        assert_eq!(from, U256::ZERO);
+
+        // Budget-capped: the capped part goes to refund_to, the excess to from, each all-or-nothing.
+        let (fee, to, from) = refund(1000, 1000, U256::from(400));
+        assert_eq!(fee, U256::ZERO);
+        assert_eq!(to, U256::from(400), "the budgeted part goes to refund_to");
+        assert_eq!(from, U256::from(600), "the excess goes back to the sender");
     }
 
     #[test]
