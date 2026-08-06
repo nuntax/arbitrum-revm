@@ -249,6 +249,28 @@ fn is_allowed_internal_caller(caller: Address) -> bool {
     caller == ARBOS_ACTS_ADDRESS
 }
 
+/// The base fee to charge the caller at.
+///
+/// geth lowers `BlockContext.BaseFee` to zero when it runs with `NoBaseFee` (revm's
+/// `disable_base_fee`, which `eth_call` and `eth_estimateGas` set) and the caller named no fee,
+/// so that `basefee <= feecap` still holds (`internal/ethapi/api.go`, `eth/gasestimator`).
+/// Without it every estimate fails: estimation starts from the block gas limit, which on
+/// Arbitrum is 2^50, and no ordinary account covers that times the base fee.
+///
+/// ArbOS keeps pricing L1 calldata at the real fee through geth's `BaseFeeInBlock`, so
+/// `GasChargingHook` reads the block base fee directly rather than going through here.
+#[inline]
+fn charged_basefee<CTX: ContextTr>(ctx: &CTX) -> u128 {
+    let basefee = ctx.block().basefee() as u128;
+    if basefee == 0 || !ctx.cfg().is_base_fee_check_disabled() {
+        return basefee;
+    }
+    let tx = ctx.tx();
+    let named_a_fee =
+        tx.max_fee_per_gas() != 0 || tx.max_priority_fee_per_gas().unwrap_or_default() != 0;
+    if named_a_fee { basefee } else { 0 }
+}
+
 #[inline]
 fn collect_tips_enabled(spec: ArbSpecId, delayed_inbox: bool, collect_tips_flag: u64) -> bool {
     // Nitro tx_processor.go CollectTips():
@@ -713,7 +735,7 @@ where
             return Ok(());
         }
 
-        let basefee_u128 = evm.ctx().block().basefee() as u128;
+        let basefee_u128 = charged_basefee(evm.ctx());
         let (
             caller,
             gas_limit,
@@ -724,6 +746,7 @@ where
             tx_nonce,
             is_eip3607_disabled,
             is_nonce_check_disabled,
+            is_balance_check_disabled,
         ) = {
             let ctx = evm.ctx();
             let tx = ctx.tx();
@@ -740,6 +763,7 @@ where
                 // nonce field is always 0 and uniqueness comes from the L1 requestId. Nitro skips
                 // the check but still bumps the sender nonce (kept below via `bump_nonce`).
                 ctx.cfg().is_nonce_check_disabled() || tx.tx_type() == ARBITRUM_CONTRACT_TX_TYPE,
+                ctx.cfg().is_balance_check_disabled(),
             )
         };
 
@@ -756,7 +780,7 @@ where
             let paid = if collect_tips {
                 effective_gas_price
             } else {
-                ctx.block().basefee() as u128
+                basefee_u128
             };
             // Nitro/go-ethereum always validate the caller balance against the
             // declared gas fee cap (gasLimit * gasFeeCap + value), regardless of
@@ -783,7 +807,10 @@ where
             let max_fee = U256::from(max_gas_price_for_balance_check)
                 .saturating_mul(U256::from(gas_limit))
                 .saturating_add(value);
-            if caller_balance < max_fee {
+            // This check replaces revm's own, so it has to honour the same override. reth sets it
+            // when prewarming a transaction, where the caller's funds are irrelevant and the point
+            // is to touch the state the real execution will need.
+            if !is_balance_check_disabled && caller_balance < max_fee {
                 return Err(InvalidTransaction::LackOfFundForMaxFee {
                     fee: Box::new(max_fee),
                     balance: Box::new(caller_balance),
@@ -849,7 +876,7 @@ where
         if is_protocol_env_bypass_tx(evm) {
             return Ok(());
         }
-        let basefee_u128 = evm.ctx().block().basefee() as u128;
+        let basefee_u128 = charged_basefee(evm.ctx());
         let caller = {
             let ctx = evm.ctx();
             let tx = ctx.tx();
@@ -970,11 +997,11 @@ where
         // otherwise we over-mint by basefee * refunded on every tx with SSTORE/SELFDESTRUCT.
 
         let (poster_fee, poster_gas, basefee, basefee_u128, coinbase, paid_gas_price) = {
+            let basefee_u128 = charged_basefee(evm.ctx());
             let ctx = evm.ctx_mut();
             let poster_fee = ctx.chain().poster_fee;
             let poster_gas = ctx.chain().poster_gas;
-            let basefee = U256::from(ctx.block().basefee());
-            let basefee_u128 = ctx.block().basefee() as u128;
+            let basefee = U256::from(basefee_u128);
             let coinbase = ctx.block().beneficiary();
             let paid_gas_price = ctx.chain().paid_gas_price;
             (
@@ -1497,9 +1524,27 @@ mod tests {
         let cfg = CfgEnv::new_with_spec(ArbSpecId::NITRO)
             .with_chain_id(42161)
             .with_disable_priority_fee_check(true);
+        make_evm_with_cfg(db, cfg, 0)
+    }
+
+    fn make_evm_with_cfg(
+        db: InMemoryDB,
+        cfg: CfgEnv<ArbSpecId>,
+        basefee: u64,
+    ) -> impl ExecuteCommitEvm<
+        Tx = ArbTransaction<TxEnv>,
+        Error = EVMError<
+            <InMemoryDB as revm::Database>::Error,
+            revm::context_interface::result::InvalidTransaction,
+        >,
+    > {
         let ctx = Context::mainnet()
             .with_tx(ArbTransaction::<TxEnv>::default())
             .with_cfg(cfg)
+            .with_block(BlockEnv {
+                basefee,
+                ..Default::default()
+            })
             .with_chain(ArbChainContext::default())
             .with_db(db);
         ctx.build_arb()
@@ -1806,6 +1851,81 @@ mod tests {
             err,
             EVMError::Transaction(InvalidTransaction::LackOfFundForMaxFee { .. })
         ));
+    }
+
+    /// reth sets `disable_balance_check` when prewarming transactions. This validation replaces
+    /// revm's own, so it has to honour the flag.
+    #[test]
+    fn disable_balance_check_lets_an_unfunded_caller_through() {
+        let mut cfg = CfgEnv::new_with_spec(ArbSpecId::NITRO)
+            .with_chain_id(42161)
+            .with_disable_priority_fee_check(true);
+        cfg.disable_balance_check = true;
+        let mut evm = make_evm_with_cfg(InMemoryDB::default(), cfg, 0);
+
+        let tx = make_call_tx(0x02, Address::with_last_byte(1), Address::ZERO);
+        assert!(
+            evm.transact_one(tx).is_ok(),
+            "an unfunded caller must be accepted when the balance check is disabled"
+        );
+    }
+
+    fn simulation_cfg(disable_base_fee: bool) -> CfgEnv<ArbSpecId> {
+        let mut cfg = CfgEnv::new_with_spec(ArbSpecId::NITRO)
+            .with_chain_id(42161)
+            .with_disable_priority_fee_check(true);
+        cfg.disable_base_fee = disable_base_fee;
+        cfg
+    }
+
+    fn simulated_tx(gas_price: u128) -> ArbTransaction<TxEnv> {
+        let mut tx = make_call_tx(0x02, Address::with_last_byte(1), Address::ZERO);
+        // Stands in for the estimation ceiling: gas_limit * basefee is far past any balance.
+        tx.base.gas_limit = 30_000_000;
+        tx.base.gas_price = gas_price;
+        tx
+    }
+
+    /// geth lowers the block base fee to zero for a simulation that names no gas price, so the
+    /// caller is neither balance-checked nor charged at a price it never offered.
+    #[test]
+    fn a_zero_price_simulation_is_not_charged_at_the_base_fee() {
+        let mut evm = make_evm_with_cfg(InMemoryDB::default(), simulation_cfg(true), 1_000_000_000);
+        assert!(
+            evm.transact_one(simulated_tx(0)).is_ok(),
+            "a zero-price simulation must not be balance-checked at the base fee"
+        );
+    }
+
+    /// The other side of the same rule: a simulation that does name a price is checked against it.
+    #[test]
+    fn a_priced_simulation_is_still_balance_checked() {
+        let mut evm = make_evm_with_cfg(InMemoryDB::default(), simulation_cfg(true), 1_000_000_000);
+        assert!(
+            matches!(
+                evm.transact_one(simulated_tx(1_000_000_000)),
+                Err(EVMError::Transaction(
+                    InvalidTransaction::LackOfFundForMaxFee { .. }
+                ))
+            ),
+            "a simulation that names a gas price must still be balance-checked"
+        );
+    }
+
+    /// Nothing above may reach real execution: with base fee checks on, the base fee stands.
+    #[test]
+    fn real_execution_still_charges_the_base_fee() {
+        let mut evm =
+            make_evm_with_cfg(InMemoryDB::default(), simulation_cfg(false), 1_000_000_000);
+        assert!(
+            matches!(
+                evm.transact_one(simulated_tx(1_000_000_000)),
+                Err(EVMError::Transaction(
+                    InvalidTransaction::LackOfFundForMaxFee { .. }
+                ))
+            ),
+            "an unfunded caller must not pass validation during real execution"
+        );
     }
 
     #[test]
