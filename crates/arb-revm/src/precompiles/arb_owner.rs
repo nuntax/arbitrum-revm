@@ -41,16 +41,9 @@ where
     let state = ArbosState::open();
     let block_timestamp: u64 = ctx.block_timestamp();
     let j = ctx.journal_mut();
-    let is_owner = match state.chain_owners.is_member(call_inputs.caller, j) {
-        Ok(v) => v,
-        Err(e) => return revert_result(gas_limit, &format!("ArbOwner: owner check error: {e}")),
-    };
-    if !is_owner {
-        return revert_result(
-            gas_limit,
-            "ArbOwner: unauthorized caller to access-controlled method",
-        );
-    }
+    // Ownership is enforced by Nitro's `OwnerPrecompile` wrapper before this body is reached, so
+    // a non-owner never gets here (it fails with the whole budget consumed). See
+    // `precompiles/mod.rs::run_owner_wrapper`.
 
     // Needed to gate the per-method owner events the same way Nitro does (>= ArbosVersion_60).
     let arbos_version = match state.arbos_version.get(j) {

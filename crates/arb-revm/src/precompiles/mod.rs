@@ -161,6 +161,12 @@ impl ArbPrecompilesEnum {
             return self.run_filtered_manager_wrapper(ctx, call, arbos_version);
         }
 
+        // ArbOwner is wrapped by Nitro's `OwnerPrecompile`, whose ownership check likewise runs
+        // ahead of the inner precompile's selector and mutability checks.
+        if arb == ArbPrecompilesEnum::ArbOwner {
+            return self.run_owner_wrapper(ctx, call, arbos_version);
+        }
+
         self.run_active_dispatch(ctx, call, arbos_version)
     }
 
@@ -233,15 +239,10 @@ impl ArbPrecompilesEnum {
                 result.gas.spend_all();
             }
         }
-        // ArbOwner is wrapped by Nitro's `OwnerPrecompile`, which returns `multigas.ZeroGas()`
-        // the chain owner is NEVER charged for an ArbOwner call (success or revert), so it pays
-        // neither the method gas nor the per-call arg/result-copy + ArbosState-open gas. Reset to
-        // zero-spent and skip the extra. (ArbDebug's `DebugPrecompile` does NOT do this, it charges
-        // normally, so only ArbOwner is exempt.)
-        if arb == ArbPrecompilesEnum::ArbOwner {
-            result.gas = Gas::new(gas_limit);
-            return result;
-        }
+        // ArbOwner's fee exemption is NOT applied here: it belongs to Nitro's `OwnerPrecompile`
+        // wrapper and is conditional on the caller actually being a chain owner. See
+        // `run_owner_wrapper`, which owns that reset and burns everything for anyone else.
+        // (ArbDebug's `DebugPrecompile` has no such exemption at all, it charges normally.)
         // A pre-ArbOS 11 ordinary error has already consumed the complete budget. Returning here
         // preserves a revert result instead of letting the later extra-gas fold rewrite it to OOG.
         if ordinary_error && arbos_version < 11 {
@@ -315,6 +316,61 @@ impl ArbPrecompilesEnum {
             let recorded = result.gas.record_regular_cost(FREE_ACCESS_CHECK_GAS);
             debug_assert!(recorded);
         }
+        result
+    }
+
+    /// Nitro `OwnerPrecompile.Call` (`precompiles/wrapper.go`), used only by ArbOwner (0x70).
+    ///
+    /// The wrapper opens ArbOS state and checks `ChainOwners.IsMember(caller)` BEFORE the inner
+    /// precompile runs, so the caller's authority decides the gas outcome before any selector,
+    /// mutability or method-version check is reached:
+    ///
+    /// * chain owner: the call is free whatever the inner result, success or revert. Nitro returns
+    ///   `gasSupplied` untouched precisely so the owner is never charged.
+    /// * anyone else: Nitro returns a plain Go error, NOT `vm.ErrExecutionReverted`, and geth
+    ///   consumes the whole supplied budget for any non-revert precompile error. This is the
+    ///   difference between a probe of 0x70 costing nothing and costing every gas it was given.
+    fn run_owner_wrapper<CTX>(
+        &self,
+        ctx: &mut CTX,
+        call: &ArbCall,
+        arbos_version: u64,
+    ) -> InterpreterResult
+    where
+        CTX: ArbPrecompileCtx,
+    {
+        debug_assert_eq!(*self, ArbPrecompilesEnum::ArbOwner);
+
+        // OpenArbosState(version read) + ChainOwners.IsMember(storage read), charged to the
+        // wrapper's own burner. Running out here errors before the ownership check, which geth
+        // again turns into an all-gas-consumed failure, for owners and non-owners alike.
+        const OWNER_CHECK_GAS: u64 = 2 * crate::arb_journal::STORAGE_READ_COST;
+        if call.gas_limit < OWNER_CHECK_GAS {
+            return gated_revert_result(call.gas_limit);
+        }
+
+        let is_owner = match ArbosState::open()
+            .chain_owners
+            .is_member(call.caller, ctx.journal_mut())
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return fatal_result(
+                    call.gas_limit,
+                    &format!("ArbOwner wrapper: owner check storage error: {error}"),
+                );
+            }
+        };
+        if !is_owner {
+            return gated_revert_result(call.gas_limit);
+        }
+
+        let mut result = self.run_active_dispatch(ctx, call, arbos_version);
+        if result.result == InstructionResult::FatalExternalError {
+            return result;
+        }
+        // Owner reached the inner precompile: charge nothing, whatever it returned.
+        result.gas = Gas::new(call.gas_limit);
         result
     }
 

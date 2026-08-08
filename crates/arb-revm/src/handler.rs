@@ -3230,17 +3230,21 @@ mod tests {
             "ArbOwner should reject callers that are not chain owners"
         );
 
-        let revert_data = out
-            .result
-            .output()
-            .expect("revert should include encoded error data");
-        let expected = b"unauthorized caller to access-controlled method";
+        // Nitro's OwnerPrecompile returns `nil` output plus a plain Go error, not
+        // `vm.ErrExecutionReverted`, and geth consumes the entire supplied budget for any
+        // non-revert precompile error. So the caller sees no returndata (the message reaches the
+        // tracer/RPC error field only) and gets nothing back. Charging the owner exemption to a
+        // non-owner instead is what undercharged arb1 block 195122972 by 25,966,517 gas.
         assert!(
-            revert_data
-                .as_ref()
-                .windows(expected.len())
-                .any(|window| window == expected),
-            "revert payload should include Nitro-compatible owner-access message"
+            out.result
+                .output()
+                .is_none_or(|output| output.as_ref().is_empty()),
+            "an unauthorized ArbOwner call returns no revert data"
+        );
+        assert_eq!(
+            out.result.tx_gas_used(),
+            1_000_000,
+            "an unauthorized ArbOwner call consumes the whole gas limit"
         );
     }
 
