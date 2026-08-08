@@ -140,10 +140,17 @@ impl ArbPrecompilesEnum {
                 );
             }
         };
-        // Nitro wraps 0x74 in `FreeAccessPrecompile`. The wrapper runs before the wrapped
-        // precompile's whole-precompile version gate, selector/delegate-call checks, and body, and
-        // gives both its access check and the inner call the original gas supply. Consequently
-        // these are two independent budgets:
+        // Precompile not yet active => behaves like an account with no code. This gate comes first
+        // for every precompile, wrapped ones included: Nitro registers a precompile only in the
+        // bucket maps at or above its own `arbosVersion` (`gethhook/geth-hook.go`), so below that
+        // version the address holds no contract at all and no wrapper exists to run.
+        if arbos_version < precompile_min_arbos_version(arb) {
+            return empty_active_result(gas_limit);
+        }
+
+        // From v60 Nitro wraps 0x74 in `FreeAccessPrecompile`. The wrapper runs before the wrapped
+        // precompile's selector/delegate-call checks and body, and gives both its access check and
+        // the inner call the original gas supply. Consequently these are two independent budgets:
         //
         // * registered filterer: the outer 1600-gas check must fit, then all gas is restored;
         // * everyone else: the inner call must fit, but only the outer 1600 gas is charged.
@@ -152,11 +159,6 @@ impl ArbPrecompilesEnum {
         // folded through the wrapper exactly like successful public view calls.
         if arb == ArbPrecompilesEnum::ArbFilteredTransactionsManager {
             return self.run_filtered_manager_wrapper(ctx, call, arbos_version);
-        }
-
-        // Precompile not yet active => behaves like an account with no code.
-        if arbos_version < precompile_min_arbos_version(arb) {
-            return empty_active_result(gas_limit);
         }
 
         self.run_active_dispatch(ctx, call, arbos_version)
@@ -291,13 +293,10 @@ impl ArbPrecompilesEnum {
         };
 
         // The wrapped call receives the original gas supply, not the outer burner's remainder.
-        // Its own whole-precompile version check happens inside the wrapper in Nitro, so a pre-v60
-        // call returns empty success but still incurs this outer access check for non-filterers.
-        let mut result = if arbos_version < precompile_min_arbos_version(*self) {
-            empty_active_result(call.gas_limit)
-        } else {
-            self.run_active_dispatch(ctx, call, arbos_version)
-        };
+        // Only reachable at v60+; below that `run_dispatch`'s version gate already returned, since
+        // Nitro does not register the precompile (or its wrapper) in the pre-v60 bucket maps.
+        debug_assert!(arbos_version >= precompile_min_arbos_version(*self));
+        let mut result = self.run_active_dispatch(ctx, call, arbos_version);
         if result.result == InstructionResult::FatalExternalError {
             return result;
         }
@@ -348,6 +347,17 @@ impl ArbPrecompilesEnum {
             }
             Self::ArbDebug => run_arb_debug(ctx, raw, gas_limit),
         }
+    }
+
+    /// The ArbOS precompile addresses that exist at `arbos_version`, i.e. the ones Nitro's
+    /// `gethhook/geth-hook.go` registers in that version's bucket map. This is the set that must
+    /// be pre-warmed for EIP-2929: an address whose precompile is not yet active is an ordinary
+    /// empty account and a call to it pays the 2600 cold-access cost.
+    pub fn active_addresses(arbos_version: u64) -> impl Iterator<Item = Address> {
+        Self::all_addresses().filter(move |addr| {
+            Self::from_address(addr)
+                .is_some_and(|arb| arbos_version >= precompile_min_arbos_version(arb))
+        })
     }
 
     pub fn all_addresses() -> impl Iterator<Item = Address> {
@@ -690,39 +700,46 @@ fn method_arbos_bounds(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> (u64, u64) {
 }
 
 /// Eth precompile set for an ArbOS version, mirroring Nitro's `activePrecompiledContracts`
-/// (`gethhook/geth-hook.go`): ArbOS 30-49 = Cancun (0x01-0x0a, NO BLS) + the standalone
-/// secp256r1 P256VERIFY (RIP-7212, 0x100); ArbOS 50+ (`IsDia`) = Osaka (Prague + BLS + P256 +
-/// EIP-7823/7883 modexp). arb_revm targets ArbOS 40+. Keyed on the ArbOS version: the
-/// precompile set flips at the ArbOS 50 boundary, which is also the eth-spec Prague->Osaka
-/// boundary (see spec.rs into_eth_spec), so the sets stay aligned.
+/// (`gethhook/geth-hook.go`): below ArbOS 30 = Berlin (0x01-0x09, no KZG point evaluation and no
+/// P256); ArbOS 30-49 = Cancun (0x01-0x0a, NO BLS) + the standalone secp256r1 P256VERIFY
+/// (RIP-7212, 0x100); ArbOS 50+ (`IsDia`) = Osaka (Prague + BLS + P256 + EIP-7823/7883 modexp).
+///
+/// Keyed on the ArbOS version, not the eth spec. Nitro picks the set from the ArbOS bucket before
+/// it ever consults the eth fork rules, so on a chain whose config activates Cancun from genesis
+/// a pre-ArbOS-30 block still gets the Berlin set.
 pub fn arb_eth_precompiles(spec: ArbSpecId) -> &'static Precompiles {
-    if spec.arbos_version() >= 50 {
+    let arbos_version = spec.arbos_version();
+    if arbos_version >= 50 {
         Precompiles::osaka()
-    } else {
+    } else if arbos_version >= 30 {
         static ARBOS30: OnceLock<Precompiles> = OnceLock::new();
         ARBOS30.get_or_init(|| {
             let mut precompiles = Precompiles::cancun().clone();
             precompiles.extend([P256VERIFY]);
             precompiles
         })
+    } else {
+        Precompiles::berlin()
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ArbPrecompiles {
     pub inner: EthPrecompiles,
-    /// Whether `inner.precompiles` is the ArbOS 50+ (`IsDia`/Osaka) set. Tracked separately
-    /// because the precompile-set boundary (ArbOS 50) does not coincide with an eth-spec change.
-    is_dia: bool,
-    /// Combined warm-address set: eth precompile addresses ∪ arb precompile addresses.
-    /// Kept in sync with `inner` via `new_with_spec` and `set_spec`.
+    /// ArbOS version `inner.precompiles` and `warm` were built for. Tracked separately from the
+    /// eth spec because both the eth precompile bucket (ArbOS 30/50) and ArbOS precompile
+    /// activation (ArbOS 30/41/60) key off it, and neither boundary coincides with an eth-spec
+    /// change.
+    arbos_version: u64,
+    /// Combined warm-address set: eth precompile addresses ∪ the ArbOS precompile addresses that
+    /// are active at `arbos_version`. Kept in sync via `new_with_spec` and `set_spec`.
     warm: AddressSet,
 }
 
-fn build_warm_set(inner: &EthPrecompiles) -> AddressSet {
+fn build_warm_set(inner: &EthPrecompiles, arbos_version: u64) -> AddressSet {
     let mut warm = AddressSet::default();
     warm.clone_from(inner.warm_addresses());
-    for addr in ArbPrecompilesEnum::all_addresses() {
+    for addr in ArbPrecompilesEnum::active_addresses(arbos_version) {
         warm.insert(addr);
     }
     warm
@@ -732,10 +749,11 @@ impl ArbPrecompiles {
     pub fn new_with_spec(spec: ArbSpecId) -> Self {
         let mut inner = EthPrecompiles::new(spec.into());
         inner.precompiles = arb_eth_precompiles(spec);
-        let warm = build_warm_set(&inner);
+        let arbos_version = spec.arbos_version();
+        let warm = build_warm_set(&inner, arbos_version);
         Self {
             inner,
-            is_dia: spec.arbos_version() >= 50,
+            arbos_version,
             warm,
         }
     }
@@ -755,16 +773,17 @@ where
 
     fn set_spec(&mut self, spec: <CTX::Cfg as revm::context::Cfg>::Spec) -> bool {
         let eth_spec = spec.into();
-        let is_dia = spec.arbos_version() >= 50;
-        // The precompile set flips at the ArbOS 50 (IsDia) boundary even though the eth spec
-        // (Prague) is unchanged, so the bucket must be compared in addition to the eth spec.
-        if eth_spec == self.inner.spec && is_dia == self.is_dia {
+        let arbos_version = spec.arbos_version();
+        // Both precompile sets flip on ArbOS-version boundaries that the eth spec does not see
+        // (the ArbOS 50 set change keeps Prague; ArbOS 30/41/60 activate ArbOS precompiles), so
+        // compare the ArbOS version in addition to the eth spec.
+        if eth_spec == self.inner.spec && arbos_version == self.arbos_version {
             return false;
         }
         self.inner.precompiles = arb_eth_precompiles(spec);
         self.inner.spec = eth_spec;
-        self.is_dia = is_dia;
-        self.warm = build_warm_set(&self.inner);
+        self.arbos_version = arbos_version;
+        self.warm = build_warm_set(&self.inner, arbos_version);
         true
     }
 
@@ -813,13 +832,15 @@ mod gating_tests {
     // Note: do NOT `use ArbPrecompilesEnum::*` here, the variant names (ArbGasInfo, ArbOwner, …)
     // would shadow the sol-interface modules of the same name and break `Module::methodCall::SELECTOR`.
     use super::{
-        ARB_ADDRESS_TABLE, ARB_RETRYABLE_TX, ArbAddressTable, ArbAggregator, ArbDebug,
+        ARB_ADDRESS_TABLE, ARB_FILTERED_TRANSACTIONS_MANAGER, ARB_NATIVE_TOKEN_MANAGER,
+        ARB_RETRYABLE_TX, ARB_SYS, ARB_WASM, ArbAddressTable, ArbAggregator, ArbDebug,
         ArbFunctionTable, ArbGasInfo, ArbOwner, ArbOwnerPublic, ArbRetryableTx, ArbSys, ArbWasm,
     };
     use super::{
-        ArbPrecompilesEnum as E, MethodPurity, method_arbos_bounds, method_is_pure, method_purity,
-        precompile_min_arbos_version,
+        ArbPrecompilesEnum as E, MethodPurity, arb_eth_precompiles, method_arbos_bounds,
+        method_is_pure, method_purity, precompile_min_arbos_version,
     };
+    use crate::ArbSpecId;
     use crate::{
         api::default_ctx::{ArbContext, DefaultArb},
         arb_journal::ArbCall,
@@ -1047,6 +1068,57 @@ mod gating_tests {
         // AddressTable length read (800) + OpenArbosState (800) + one argument word (3).
         assert_eq!(after.gas.total_gas_spent(), 1_603);
         assert!(after.output.is_empty());
+    }
+
+    /// An ArbOS precompile that is not active yet is an ordinary empty account, so it must not be
+    /// pre-warmed for EIP-2929. Warming 0x74 at ArbOS 20 charged a caller warm (100) instead of
+    /// cold (2600) access and undercharged arb1 block 195002272 by 2500 of its 900-gas gap.
+    #[test]
+    fn warm_set_only_contains_arbos_precompiles_active_at_that_version() {
+        for (version, expected) in [
+            (20_u64, false),
+            (29, false),
+            (30, false),
+            (41, false),
+            (59, false),
+            (60, true),
+            (61, true),
+        ] {
+            let active: Vec<_> = E::active_addresses(version).collect();
+            assert_eq!(
+                active.contains(&ARB_FILTERED_TRANSACTIONS_MANAGER),
+                expected,
+                "0x74 (v60) activity at ArbOS {version}"
+            );
+            // Ungated precompiles are present at every version.
+            assert!(active.contains(&ARB_SYS), "ArbSys missing at ArbOS {version}");
+            assert_eq!(
+                active.contains(&ARB_WASM),
+                version >= 30,
+                "0x71 (v30) activity at ArbOS {version}"
+            );
+            assert_eq!(
+                active.contains(&ARB_NATIVE_TOKEN_MANAGER),
+                version >= 41,
+                "0x73 (v41) activity at ArbOS {version}"
+            );
+        }
+    }
+
+    /// Nitro picks the eth precompile set from the ArbOS bucket, not the eth fork: below ArbOS 30
+    /// it is Berlin, which has neither KZG point evaluation (0x0a) nor P256VERIFY (0x100).
+    #[test]
+    fn eth_precompile_set_is_berlin_below_arbos_30() {
+        let point_eval = Address::with_last_byte(0x0a);
+        let p256 = *super::P256VERIFY.address();
+
+        let below = arb_eth_precompiles(ArbSpecId::ARBOS_20);
+        assert!(!below.addresses_set().contains(&point_eval));
+        assert!(!below.addresses_set().contains(&p256));
+
+        let stylus = arb_eth_precompiles(ArbSpecId::ARBOS_30);
+        assert!(stylus.addresses_set().contains(&point_eval));
+        assert!(stylus.addresses_set().contains(&p256));
     }
 
     #[test]

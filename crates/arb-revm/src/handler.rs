@@ -2431,7 +2431,7 @@ mod tests {
     }
 
     #[test]
-    fn filtered_transaction_manager_wraps_the_inactive_inner_precompile_before_arbos_60() {
+    fn filtered_transaction_manager_is_an_empty_account_before_arbos_60() {
         let caller = Address::with_last_byte(0x7e);
         let tx_hash = B256::repeat_byte(0x5d);
         let mut db = InMemoryDB::default();
@@ -2475,10 +2475,15 @@ mod tests {
                 .output()
                 .is_none_or(|output| output.as_ref().is_empty())
         );
+        // Nitro registers 0x74 (and its FreeAccessPrecompile wrapper) only in the ArbOS 60 bucket
+        // map, so at v59 the address holds no contract: the call runs nothing and burns no gas,
+        // and the tx settles at the EIP-7623 calldata floor (21000 + 144 tokens * 10) rather than
+        // the 21_576 standard intrinsic. Charging the wrapper's 1600-gas access check here is what
+        // undercharged arb1 block 195002272 by 900.
         assert_eq!(
             result.result.tx_gas_used(),
-            21_576 + 1_600,
-            "Nitro's outer FreeAccessPrecompile remains active around the inactive v59 inner call"
+            22_440,
+            "a pre-v60 call to 0x74 must cost nothing beyond the tx floor"
         );
     }
 
