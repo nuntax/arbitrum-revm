@@ -858,7 +858,12 @@ async fn main() -> Result<()> {
         basefee: header.base_fee_per_gas.unwrap_or(0),
         difficulty: header.difficulty,
         beneficiary: header.beneficiary,
-        prevrandao: Some(header.mix_hash),
+        // geth NewEVMBlockContext sets Context.Random = BigToHash(header.Difficulty) whenever
+        // Difficulty != 0, and Nitro always sets L2 difficulty to 1, so DIFFICULTY/PREVRANDAO
+        // (0x44) returns 1. The mixHash is ArbOS metadata (send_count / l1_block_number /
+        // arbos_version, decoded just below) and must never reach 0x44, or a contract that hashes
+        // it produces a value that cannot match canonical. Mirrors arb-reth-evm's build_evm_env.
+        prevrandao: Some(B256::from(header.difficulty.to_be_bytes::<32>())),
         ..Default::default()
     };
     let recorded_block_env = block_env.clone();
