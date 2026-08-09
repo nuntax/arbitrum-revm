@@ -288,8 +288,9 @@ where
             if donated_gas < RETRY_TX_GAS_MINIMUM {
                 // Nitro has already metered RetryableSizeBytes, OpenRetryable,
                 // IncrementNumTries, and MakeTx before it discovers that the remaining donation
-                // cannot fund a retry transaction. This is an ordinary pre-ArbOS-11 error, so the
-                // shared wrapper must preserve that burned gas and return empty revert data.
+                // cannot fund a retry transaction. This is an ordinary precompile error; at
+                // ArbOS 11 and later, the shared wrapper preserves that burned gas and returns
+                // empty revert data.
                 let mut result = ordinary_error_result(gas_limit);
                 // `read_burns` includes the generic `makeContext` charge, which
                 // `run_active_dispatch` folds in after this handler returns.
