@@ -182,6 +182,8 @@ where
         }
         ArbRetryableTx::ArbRetryableTxCalls::redeem(c) => {
             let redeem_input_len = input.len();
+            let call_input_extra = ARBOS_STATE_OPEN_GAS
+                + COPY_GAS * words_for_bytes(redeem_input_len.saturating_sub(4));
             let current_timestamp: u64 = ctx.block_timestamp();
             let retryable = state.retryables.retryable(c.ticketId);
 
@@ -284,10 +286,17 @@ where
             }
             let donated_gas = gas_limit - reserved;
             if donated_gas < RETRY_TX_GAS_MINIMUM {
-                return revert_result(
-                    gas_limit,
-                    "ArbRetryableTx: not enough gas to run redeem attempt",
-                );
+                // Nitro has already metered RetryableSizeBytes, OpenRetryable,
+                // IncrementNumTries, and MakeTx before it discovers that the remaining donation
+                // cannot fund a retry transaction. This is an ordinary pre-ArbOS-11 error, so the
+                // shared wrapper must preserve that burned gas and return empty revert data.
+                let mut result = ordinary_error_result(gas_limit);
+                // `read_burns` includes the generic `makeContext` charge, which
+                // `run_active_dispatch` folds in after this handler returns.
+                let _ = result
+                    .gas
+                    .record_regular_cost(read_burns.saturating_sub(call_input_extra));
+                return result;
             }
 
             let chain_id = match ctx.tx_chain_id() {
@@ -359,8 +368,6 @@ where
             // MultiConstraintFix, the historical fixed reservation can even be smaller than the
             // actual constraint traversal; Nitro then runs out of gas and reverts the redeem.
             // v60+ charges and consumes the same fixed 20800 with storage metering disabled.
-            let call_input_extra = ARBOS_STATE_OPEN_GAS
-                + COPY_GAS * words_for_bytes(redeem_input_len.saturating_sub(4));
             if actual_backlog_update_cost > backlog_update_cost {
                 // Leave exactly the generic call overhead unspent here. `run_active_dispatch`
                 // consumes it after the body returns, producing Nitro's all-gas execution revert
