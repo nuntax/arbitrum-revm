@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use revm::primitives::{Address, B256, HashMap, U256};
 
 /// Arbitrum chain-scoped execution context carried alongside block/tx/cfg.
@@ -48,6 +50,10 @@ pub struct ArbChainContext {
     /// model to price page growth across the tx's (possibly nested) Stylus calls.
     pub stylus_pages_open: u16,
     pub stylus_pages_ever: u16,
+    /// Code hashes invoked by Stylus in this block, most-recent first. Nitro's `RecentWasms`
+    /// cache is discarded at block end and makes repeat program calls use cached-init pricing
+    /// from ArbOS 60 onward.
+    recent_wasms: VecDeque<B256>,
     /// Gas refund accrued within a Stylus frame. This includes EVM sub-calls made through
     /// call/create hostios and direct `SetTrieSlots` writes. Nitro journals both in StateDB;
     /// revm's normal frame return only propagates the former when it owns the sub-frame, so the
@@ -91,6 +97,7 @@ impl ArbChainContext {
             arbos_version: None,
             stylus_pages_open: 0,
             stylus_pages_ever: 0,
+            recent_wasms: VecDeque::new(),
             stylus_refund: 0,
             stylus_program_spans: HashMap::default(),
             filtered_tx: false,
@@ -109,6 +116,24 @@ impl ArbChainContext {
     pub fn with_base_fee_in_block(mut self, base_fee_in_block: u64) -> Self {
         self.base_fee_in_block = Some(base_fee_in_block);
         self
+    }
+
+    /// Inserts a Stylus code hash in Nitro's block-scoped LRU and returns whether it was already
+    /// present. Nitro normalizes a zero capacity to one entry.
+    pub fn insert_recent_wasm(&mut self, code_hash: B256, capacity: u16) -> bool {
+        let capacity = usize::from(capacity.max(1));
+
+        if let Some(index) = self.recent_wasms.iter().position(|hash| *hash == code_hash) {
+            self.recent_wasms.remove(index);
+            self.recent_wasms.push_front(code_hash);
+            return true;
+        }
+
+        if self.recent_wasms.len() >= capacity {
+            self.recent_wasms.pop_back();
+        }
+        self.recent_wasms.push_front(code_hash);
+        false
     }
 
     /// Resets per-tx gas accounting state. Called at the start of each transaction.
@@ -133,11 +158,37 @@ impl ArbChainContext {
 
 #[cfg(test)]
 mod tests {
+    use revm::primitives::B256;
+
     use super::ArbChainContext;
 
     #[test]
     fn builds_chain_context_from_non_block_inputs() {
         let ctx = ArbChainContext::new(Some(42));
         assert_eq!(ctx.sequence_number, Some(42));
+    }
+
+    #[test]
+    fn recent_wasms_uses_block_scoped_lru_semantics() {
+        let a = B256::with_last_byte(1);
+        let b = B256::with_last_byte(2);
+        let c = B256::with_last_byte(3);
+        let mut ctx = ArbChainContext::new(None);
+
+        assert!(!ctx.insert_recent_wasm(a, 2));
+        assert!(!ctx.insert_recent_wasm(b, 2));
+        assert!(ctx.insert_recent_wasm(a, 2));
+        assert!(!ctx.insert_recent_wasm(c, 2));
+        assert!(ctx.insert_recent_wasm(a, 2));
+        assert!(!ctx.insert_recent_wasm(b, 2));
+
+        let mut zero_capacity = ArbChainContext::new(None);
+        assert!(!zero_capacity.insert_recent_wasm(a, 0));
+        assert!(zero_capacity.insert_recent_wasm(a, 0));
+        assert!(!zero_capacity.insert_recent_wasm(b, 0));
+        assert!(!zero_capacity.insert_recent_wasm(a, 0));
+
+        let mut next_block = ArbChainContext::new(None);
+        assert!(!next_block.insert_recent_wasm(a, 2));
     }
 }

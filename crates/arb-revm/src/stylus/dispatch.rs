@@ -167,10 +167,21 @@ where
                 }
             };
 
+            // Nitro tracks programs invoked in this block separately from the persisted cache
+            // flag. From ArbOS 60 onward, a repeated code hash gets cached-init pricing until
+            // the block-scoped LRU is discarded at the next block.
+            let recent_wasms_cache_hit = if arbos_version >= 60 {
+                ctx.chain_mut()
+                    .insert_recent_wasm(code_hash, params.block_cache_size)
+            } else {
+                false
+            };
+            let cached_for_pricing = program.cached || recent_wasms_cache_hit;
+
             // Charge page + init/cached gas before running, from the stored program info.
             // Per Nitro programs.go `CallProgram`: for a cached program OR Stylus version > 1,
             // the cached-init cost is charged; for a non-cached program the init cost is charged
-            // too (version 1 folded cached into init). recentWasmsCacheHit is ArbOS >= 60 only.
+            // too (version 1 folded cached into init).
             let mut gas = Gas::new(gas_limit);
             // Stylus memory model: price page growth against the tx's current open/ever pages,
             // then add this program's footprint (Nitro statedb AddStylusPages). `open` is
@@ -188,14 +199,14 @@ where
             ctx.chain_mut().stylus_pages_open = new_open;
             ctx.chain_mut().stylus_pages_ever = pages_ever.max(new_open);
             let mut init_cost = 0u64;
-            if program.cached || program.version > 1 {
+            if cached_for_pricing || program.version > 1 {
                 init_cost += cached_gas_cost(
                     program.cached_cost,
                     params.min_cached_init_gas,
                     params.cached_cost_scalar,
                 );
             }
-            if !program.cached {
+            if !cached_for_pricing {
                 init_cost += init_gas_cost(
                     program.init_cost,
                     params.min_init_gas,
