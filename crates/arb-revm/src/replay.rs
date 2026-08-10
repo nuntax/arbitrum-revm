@@ -21,17 +21,17 @@ use std::collections::BTreeMap;
 
 use arbitrum_alloy_rpc_types::ArbTransaction as RpcArbTransaction;
 use revm::{
-    DatabaseRef, ExecuteCommitEvm, ExecuteEvm,
     context::{BlockEnv, CfgEnv, TxEnv},
     database::CacheDB,
-    primitives::{Address, B256, Bytes, KECCAK_EMPTY, StorageKey, StorageValue, U256},
+    primitives::{Address, Bytes, StorageKey, StorageValue, B256, KECCAK_EMPTY, U256},
     state::{AccountInfo, Bytecode, EvmState},
+    DatabaseRef, ExecuteCommitEvm, ExecuteEvm,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ArbBuilder, ArbChainContext, ArbContext, ArbSpecId, ArbTransaction, DefaultArb,
-    transaction::arb_envelope_to_tx_env,
+    transaction::arb_envelope_to_tx_env, ArbBuilder, ArbChainContext, ArbContext, ArbSpecId,
+    ArbTransaction, DefaultArb,
 };
 
 /// Current on-disk fixture schema identifier.
@@ -355,6 +355,12 @@ pub fn replay_fixture(fixture: &ReplayFixture) -> ReplayReport {
         .with_chain_id(fixture.chain_id)
         .with_disable_priority_fee_check(true);
     cfg_env.disable_balance_check = true;
+    // Match the live replayer and production executor: Arbitrum enables EIP-7623 only after its
+    // on-chain calldata-price-increase feature flips. The fixture's prestate includes this bit,
+    // so read it rather than inheriting revm's Ethereum default.
+    cfg_env.disable_eip7623 = !crate::ArbosState::open()
+        .features
+        .read_calldata_price_increase_db(&mut db);
     // Match production's Stylus bytecode handling. Valid Stylus program code begins with 0xEF.
     cfg_env.disable_eip3541 = spec.is_enabled_in(ArbSpecId::ARBOS_30);
     // Nitro exempts Arbitrum from the EIP-7825 per-tx gas cap (Osaka / ArbOS 50+); match it.

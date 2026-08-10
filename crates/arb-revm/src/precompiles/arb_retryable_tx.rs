@@ -9,6 +9,7 @@ use revm::{
 
 const REDEEM_SCHEDULED_EVENT_SIGNATURE: &[u8] =
     b"RedeemScheduled(bytes32,bytes32,uint64,uint64,address,uint256,uint256)";
+const LIFETIME_EXTENDED_EVENT_SIGNATURE: &[u8] = b"LifetimeExtended(bytes32,uint256)";
 const RETRY_TX_GAS_MINIMUM: u64 = 21_000;
 // EVM log gas (go-ethereum params/protocol_params.go); version-independent.
 const LOG_GAS: u64 = 375; // params.LogGas
@@ -22,6 +23,7 @@ const LOG_DATA_GAS: u64 = 8; // params.LogDataGas
 const REDEEM_SCHEDULED_EVENT_DATA_BYTES: u64 = 128; // 4 * 32-byte words
 const REDEEM_SCHEDULED_EVENT_GAS: u64 =
     LOG_GAS + 4 * LOG_TOPIC_GAS + REDEEM_SCHEDULED_EVENT_DATA_BYTES * LOG_DATA_GAS; // 2899
+const LIFETIME_EXTENDED_EVENT_GAS: u64 = LOG_GAS + 2 * LOG_TOPIC_GAS + 32 * LOG_DATA_GAS; // 1381
 const REDEEM_COPY_GAS: u64 = 3; // params.CopyGas (gasCostToReturnResult)
 // Nitro ArbOS pricer version boundaries (go-ethereum/params/config_arbitrum.go). At and after
 // `SingleGasConstraints` the redeem's backlog reservation includes an extra `GasModelToUse` read;
@@ -45,6 +47,14 @@ const REDEEM_READ_BURNS_BASE: u64 = 28_353;
 // StorageReadCost. arb_revm's ArbosState reads are free, so charge the equivalent so the not-found
 // path burns the same computation gas as canonical.
 const REDEEM_NOT_FOUND_READ_BURNS: u64 = 2 * REDEEM_STORAGE_READ;
+// Nitro `ArbRetryableTx.Keepalive` has to prepay an update proportional to the serialized
+// retryable size, append a duplicate timeout-queue entry, extend the window counter, pay the
+// future reaper, and emit `LifetimeExtended`. ArbOS storage is unmetered in the Rust model, so
+// mirror the corresponding burner charges explicitly.
+const KEEPALIVE_RETRYABLE_FIXED_BYTES: u64 = 7 * 32;
+const KEEPALIVE_UPDATE_COST_PER_WORD: u64 = 200; // params.SstoreSetGasEIP2200 / 100
+const KEEPALIVE_QUEUE_AND_WINDOW_WRITES: u64 = 3 * 20_000;
+const KEEPALIVE_REAP_PRICE: u64 = 58_000;
 // `NoTicketWithID()` custom-error selector, the revert reason Nitro returns for a missing ticket at
 // ArbOS >= 3 (oldNotFoundError). Matching it also matches the revert-output copy gas.
 const NO_TICKET_WITH_ID_SELECTOR: [u8; 4] = [0x80, 0x69, 0x84, 0x56];
@@ -131,26 +141,193 @@ where
         },
         ArbRetryableTx::ArbRetryableTxCalls::keepalive(c) => {
             let record = state.retryables.retryable(c.ticketId);
-            let timeout = match record.timeout_with_windows(ctx.journal_mut()) {
-                Ok(t) => t,
-                Err(e) => return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}")),
+            let current_time = ctx.block_timestamp();
+            let arbos_version = match state.arbos_version.get(ctx.journal_mut()) {
+                Ok(version) => version,
+                Err(error) => {
+                    return fatal_result(
+                        gas_limit,
+                        &format!("ArbRetryableTx: version read failed: {error}"),
+                    );
+                }
             };
-            if timeout == 0 {
-                return revert_result(gas_limit, "ArbRetryableTx: ticket does not exist");
+
+            // Nitro calls `RetryableSizeBytes` first. It opens the ticket and therefore reads the
+            // raw timeout (and, only for expired v60+ tickets, the extension-window count).
+            let raw_timeout = match record.timeout.get(ctx.journal_mut()) {
+                Ok(timeout) => timeout,
+                Err(error) => {
+                    return fatal_result(
+                        gas_limit,
+                        &format!("ArbRetryableTx: retryable timeout read failed: {error}"),
+                    );
+                }
+            };
+            let mut read_count = 1_u64;
+            let mut ticket_exists = raw_timeout != 0;
+            if ticket_exists && raw_timeout < current_time {
+                if arbos_version >= ARBOS_VERSION_MULTI_GAS_CONSTRAINTS {
+                    let windows = match record.timeout_windows_left.get(ctx.journal_mut()) {
+                        Ok(windows) => windows,
+                        Err(error) => {
+                            return fatal_result(
+                                gas_limit,
+                                &format!(
+                                    "ArbRetryableTx: retryable extension-window read failed: {error}"
+                                ),
+                            );
+                        }
+                    };
+                    read_count += 1;
+                    ticket_exists = raw_timeout
+                        .saturating_add(windows.saturating_mul(RETRYABLE_LIFETIME_SECONDS))
+                        >= current_time;
+                } else {
+                    ticket_exists = false;
+                }
             }
-            let new_timeout = timeout.saturating_add(RETRYABLE_LIFETIME_SECONDS);
-            match record.timeout.set(new_timeout, ctx.journal_mut()) {
-                Ok(_) => {}
-                Err(e) => return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}")),
+            if !ticket_exists {
+                return keepalive_not_found_result(gas_limit, read_count, arbos_version);
             }
-            match record.timeout_windows_left.set(0, ctx.journal_mut()) {
-                Ok(_) => {}
-                Err(e) => return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}")),
+
+            let calldata_size = match record.calldata.size(ctx.journal_mut()) {
+                Ok(size) => size,
+                Err(error) => {
+                    return fatal_result(
+                        gas_limit,
+                        &format!("ArbRetryableTx: retryable calldata size read failed: {error}"),
+                    );
+                }
+            };
+            read_count += 1;
+            let retryable_size = KEEPALIVE_RETRYABLE_FIXED_BYTES.saturating_add(
+                32 * words_for_bytes(calldata_size.try_into().unwrap_or(usize::MAX)),
+            );
+            let update_cost = words_for_bytes(retryable_size.try_into().unwrap_or(usize::MAX))
+                .saturating_mul(KEEPALIVE_UPDATE_COST_PER_WORD);
+
+            // `RetryableState.Keepalive` opens the ticket again, then `CalculateTimeout` reads the
+            // raw timeout and window count. Keep the access order explicit, including v60's
+            // expired-ticket window read, because it determines the metered gas.
+            let timeout_for_open = match record.timeout.get(ctx.journal_mut()) {
+                Ok(timeout) => timeout,
+                Err(error) => {
+                    return fatal_result(
+                        gas_limit,
+                        &format!("ArbRetryableTx: retryable timeout read failed: {error}"),
+                    );
+                }
+            };
+            read_count += 1;
+            let mut open_ticket_exists = timeout_for_open != 0;
+            if open_ticket_exists && timeout_for_open < current_time {
+                if arbos_version >= ARBOS_VERSION_MULTI_GAS_CONSTRAINTS {
+                    let windows = match record.timeout_windows_left.get(ctx.journal_mut()) {
+                        Ok(windows) => windows,
+                        Err(error) => {
+                            return fatal_result(
+                                gas_limit,
+                                &format!(
+                                    "ArbRetryableTx: retryable extension-window read failed: {error}"
+                                ),
+                            );
+                        }
+                    };
+                    read_count += 1;
+                    open_ticket_exists = timeout_for_open
+                        .saturating_add(windows.saturating_mul(RETRYABLE_LIFETIME_SECONDS))
+                        >= current_time;
+                } else {
+                    open_ticket_exists = false;
+                }
             }
-            ok_result(
-                gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(U256::from(new_timeout),)),
-            )
+            if !open_ticket_exists {
+                return keepalive_not_found_result(gas_limit, read_count, arbos_version);
+            }
+
+            let timeout = match record.timeout.get(ctx.journal_mut()) {
+                Ok(timeout) => timeout,
+                Err(error) => {
+                    return fatal_result(
+                        gas_limit,
+                        &format!("ArbRetryableTx: retryable timeout read failed: {error}"),
+                    );
+                }
+            };
+            let windows = match record.timeout_windows_left.get(ctx.journal_mut()) {
+                Ok(windows) => windows,
+                Err(error) => {
+                    return fatal_result(
+                        gas_limit,
+                        &format!("ArbRetryableTx: retryable extension-window read failed: {error}"),
+                    );
+                }
+            };
+            read_count += 2;
+            let effective_timeout =
+                timeout.saturating_add(windows.saturating_mul(RETRYABLE_LIFETIME_SECONDS));
+            let pre_mutation_cost = read_count
+                .saturating_mul(REDEEM_STORAGE_READ)
+                .saturating_add(update_cost);
+            if effective_timeout > current_time.saturating_add(RETRYABLE_LIFETIME_SECONDS) {
+                return keepalive_ordinary_error_result(gas_limit, pre_mutation_cost);
+            }
+
+            // Queue::Put reads the write pointer and writes both the pointer and a new entry; the
+            // subsequent Increment reads and writes `timeoutWindowsLeft`.
+            read_count += 2;
+            let body_cost = read_count
+                .saturating_mul(REDEEM_STORAGE_READ)
+                .saturating_add(update_cost)
+                .saturating_add(KEEPALIVE_QUEUE_AND_WINDOW_WRITES)
+                .saturating_add(KEEPALIVE_REAP_PRICE)
+                .saturating_add(LIFETIME_EXTENDED_EVENT_GAS);
+            if gas_limit < body_cost {
+                return InterpreterResult {
+                    result: InstructionResult::OutOfGas,
+                    gas: Gas::new_spent_with_reservoir(gas_limit, 0),
+                    output: Bytes::new(),
+                };
+            }
+
+            if let Err(error) = state
+                .retryables
+                .timeout_queue
+                .put(c.ticketId, ctx.journal_mut())
+            {
+                return fatal_result(
+                    gas_limit,
+                    &format!("ArbRetryableTx: retryable timeout queue write failed: {error}"),
+                );
+            }
+            if let Err(error) = record
+                .timeout_windows_left
+                .set(windows.saturating_add(1), ctx.journal_mut())
+            {
+                return fatal_result(
+                    gas_limit,
+                    &format!("ArbRetryableTx: retryable extension-window write failed: {error}"),
+                );
+            }
+
+            let new_timeout = effective_timeout.saturating_add(RETRYABLE_LIFETIME_SECONDS);
+            ctx.journal_mut().emit_log(Log::new_unchecked(
+                call_inputs.bytecode_address,
+                vec![keccak256(LIFETIME_EXTENDED_EVENT_SIGNATURE), c.ticketId],
+                Bytes::from(alloy_core::sol_types::SolValue::abi_encode(&(U256::from(
+                    new_timeout,
+                ),))),
+            ));
+
+            let mut gas = Gas::new(gas_limit);
+            let _ = gas.record_regular_cost(body_cost);
+            InterpreterResult {
+                result: InstructionResult::Return,
+                gas,
+                output: Bytes::from(alloy_core::sol_types::SolValue::abi_encode(&(U256::from(
+                    new_timeout,
+                ),))),
+            }
         }
         ArbRetryableTx::ArbRetryableTxCalls::cancel(c) => {
             let record = state.retryables.retryable(c.ticketId);
@@ -401,6 +578,38 @@ where
                 gas,
             }
         }
+    }
+}
+
+fn keepalive_not_found_result(
+    gas_limit: u64,
+    read_count: u64,
+    arbos_version: u64,
+) -> InterpreterResult {
+    let mut gas = Gas::new(gas_limit);
+    let _ = gas.record_regular_cost(read_count.saturating_mul(REDEEM_STORAGE_READ));
+    if arbos_version >= 3 {
+        InterpreterResult {
+            result: InstructionResult::Revert,
+            gas,
+            output: Bytes::from_static(&NO_TICKET_WITH_ID_SELECTOR),
+        }
+    } else {
+        InterpreterResult {
+            result: InstructionResult::PrecompileError,
+            gas,
+            output: Bytes::new(),
+        }
+    }
+}
+
+fn keepalive_ordinary_error_result(gas_limit: u64, consumed: u64) -> InterpreterResult {
+    let mut gas = Gas::new(gas_limit);
+    let _ = gas.record_regular_cost(consumed);
+    InterpreterResult {
+        result: InstructionResult::PrecompileError,
+        gas,
+        output: Bytes::new(),
     }
 }
 
