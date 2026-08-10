@@ -65,6 +65,14 @@ pub trait ArbJournal {
     /// Deployed bytecode of `account` (empty if none).
     fn account_code(&mut self, account: Address) -> Result<Bytes, Self::Error>;
 
+    /// Deployed code hash and bytecode of `account`, without warming it for a later user-EVM
+    /// access. This is the ArbOS equivalent of Nitro's `StateDB.GetCodeHash` followed by its
+    /// unmetered code-reader lookup.
+    fn account_code_hash_and_code(
+        &mut self,
+        account: Address,
+    ) -> Result<(B256, Bytes), Self::Error>;
+
     /// Deployed bytecode of `account`, including whether this access first warmed it.
     fn account_code_load(&mut self, account: Address) -> Result<StateLoad<Bytes>, Self::Error>;
 
@@ -113,6 +121,9 @@ pub trait ArbJournal {
 pub const STORAGE_READ_COST: u64 = 800; // params.SloadGasEIP2200
 pub const STORAGE_WRITE_COST: u64 = 20_000; // params.SstoreSetGasEIP2200
 pub const STORAGE_WRITE_ZERO_COST: u64 = 5_000; // params.SstoreResetGasEIP2200
+/// Nitro's `Storage.GetCodeHash`: EIP-2929's cold account access price, charged through the
+/// ArbOS burner independently of the EVM access list.
+pub const STORAGE_CODE_HASH_COST: u64 = 2_600; // params.ColdAccountAccessCostEIP2929
 const LOG_GAS: u64 = 375; // params.LogGas
 const LOG_TOPIC_GAS: u64 = 375; // params.LogTopicGas (charged per topic, incl. the signature)
 const LOG_DATA_GAS: u64 = 8; // params.LogDataGas (per byte)
@@ -142,6 +153,23 @@ impl<'a, J: ArbJournal> MeteredJournal<'a, J> {
     #[inline]
     fn burn(&mut self, amount: u64) {
         self.burned = self.burned.saturating_add(amount);
+    }
+
+    /// Add a Nitro burner charge that is not represented by an ArbOS storage operation.
+    ///
+    /// Most callers are charged by routing a read, write, or log through this wrapper. A small
+    /// number of Nitro paths burn a value derived from consensus state instead, such as a Stylus
+    /// program's stored init cost when its cache state changes.
+    #[inline]
+    pub fn charge(&mut self, amount: u64) {
+        self.burn(amount);
+    }
+
+    /// Access the underlying journal for a Nitro operation whose logical charge differs from the
+    /// normal flat ArbOS-storage charge applied by this wrapper.
+    #[inline]
+    pub fn inner_mut(&mut self) -> &mut J {
+        self.inner
     }
 }
 
@@ -177,6 +205,13 @@ impl<J: ArbJournal> ArbJournal for MeteredJournal<'_, J> {
 
     fn account_code(&mut self, account: Address) -> Result<Bytes, Self::Error> {
         self.inner.account_code(account)
+    }
+
+    fn account_code_hash_and_code(
+        &mut self,
+        account: Address,
+    ) -> Result<(B256, Bytes), Self::Error> {
+        self.inner.account_code_hash_and_code(account)
     }
 
     fn account_code_load(&mut self, account: Address) -> Result<StateLoad<Bytes>, Self::Error> {
@@ -282,6 +317,24 @@ where
         Ok(self.code(account)?.data)
     }
 
+    fn account_code_hash_and_code(
+        &mut self,
+        account: Address,
+    ) -> Result<(B256, Bytes), Self::Error> {
+        let (code_hash, was_cold) = {
+            let loaded = self.load_account(account)?;
+            (loaded.data.info.code_hash, loaded.is_cold)
+        };
+        let code = self.code(account);
+        if was_cold {
+            self.load_account_mut_skip_cold_load(account, false)
+                .map_err(|e| e.unwrap_db_error())?
+                .data
+                .unsafe_mark_cold();
+        }
+        Ok((code_hash, code?.data))
+    }
+
     fn account_code_load(&mut self, account: Address) -> Result<StateLoad<Bytes>, Self::Error> {
         self.code(account)
     }
@@ -363,6 +416,31 @@ impl ArbJournal for ArbInternals<'_, '_> {
             .code()
             .map(|c| c.original_bytes())
             .unwrap_or_default())
+    }
+
+    fn account_code_hash_and_code(
+        &mut self,
+        account: Address,
+    ) -> Result<(B256, Bytes), Self::Error> {
+        let (code_hash, was_cold, code) = {
+            let loaded = self.0.load_account_code(account)?;
+            let code_hash = *loaded.data.code_hash();
+            let was_cold = loaded.is_cold;
+            let code = loaded
+                .data
+                .code()
+                .map(|code| code.original_bytes())
+                .unwrap_or_default();
+            (code_hash, was_cold, code)
+        };
+        if was_cold {
+            self.0
+                .load_account_mut_skip_cold_load(account, false)
+                .map_err(|e| e.unwrap_db_error())?
+                .data
+                .unsafe_mark_cold();
+        }
+        Ok((code_hash, code))
     }
 
     fn account_code_load(&mut self, account: Address) -> Result<StateLoad<Bytes>, Self::Error> {

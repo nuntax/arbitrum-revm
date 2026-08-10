@@ -1,10 +1,12 @@
 use super::*;
 use crate::arb_journal::{ArbCall, ArbPrecompileCtx};
-use crate::storage::{programs::ARBITRUM_START_TIME, stylus_param_layout as layout, unpack_uint};
+use crate::storage::{
+    programs::{ARBITRUM_START_TIME, ProgramInfo},
+    stylus_param_layout as layout, unpack_uint,
+};
 #[cfg(feature = "stylus")]
 use crate::{
     arb_journal::ArbJournal,
-    storage::programs::ProgramInfo,
     stylus::params::StylusParams,
     stylus::program::{stylus_activate, stylus_code},
 };
@@ -205,6 +207,9 @@ where
         ArbWasm::ArbWasmCalls::codehashVersion(c) => {
             codehash_version(ctx, gas_limit, &word, c.codehash)
         }
+        ArbWasm::ArbWasmCalls::codehashAsmSize(c) => {
+            codehash_asm_size(ctx, gas_limit, &word, c.codehash)
+        }
         ArbWasm::ArbWasmCalls::activateProgram(_c) => {
             #[cfg(feature = "stylus")]
             {
@@ -223,8 +228,7 @@ where
                 revert_result(gas_limit, "ArbWasm: activation requires the stylus feature")
             }
         }
-        ArbWasm::ArbWasmCalls::codehashAsmSize(_)
-        | ArbWasm::ArbWasmCalls::programVersion(_)
+        ArbWasm::ArbWasmCalls::programVersion(_)
         | ArbWasm::ArbWasmCalls::programInitGas(_)
         | ArbWasm::ArbWasmCalls::programMemoryFootprint(_)
         | ArbWasm::ArbWasmCalls::programTimeLeft(_)
@@ -244,7 +248,11 @@ fn charge_result(mut result: InterpreterResult, cost: u64) -> InterpreterResult 
     result
 }
 
-fn custom_error_result(gas_limit: u64, signature: &[u8], args: &[u8]) -> InterpreterResult {
+pub(super) fn custom_error_result(
+    gas_limit: u64,
+    signature: &[u8],
+    args: &[u8],
+) -> InterpreterResult {
     let selector = keccak256(signature);
     let mut output = Vec::with_capacity(4 + args.len());
     output.extend_from_slice(&selector[..4]);
@@ -265,19 +273,81 @@ fn codehash_version<CTX>(
 where
     CTX: ArbPrecompileCtx,
 {
+    let program = match active_program(ctx, gas_limit, params_word, code_hash) {
+        Ok(program) => program,
+        Err(result) => return result,
+    };
+    charge_result(
+        ok_result(
+            gas_limit,
+            alloy_core::sol_types::SolValue::abi_encode(&(program.version,)),
+        ),
+        PROGRAM_READ_GAS,
+    )
+}
+
+/// `ArbWasm.codehashAsmSize(bytes32)`: return the active program's estimated assembly size in
+/// bytes. Nitro stores this estimate in KiB and returns `asmEstimateKb * 1024`.
+fn codehash_asm_size<CTX>(
+    ctx: &mut CTX,
+    gas_limit: u64,
+    params_word: &[u8; 32],
+    code_hash: B256,
+) -> InterpreterResult
+where
+    CTX: ArbPrecompileCtx,
+{
+    let program = match active_program(ctx, gas_limit, params_word, code_hash) {
+        Ok(program) => program,
+        Err(result) => return result,
+    };
+    charge_result(
+        ok_result(
+            gas_limit,
+            alloy_core::sol_types::SolValue::abi_encode(&(program
+                .asm_estimate_kb
+                .saturating_mul(1024),)),
+        ),
+        PROGRAM_READ_GAS,
+    )
+}
+
+/// Nitro `Programs.getActiveProgram`: load a program record and enforce its shared query
+/// invariants. The read is metered on both success and semantic errors, matching Nitro's storage
+/// burner. The caller supplies the method-specific successful result.
+fn active_program<CTX>(
+    ctx: &mut CTX,
+    gas_limit: u64,
+    params_word: &[u8; 32],
+    code_hash: B256,
+) -> Result<ProgramInfo, InterpreterResult>
+where
+    CTX: ArbPrecompileCtx,
+{
     let state = ArbosState::open();
-    let params_version = unpack_uint(params_word, layout::VERSION.0, layout::VERSION.1) as u16;
     let program = match state.programs.read_program(code_hash, ctx.journal_mut()) {
         Ok(program) => program,
         Err(error) => {
-            return fatal_result(gas_limit, &format!("ArbWasm: program read error: {error}"));
+            return Err(fatal_result(
+                gas_limit,
+                &format!("ArbWasm: program read error: {error}"),
+            ));
         }
     };
-    let result = if program.version == 0 {
-        custom_error_result(gas_limit, b"ProgramNotActivated()", &[])
+    let params_version = unpack_uint(params_word, layout::VERSION.0, layout::VERSION.1) as u16;
+    let error = if program.version == 0 {
+        Some(custom_error_result(
+            gas_limit,
+            b"ProgramNotActivated()",
+            &[],
+        ))
     } else if program.version != params_version {
         let args = alloy_core::sol_types::SolValue::abi_encode(&(program.version, params_version));
-        custom_error_result(gas_limit, b"ProgramNeedsUpgrade(uint16,uint16)", &args)
+        Some(custom_error_result(
+            gas_limit,
+            b"ProgramNeedsUpgrade(uint16,uint16)",
+            &args,
+        ))
     } else {
         let activated_at = ARBITRUM_START_TIME
             .saturating_add(u64::from(program.activated_at).saturating_mul(3600));
@@ -288,17 +358,16 @@ where
             layout::EXPIRY_DAYS.1,
         ));
         let expiry = expiry_days.saturating_mul(24 * 60 * 60);
-        if age > expiry {
+        (age > expiry).then(|| {
             let args = alloy_core::sol_types::SolValue::abi_encode(&(age,));
             custom_error_result(gas_limit, b"ProgramExpired(uint64)", &args)
-        } else {
-            ok_result(
-                gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(program.version,)),
-            )
-        }
+        })
     };
-    charge_result(result, PROGRAM_READ_GAS)
+
+    match error {
+        Some(result) => Err(charge_result(result, PROGRAM_READ_GAS)),
+        None => Ok(program),
+    }
 }
 
 /// `ArbWasm.activateProgram(address)`: compile+instrument the program's WASM, charge the activation
