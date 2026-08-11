@@ -129,7 +129,7 @@ pub fn run_program(
     let ink_limit = stylus_config.pricing.gas_to_ink(ArbGas(gas.remaining()));
     gas.spend_all();
 
-    let (kind, output) = match instance.run_main(calldata, stylus_config, ink_limit) {
+    let (kind, mut output) = match instance.run_main(calldata, stylus_config, ink_limit) {
         Ok(outcome) => outcome.into_data(),
         Err(_) => (UserOutcomeKind::Failure, Vec::new()),
     };
@@ -140,7 +140,13 @@ pub fn run_program(
         .0;
     let result = match kind {
         UserOutcomeKind::Success => InstructionResult::Return,
-        UserOutcomeKind::Revert | UserOutcomeKind::Failure => InstructionResult::Revert,
+        UserOutcomeKind::Revert => InstructionResult::Revert,
+        // Nitro maps `userFailure` to `vm.ErrExecutionReverted` with no return bytes.
+        // The runtime error text is diagnostic-only and must not become EVM-visible.
+        UserOutcomeKind::Failure => {
+            output.clear();
+            InstructionResult::Revert
+        }
         UserOutcomeKind::OutOfInk => InstructionResult::OutOfGas,
         UserOutcomeKind::OutOfStack => {
             gas_left = 0;
