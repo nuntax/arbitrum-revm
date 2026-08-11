@@ -621,7 +621,11 @@ where
                 if outcome.instruction_result().is_ok() {
                     self.0.ctx.chain_mut().stylus_refund += outcome.gas().refunded();
                 }
-                let call_cost = gas_limit.saturating_sub(outcome.gas().remaining());
+                let call_cost = stylus_subcall_gas_cost(
+                    gas_limit,
+                    *outcome.instruction_result(),
+                    outcome.gas().remaining(),
+                );
                 return (
                     vec![status as u8],
                     VecReader::new(output),
@@ -772,6 +776,24 @@ fn stylus_call_gas_limit(available: u64, requested: u64) -> u64 {
     min(((available as u128) * 63 / 64) as u64, requested)
 }
 
+/// Gas consumed by an EVM sub-call made through a Stylus hostio.
+///
+/// A normal EVM CALL returns the child's unused gas only when it succeeded or reverted. Halts,
+/// including out-of-gas, consume the full forwarded amount. Nitro gets this from `evm.Call`'s
+/// `returnGas`; this bridge receives the raw child frame outcome and must apply the same rule.
+#[inline]
+fn stylus_subcall_gas_cost(
+    gas_limit: u64,
+    instruction_result: InstructionResult,
+    gas_remaining: u64,
+) -> u64 {
+    if instruction_result.is_ok_or_revert() {
+        gas_limit.saturating_sub(gas_remaining)
+    } else {
+        gas_limit
+    }
+}
+
 fn revert(gas_limit: u64, output: Vec<u8>) -> InterpreterAction {
     InterpreterAction::Return(InterpreterResult {
         result: InstructionResult::Revert,
@@ -785,10 +807,11 @@ mod tests {
     use revm::{
         context_interface::{ContextTr, JournalTr},
         database_interface::EmptyDB,
+        interpreter::InstructionResult,
         primitives::{Address, Bytes, Log, LogData},
     };
 
-    use super::stylus_call_gas_limit;
+    use super::{stylus_call_gas_limit, stylus_subcall_gas_cost};
     use crate::api::default_ctx::{ArbContext, DefaultArb};
 
     /// Native stack overflow recovery saves state before the run and restores it on retry using
@@ -829,5 +852,29 @@ mod tests {
     #[test]
     fn stylus_eip150_cap_respects_requested_gas() {
         assert_eq!(stylus_call_gas_limit(64_000, 12_345), 12_345);
+    }
+
+    #[test]
+    fn stylus_subcall_returns_unused_gas_only_for_success_or_revert() {
+        // Robinhood block 23,784,922 reaches the EIP-2200 reentrancy sentry with 1,674 gas
+        // remaining. Nitro's `evm.Call` turns that halt into zero return gas, so the hostio must
+        // consume all 415,851 forwarded gas rather than refunding the remainder.
+        assert_eq!(
+            stylus_subcall_gas_cost(415_851, InstructionResult::ReentrancySentryOOG, 1_674),
+            415_851
+        );
+        assert_eq!(
+            stylus_subcall_gas_cost(415_851, InstructionResult::OutOfGas, 1_674),
+            415_851
+        );
+
+        assert_eq!(
+            stylus_subcall_gas_cost(415_851, InstructionResult::Revert, 1_674),
+            414_177
+        );
+        assert_eq!(
+            stylus_subcall_gas_cost(415_851, InstructionResult::Return, 1_674),
+            414_177
+        );
     }
 }
