@@ -41,12 +41,12 @@ arbitrum-alloy-rpc-types = { git = "https://github.com/nuntax/arbitrum-alloy", r
 arbitrum-alloy-network = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "83593650bf6d07d2255e8627c417a9236cd5d02b" }
 # Brotli and every Stylus runtime crate come from one generated Nitro runtime revision. Keeping the
 # source and revision identical is required so the runtime's Wasmer types unify.
-brotli = { git = "https://github.com/nuntax/nitro-rust-runtime", rev = "1b5352e1415586454df51ddaf3cf10a07ec08736", features = ["cc_brotli"] }
+brotli = { git = "https://github.com/nuntax/nitro-rust-runtime", rev = "d8d9611bd67f4d777894c52f5312ec89b4380e76", features = ["cc_brotli"] }
 
 # Stylus WASM execution is feature-gated because the runtime and compiler are a heavy build.
-stylus = { git = "https://github.com/nuntax/nitro-rust-runtime", rev = "1b5352e1415586454df51ddaf3cf10a07ec08736", features = ["cc_brotli"], optional = true }
-arbutil = { git = "https://github.com/nuntax/nitro-rust-runtime", rev = "1b5352e1415586454df51ddaf3cf10a07ec08736", optional = true }
-wasmer-types = { git = "https://github.com/nuntax/nitro-rust-runtime", rev = "1b5352e1415586454df51ddaf3cf10a07ec08736", optional = true }
+stylus = { git = "https://github.com/nuntax/nitro-rust-runtime", rev = "d8d9611bd67f4d777894c52f5312ec89b4380e76", features = ["cc_brotli"], optional = true }
+arbutil = { git = "https://github.com/nuntax/nitro-rust-runtime", rev = "d8d9611bd67f4d777894c52f5312ec89b4380e76", optional = true }
+wasmer-types = { git = "https://github.com/nuntax/nitro-rust-runtime", rev = "d8d9611bd67f4d777894c52f5312ec89b4380e76", optional = true }
 wasm-encoder = { version = "0.244.0", optional = true }
 wasmparser = { version = "0.244.0", optional = true }
 wasmprinter = { version = "0.244.0", optional = true }

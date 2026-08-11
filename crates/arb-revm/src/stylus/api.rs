@@ -114,7 +114,7 @@ pub fn handle_request<CTX>(
     req_data: Vec<u8>,
 ) -> (Vec<u8>, VecReader, ArbGas)
 where
-    CTX: ContextTr<Chain = ArbChainContext, Journal: JournalTr>,
+    CTX: ContextTr<Chain = ArbChainContext, Journal: JournalTr, Cfg: Cfg<Spec = crate::ArbSpecId>>,
 {
     let debug = std::env::var("STYLUS_GAS_DEBUG").is_ok();
     // A valid Stylus program always sends correctly-sized hostio requests. Guard the decoders
@@ -145,14 +145,30 @@ where
         }
 
         // SSTORE batch: req = gas_left(8) ++ [key(32) ++ value(32)]* → status + total gas.
+        EvmApiMethod::SetTrieSlots if req_data.len() < 8 => malformed(),
         EvmApiMethod::SetTrieSlots => {
-            let mut total = 0u64;
+            let mut gas_left =
+                u64::from_be_bytes(req_data[..8].try_into().expect("length checked"));
+            let initial_gas = gas_left;
             let mut off = 8;
             while off + 64 <= req_data.len() {
                 let key = word(&req_data[off..]);
                 let value = word(&req_data[off + 32..]);
                 off += 64;
                 if let Ok(load) = ctx.journal_mut().sstore(contract, key, value) {
+                    let cost = sstore_cost(&load.data, load.is_cold);
+                    if cost > gas_left {
+                        // Nitro charges this hostio from the guest-supplied budget. Once a
+                        // slot cannot be paid, the entire budget is consumed and the program
+                        // receives Failure before ArbOS 50 and OutOfGas afterwards.
+                        let status = if ctx.cfg().spec().arbos_version() < 50 {
+                            EvmApiStatus::Failure
+                        } else {
+                            EvmApiStatus::OutOfGas
+                        };
+                        return (vec![status as u8], empty_reader(), ArbGas(initial_gas));
+                    }
+                    gas_left -= cost;
                     // The direct storage hostio bypasses revm's SSTORE instruction, which
                     // normally journals this refund. Preserve the full signed transition
                     // refund so clears and same-transaction restores agree with Nitro's StateDB.
@@ -162,10 +178,17 @@ where
                         .gas_params()
                         .sstore_refund(eth_spec.is_enabled_in(SpecId::ISTANBUL), &load.data);
                     ctx.chain_mut().stylus_refund += refund;
-                    total += sstore_cost(&load.data, load.is_cold);
+                    if gas_left == 0 {
+                        let status = if ctx.cfg().spec().arbos_version() < 50 {
+                            EvmApiStatus::Failure
+                        } else {
+                            EvmApiStatus::OutOfGas
+                        };
+                        return (vec![status as u8], empty_reader(), ArbGas(initial_gas));
+                    }
                 }
             }
-            (ok_status(), empty_reader(), ArbGas(total))
+            (ok_status(), empty_reader(), ArbGas(initial_gas - gas_left))
         }
 
         // TLOAD: req = key(32) → value(32).
