@@ -103,6 +103,17 @@ fn empty_reader() -> VecReader {
     VecReader::new(Vec::new())
 }
 
+/// Nitro changed exhausted `SetTrieSlots` from a generic failure to an out-of-gas status at
+/// ArbOS 50. The guest runtime handles the two statuses differently, so this is consensus logic.
+#[inline]
+fn set_trie_slots_exhausted_status(arbos_version: u64) -> EvmApiStatus {
+    if arbos_version < 50 {
+        EvmApiStatus::Failure
+    } else {
+        EvmApiStatus::OutOfGas
+    }
+}
+
 /// Decode and service one hostio request for a Stylus call executing as `contract`.
 ///
 /// Handles the state/log/transient hostios; call/create re-entrancy is left to the executor
@@ -161,11 +172,7 @@ where
                         // Nitro charges this hostio from the guest-supplied budget. Once a
                         // slot cannot be paid, the entire budget is consumed and the program
                         // receives Failure before ArbOS 50 and OutOfGas afterwards.
-                        let status = if ctx.cfg().spec().arbos_version() < 50 {
-                            EvmApiStatus::Failure
-                        } else {
-                            EvmApiStatus::OutOfGas
-                        };
+                        let status = set_trie_slots_exhausted_status(ctx.cfg().spec().arbos_version());
                         return (vec![status as u8], empty_reader(), ArbGas(initial_gas));
                     }
                     gas_left -= cost;
@@ -179,11 +186,7 @@ where
                         .sstore_refund(eth_spec.is_enabled_in(SpecId::ISTANBUL), &load.data);
                     ctx.chain_mut().stylus_refund += refund;
                     if gas_left == 0 {
-                        let status = if ctx.cfg().spec().arbos_version() < 50 {
-                            EvmApiStatus::Failure
-                        } else {
-                            EvmApiStatus::OutOfGas
-                        };
+                        let status = set_trie_slots_exhausted_status(ctx.cfg().spec().arbos_version());
                         return (vec![status as u8], empty_reader(), ArbGas(initial_gas));
                     }
                 }
@@ -315,4 +318,17 @@ where
         );
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EvmApiStatus, set_trie_slots_exhausted_status};
+
+    #[test]
+    fn set_trie_slots_exhaustion_is_version_gated() {
+        assert_eq!(set_trie_slots_exhausted_status(31), EvmApiStatus::Failure);
+        assert_eq!(set_trie_slots_exhausted_status(49), EvmApiStatus::Failure);
+        assert_eq!(set_trie_slots_exhausted_status(50), EvmApiStatus::OutOfGas);
+        assert_eq!(set_trie_slots_exhausted_status(61), EvmApiStatus::OutOfGas);
+    }
 }
