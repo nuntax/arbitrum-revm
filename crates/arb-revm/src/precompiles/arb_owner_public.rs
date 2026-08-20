@@ -172,23 +172,32 @@ where
                 Ok(v) => v,
                 Err(e) => return revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}")),
             };
-            let version = match state.upgrade_version.get(ctx.journal_mut()) {
-                Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}")),
+            let mut journal = MeteredJournal::new(ctx.journal_mut());
+            let scheduled = state.upgrade_version.get(&mut journal).and_then(|version| {
+                state
+                    .upgrade_timestamp
+                    .get(&mut journal)
+                    .map(|timestamp| (version, timestamp))
+            });
+            let mut result = match scheduled {
+                Ok((version, timestamp)) => {
+                    let (version, timestamp) = if arbos_version >= version {
+                        (0_u64, 0_u64)
+                    } else {
+                        (version, timestamp)
+                    };
+                    ok_result(
+                        gas_limit,
+                        alloy_core::sol_types::SolValue::abi_encode(&(version, timestamp)),
+                    )
+                }
+                Err(e) => revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}")),
             };
-            let timestamp = match state.upgrade_timestamp.get(ctx.journal_mut()) {
-                Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}")),
-            };
-            let (version, timestamp) = if arbos_version >= version {
-                (0_u64, 0_u64)
-            } else {
-                (version, timestamp)
-            };
-            ok_result(
-                gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(version, timestamp)),
-            )
+            if !result.gas.record_regular_cost(journal.burned) {
+                result.result = InstructionResult::OutOfGas;
+                result.output = Bytes::new();
+            }
+            result
         }
         ArbOwnerPublic::ArbOwnerPublicCalls::isCalldataPriceIncreaseEnabled(_) => {
             let enabled = match state
@@ -269,24 +278,58 @@ where
 
 #[cfg(test)]
 mod tests {
-    use alloy_core::sol_types::SolCall;
+    use alloy_core::sol_types::{SolCall, SolValue};
     use arbitrum_alloy_precompiles::addresses::ARB_OWNER_PUBLIC;
     use revm::{
         context_interface::{ContextTr, JournalTr},
         database_interface::EmptyDB,
         interpreter::InstructionResult,
-        primitives::{Address, address, keccak256},
+        primitives::{Address, U256, address, keccak256},
     };
 
-    use super::{ArbOwnerPublic, run_arb_owner_public};
+    use super::{ArbOwnerPublic, ArbPrecompilesEnum, run_arb_owner_public};
     use crate::{
         ArbosState,
         api::default_ctx::{ArbContext, DefaultArb},
+        arb_journal::ArbCall,
     };
 
     const OWNER_1: Address = address!("d345e41ae2cb00311956aa7109fc801ae8c81a52");
     const OWNER_2: Address = address!("98e4db7e07e584f89a2f6043e7b7c89dc27769ed");
     const OWNER_3: Address = address!("cf57572261c7c2bcf21ffd220ea7d1a27d40a827");
+
+    #[test]
+    fn get_scheduled_upgrade_charges_both_storage_reads() {
+        let mut ctx = <ArbContext<EmptyDB> as DefaultArb>::arb();
+        let state = ArbosState::open();
+        state.arbos_version.set(61, ctx.journal_mut()).unwrap();
+        state.upgrade_version.set(62, ctx.journal_mut()).unwrap();
+        state
+            .upgrade_timestamp
+            .set(1_234, ctx.journal_mut())
+            .unwrap();
+
+        let input = ArbOwnerPublic::getScheduledUpgradeCall {}.abi_encode();
+        let call = ArbCall {
+            input: &input,
+            gas_limit: 100_000,
+            caller: Address::ZERO,
+            value: U256::ZERO,
+            bytecode_address: ARB_OWNER_PUBLIC,
+            acting_address: ARB_OWNER_PUBLIC,
+            is_static: true,
+        };
+        let result = ArbPrecompilesEnum::ArbOwnerPublic.run_dispatch(&mut ctx, &call);
+
+        assert_eq!(result.result, InstructionResult::Return);
+        assert_eq!(
+            <(u64, u64)>::abi_decode(&result.output).unwrap(),
+            (62, 1_234)
+        );
+        // OpenArbosState (800), upgrade version and timestamp reads (2 * 800), and two output
+        // words (2 * 3).
+        assert_eq!(result.gas.total_gas_spent(), 2_406);
+    }
 
     #[test]
     fn rectify_chain_owner_repairs_history_and_emits_canonical_event() {
