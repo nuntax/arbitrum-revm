@@ -65,6 +65,9 @@ impl RequestHandler<VecReader> for StylusHandler {
 const COLD_SLOAD_COST: u64 = 2100;
 const WARM_STORAGE_READ_COST: u64 = 100;
 const COLD_ACCOUNT_ACCESS_COST: u64 = 2600;
+/// EIP-150 EXTCODESIZE, and the code-size unit Nitro scales it by.
+const EXTCODE_SIZE_GAS_EIP150: u64 = 700;
+const DEFAULT_MAX_CODE_SIZE: u64 = 24576;
 const SSTORE_SET_GAS: u64 = 20_000;
 const SSTORE_RESET_GAS: u64 = 2900;
 
@@ -86,6 +89,26 @@ fn sstore_cost(res: &SStoreResult, is_cold: bool) -> u64 {
         WARM_STORAGE_READ_COST
     };
     cost
+}
+
+/// Nitro's `WasmAccountTouchCost` (go-ethereum `core/vm/operations_acl_arbitrum.go`): the EIP-2929
+/// account access cost, plus an EXTCODESIZE charge (scaled by how many default-sized code slots
+/// this chain's limit allows) when the CODE is loaded rather than the balance or code hash.
+/// The scale is chain config, not a constant: at the 24576-byte default it is one EXTCODESIZE, and
+/// a chain permitting 4x that pays 4x.
+#[inline]
+fn wasm_account_touch_cost(is_cold: bool, with_code: bool, max_code_size: u64) -> u64 {
+    let access = if is_cold {
+        COLD_ACCOUNT_ACCESS_COST
+    } else {
+        WARM_STORAGE_READ_COST
+    };
+    let ext_code = if with_code {
+        (max_code_size / DEFAULT_MAX_CODE_SIZE).saturating_mul(EXTCODE_SIZE_GAS_EIP150)
+    } else {
+        0
+    };
+    access.saturating_add(ext_code)
 }
 
 #[inline]
@@ -246,16 +269,45 @@ where
                 .load_account(address)
                 .map(|acc| (acc.data.info.balance, acc.is_cold))
                 .unwrap_or_default();
-            let gas = if is_cold {
-                COLD_ACCOUNT_ACCESS_COST
-            } else {
-                WARM_STORAGE_READ_COST
-            };
+            let gas = wasm_account_touch_cost(is_cold, false, 0);
             (
                 balance.to_be_bytes::<32>().to_vec(),
                 empty_reader(),
                 ArbGas(gas),
             )
+        }
+
+        // EXTCODECOPY: req = address(20) + gas_left(8) → code via the reader + touch cost.
+        // Leaving this unwired handed the guest an empty code buffer and charged no gas, so any
+        // program reading another account's code took a branch Nitro never takes and reverted,
+        // which is a silent consensus divergence.
+        //
+        // Nitro reserves the worst case before it will load: the account is touched (and warmed)
+        // either way, but under the reserve it answers with EMPTY code and still charges, rather
+        // than returning code it could not pay for (`arbos/programs/api.go`, `accountCode`).
+        EvmApiMethod::AccountCode if req_data.len() < 28 => malformed(),
+        EvmApiMethod::AccountCode => {
+            let address = Address::from_slice(&req_data[..20]);
+            let gas_left = u64::from_be_bytes(req_data[20..28].try_into().unwrap());
+            let max_code_size = ctx.cfg().max_code_size() as u64;
+            let (code, is_cold) = ctx
+                .journal_mut()
+                .load_account_with_code(address)
+                .map(|acc| {
+                    (
+                        acc.data
+                            .info
+                            .code
+                            .as_ref()
+                            .map(|c| c.original_bytes().to_vec())
+                            .unwrap_or_default(),
+                        acc.is_cold,
+                    )
+                })
+                .unwrap_or_default();
+            let gas = wasm_account_touch_cost(is_cold, true, max_code_size);
+            let code = if gas_left < gas { Vec::new() } else { code };
+            (Vec::new(), VecReader::new(code), ArbGas(gas))
         }
 
         // EXTCODEHASH: req = address(20) → codehash(32) + access gas.
@@ -267,11 +319,7 @@ where
                 .load_account_with_code(address)
                 .map(|acc| (acc.data.info.code_hash, acc.is_cold))
                 .unwrap_or_default();
-            let gas = if is_cold {
-                COLD_ACCOUNT_ACCESS_COST
-            } else {
-                WARM_STORAGE_READ_COST
-            };
+            let gas = wasm_account_touch_cost(is_cold, false, 0);
             (code_hash.0.to_vec(), empty_reader(), ArbGas(gas))
         }
 
@@ -304,8 +352,8 @@ where
             (Vec::new(), empty_reader(), ArbGas(cost))
         }
 
-        // Not yet wired: account_code (returns code via the reader), capture, and
-        // the call/create family (handled by the executor's frame re-entry). TODO(stage 2).
+        // Not yet wired: capture, and the call/create family (handled by the executor's frame
+        // re-entry). TODO(stage 2).
         _ => (Vec::new(), empty_reader(), ArbGas(0)),
     };
     if debug {
