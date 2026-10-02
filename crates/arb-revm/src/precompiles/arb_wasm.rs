@@ -84,6 +84,21 @@ where
         );
     }
 
+    // Nitro's `ActivationGas` reads its own slot and never the params word, so it must not be
+    // charged the params read below.
+    if let ArbWasm::ArbWasmCalls::activationGas(_) = call {
+        return match state.programs.activation_gas.get(ctx.journal_mut()) {
+            Ok(v) => ok_result(
+                gas_limit,
+                alloy_core::sol_types::SolValue::abi_encode(&(v,)),
+            ),
+            Err(e) => revert_result(
+                gas_limit,
+                &format!("ArbWasm: activation gas read error: {e}"),
+            ),
+        };
+    }
+
     // Read the single packed 32-byte word that holds all Stylus params.
     // Nitro reference: arbos/programs/params.go Params().
     let word = match state.programs.read_params_word(ctx.journal_mut()) {
@@ -228,6 +243,7 @@ where
                 revert_result(gas_limit, "ArbWasm: activation requires the stylus feature")
             }
         }
+        ArbWasm::ArbWasmCalls::activationGas(_) => unreachable!("answered before the params read"),
         ArbWasm::ArbWasmCalls::programVersion(_)
         | ArbWasm::ArbWasmCalls::programInitGas(_)
         | ArbWasm::ArbWasmCalls::programMemoryFootprint(_)

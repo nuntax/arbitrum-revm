@@ -725,6 +725,9 @@ fn method_arbos_bounds(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> (u64, u64) {
             {
                 return (50, 0);
             }
+            if sel == ArbOwner::setWasmActivationGasCall::SELECTOR {
+                return (59, 0);
+            }
             if sel == ArbOwner::setMaxStylusContractFragmentsCall::SELECTOR
                 || sel == ArbOwner::addTransactionFiltererCall::SELECTOR
                 || sel == ArbOwner::removeTransactionFiltererCall::SELECTOR
@@ -732,6 +735,12 @@ fn method_arbos_bounds(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> (u64, u64) {
                 || sel == ArbOwner::setFilteredFundsRecipientCall::SELECTOR
             {
                 return (60, 0);
+            }
+            (0, 0)
+        }
+        ArbPrecompilesEnum::ArbWasm => {
+            if sel == ArbWasm::activationGasCall::SELECTOR {
+                return (59, 0);
             }
             (0, 0)
         }
@@ -1001,6 +1010,15 @@ mod gating_tests {
         assert_eq!(
             method_arbos_bounds(E::ArbOwner, ArbOwner::setWasmMaxSizeCall::SELECTOR),
             (40, 0)
+        );
+        // the configurable activation gas is v59 on both sides
+        assert_eq!(
+            method_arbos_bounds(E::ArbOwner, ArbOwner::setWasmActivationGasCall::SELECTOR),
+            (59, 0)
+        );
+        assert_eq!(
+            method_arbos_bounds(E::ArbWasm, ArbWasm::activationGasCall::SELECTOR),
+            (59, 0)
         );
         // ArbDebug.panic is v30 (Stylus)
         assert_eq!(

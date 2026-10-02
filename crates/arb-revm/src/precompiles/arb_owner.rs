@@ -748,6 +748,10 @@ where
             );
             set_or_revert!(state.programs.write_params_word(word, j), "setWasmMaxSize")
         }
+        ArbOwner::ArbOwnerCalls::setWasmActivationGas(c) => set_or_revert!(
+            state.programs.activation_gas.set(c.gas, j),
+            "setWasmActivationGas"
+        ),
         ArbOwner::ArbOwnerCalls::addWasmCacheManager(c) => set_or_revert!(
             state.programs.cache_managers.add(c.manager, j),
             "addWasmCacheManager"
