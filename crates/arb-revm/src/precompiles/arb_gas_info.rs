@@ -5,6 +5,10 @@ const ASSUMED_SIMPLE_TX_SIZE: u64 = 140;
 const TX_DATA_NON_ZERO_GAS_EIP2028: u64 = 16;
 const STORAGE_WRITE_COST: u64 = 20_000;
 
+/// `ArbMultiGasConstraintsTypes.ResourceConstraint` as its ABI tuple: `(WeightedResource[] resources,
+/// uint32 adjustmentWindowSecs, uint64 targetPerSec, uint64 backlog)`, a resource being `(uint8, uint64)`.
+type ResourceConstraint = (Vec<(u8, u64)>, u32, u64, u64);
+
 pub(super) fn run_arb_gas_info<CTX>(
     ctx: &mut CTX,
     input: &[u8],
@@ -19,7 +23,8 @@ where
     };
 
     let state = ArbosState::open();
-    let l2_gas_price = U256::from(ctx.block_basefee());
+    // Nitro prices every getter below from `BaseFeeInBlock`.
+    let l2_gas_price = U256::from(ctx.block_basefee_in_block());
 
     // ArbOS version is a cached field on Nitro's opened `ArbosState` (no per-read storage charge),
     // so read it through the raw journal to keep it unmetered. Every other ArbOS-storage read below
@@ -28,22 +33,68 @@ where
     // `arbos_call_extra_gas`. Without this the getters undercharged their storage reads by 800 per read, mispricing the receipt gasUsed.
     let arbos_version = match state.arbos_version.get(ctx.journal_mut()) {
         Ok(v) => v,
-        Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+        Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
     };
     let mut journal = MeteredJournal::new(ctx.journal_mut());
     let j = &mut journal;
 
     let mut result = match call {
+        ArbGasInfo::ArbGasInfoCalls::getGasPricingConstraints(_) => {
+            match state.l2_pricing.gas_constraints(j) {
+                Ok(constraints) => ok_result(
+                    gas_limit,
+                    ArbGasInfo::getGasPricingConstraintsCall::abi_encode_returns(&constraints),
+                ),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
+            }
+        }
+        ArbGasInfo::ArbGasInfoCalls::getMultiGasPricingConstraints(_) => {
+            let constraints = match state.l2_pricing.multi_gas_constraints(j) {
+                Ok(c) => c,
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
+            };
+            // `ResourceConstraint[]` as the ABI tuple `((uint8,uint64)[],uint32,uint64,uint64)[]`:
+            // the binding's library types are not exported. Nitro lists only the nonzero weights,
+            // in resource-kind order.
+            let encoded: Vec<ResourceConstraint> = constraints
+                .into_iter()
+                .map(|c| {
+                    let resources = (0u8..)
+                        .zip(c.weights)
+                        .filter(|(_, weight)| *weight != 0)
+                        .collect();
+                    (resources, c.adjustment_window, c.target, c.backlog)
+                })
+                .collect();
+            use alloy_core::sol_types::{
+                SolType,
+                sol_data::{Array, Uint},
+            };
+            type Returns = (Array<(Array<(Uint<8>, Uint<64>)>, Uint<32>, Uint<64>, Uint<64>)>,);
+            ok_result(gas_limit, Returns::abi_encode_params(&(encoded,)))
+        }
+        ArbGasInfo::ArbGasInfoCalls::getMultiGasBaseFee(_) => {
+            match state
+                .l2_pricing
+                .multi_gas_base_fees(l2_gas_price, arbos_version, j)
+            {
+                Ok(fees) => ok_result(
+                    gas_limit,
+                    ArbGasInfo::getMultiGasBaseFeeCall::abi_encode_returns(&fees.to_vec()),
+                ),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
+            }
+        }
         ArbGasInfo::ArbGasInfoCalls::getPricesInWei(_) => {
             // (perL2Tx, perL1CalldataUnit, perStorageAllocation,
             //  perArbGasBase, perArbGasCongestion, perArbGasTotal)
             let min_base_fee = match state.l2_pricing.min_base_fee_wei.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             let l1_price = match state.l1_pricing.price_per_unit.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             let wei_for_l1_calldata =
                 l1_price.saturating_mul(U256::from(TX_DATA_NON_ZERO_GAS_EIP2028));
@@ -58,7 +109,7 @@ where
                 l2_gas_price.saturating_mul(U256::from(STORAGE_WRITE_COST));
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(
+                alloy_core::sol_types::SolValue::abi_encode_params(&(
                     per_l2_tx,
                     wei_for_l1_calldata,
                     per_storage_allocation,
@@ -72,11 +123,11 @@ where
             // Deprecated aggregator path; return same as getPricesInWei.
             let min_base_fee = match state.l2_pricing.min_base_fee_wei.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             let l1_price = match state.l1_pricing.price_per_unit.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             let wei_for_l1_calldata =
                 l1_price.saturating_mul(U256::from(TX_DATA_NON_ZERO_GAS_EIP2028));
@@ -91,7 +142,7 @@ where
                 l2_gas_price.saturating_mul(U256::from(STORAGE_WRITE_COST));
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(
+                alloy_core::sol_types::SolValue::abi_encode_params(&(
                     per_l2_tx,
                     wei_for_l1_calldata,
                     per_storage_allocation,
@@ -105,7 +156,7 @@ where
             // (perL2Tx, perL1Calldata, perStorageAllocation)
             let l1_price = match state.l1_pricing.price_per_unit.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             let wei_for_l1_calldata =
                 l1_price.saturating_mul(U256::from(TX_DATA_NON_ZERO_GAS_EIP2028));
@@ -125,7 +176,7 @@ where
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(
+                alloy_core::sol_types::SolValue::abi_encode_params(&(
                     gas_per_l2_tx,
                     gas_for_l1_calldata,
                     U256::from(STORAGE_WRITE_COST),
@@ -135,7 +186,7 @@ where
         ArbGasInfo::ArbGasInfoCalls::getPricesInArbGasWithAggregator(_) => {
             let l1_price = match state.l1_pricing.price_per_unit.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             let wei_for_l1_calldata =
                 l1_price.saturating_mul(U256::from(TX_DATA_NON_ZERO_GAS_EIP2028));
@@ -155,7 +206,7 @@ where
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(
+                alloy_core::sol_types::SolValue::abi_encode_params(&(
                     gas_per_l2_tx,
                     gas_for_l1_calldata,
                     U256::from(STORAGE_WRITE_COST),
@@ -165,15 +216,15 @@ where
         ArbGasInfo::ArbGasInfoCalls::getGasAccountingParams(_) => {
             let speed_limit = match state.l2_pricing.speed_limit_per_second.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             let per_block = match state.l2_pricing.per_block_gas_limit.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(
+                alloy_core::sol_types::SolValue::abi_encode_params(&(
                     U256::from(speed_limit),
                     U256::from(per_block),
                     U256::from(per_block),
@@ -183,72 +234,72 @@ where
         ArbGasInfo::ArbGasInfoCalls::getMaxTxGasLimit(_) => {
             let limit = match state.l2_pricing.per_tx_gas_limit.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(U256::from(limit),)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(U256::from(limit),)),
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getMinimumGasPrice(_) => {
             let min_fee = match state.l2_pricing.min_base_fee_wei.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(min_fee,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(min_fee,)),
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getL1BaseFeeEstimate(_) => {
             let l1_fee = match state.l1_pricing.price_per_unit.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(l1_fee,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(l1_fee,)),
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getL1BaseFeeEstimateInertia(_) => {
             let inertia = match state.l1_pricing.inertia.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(inertia,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(inertia,)),
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getL1RewardRate(_) => {
             let rate = match state.l1_pricing.per_unit_reward.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(rate,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(rate,)),
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getL1RewardRecipient(_) => {
             let recipient = match state.l1_pricing.pay_rewards_to.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(recipient,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(recipient,)),
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getL1GasPriceEstimate(_) => {
             // In Nitro, L1 gas price estimate == price_per_unit.
             let price = match state.l1_pricing.price_per_unit.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(price,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(price,)),
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getCurrentTxL1GasFees(_) => {
@@ -259,97 +310,97 @@ where
             let fee = j.transient_load(crate::constants::CURRENT_TX_L1_FEE_ADDR, U256::ZERO);
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(fee,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(fee,)),
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getGasBacklog(_) => {
             let backlog = match state.l2_pricing.gas_backlog.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(backlog,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(backlog,)),
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getPricingInertia(_) => {
             let inertia = match state.l2_pricing.pricing_inertia.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(inertia,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(inertia,)),
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getGasBacklogTolerance(_) => {
             let tolerance = match state.l2_pricing.backlog_tolerance.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(tolerance,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(tolerance,)),
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getL1PricingSurplus(_) => {
             let surplus = match state.l1_pricing.get_l1_pricing_surplus(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(surplus,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(surplus,)),
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getPerBatchGasCharge(_) => {
             let charge = match state.l1_pricing.per_batch_gas_cost.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(charge,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(charge,)),
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getAmortizedCostCapBips(_) => {
             let cap = match state.l1_pricing.amortized_cost_cap_bips.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(cap,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(cap,)),
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getL1FeesAvailable(_) => {
             let available = match state.l1_pricing.l1_fees_available.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(available,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(available,)),
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getL1PricingEquilibrationUnits(_) => {
             let units = match state.l1_pricing.equilibration_units.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(units,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(units,)),
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getLastL1PricingUpdateTime(_) => {
             let ts = match state.l1_pricing.last_update_time.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(ts,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(ts,)),
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getL1PricingFundsDueForRewards(_) => {
@@ -362,41 +413,41 @@ where
                         U256::ZERO
                     }
                 }
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(due,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(due,)),
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getL1PricingUnitsSinceUpdate(_) => {
             let units = match state.l1_pricing.units_since_update.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(units,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(units,)),
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getLastL1PricingSurplus(_) => {
             let surplus = match state.l1_pricing.last_surplus.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(surplus,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(surplus,)),
             )
         }
         ArbGasInfo::ArbGasInfoCalls::getMaxBlockGasLimit(_) => {
             let limit = match state.l2_pricing.per_block_gas_limit.get(j) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbGasInfo: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbGasInfo: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(limit,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(limit,)),
             )
         }
     };

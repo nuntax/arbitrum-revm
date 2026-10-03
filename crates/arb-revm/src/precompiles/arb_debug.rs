@@ -15,16 +15,16 @@ where
     match call {
         ArbDebug::ArbDebugCalls::customRevert(c) => {
             // Revert with the provided error number encoded as a string.
-            revert_result(gas_limit, &format!("ArbDebug: custom revert {}", c.number))
+            plain_error(gas_limit, &format!("ArbDebug: custom revert {}", c.number))
         }
         ArbDebug::ArbDebugCalls::panic(_) | ArbDebug::ArbDebugCalls::legacyError(_) => {
-            revert_result(gas_limit, "ArbDebug: panic")
+            plain_error(gas_limit, "ArbDebug: panic")
         }
         ArbDebug::ArbDebugCalls::eventsView(_) => ok_result(gas_limit, vec![]),
         ArbDebug::ArbDebugCalls::events(_)
         | ArbDebug::ArbDebugCalls::becomeChainOwner(_)
         | ArbDebug::ArbDebugCalls::overwriteContractCode(_) => {
-            revert_result(gas_limit, "ArbDebug: not available in production")
+            plain_error(gas_limit, "ArbDebug: not available in production")
         }
     }
 }

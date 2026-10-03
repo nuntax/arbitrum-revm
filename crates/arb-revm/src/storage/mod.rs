@@ -34,7 +34,9 @@ pub use chain_config::{
 };
 pub use features::{ArbFeatures, FEATURE_INCREASED_CALLDATA_PRICE};
 pub use l1_pricing::L1Pricing;
-pub use l2_pricing::L2Pricing;
+pub use l2_pricing::{
+    L2Pricing, MAX_PRICING_EXPONENT_BIPS, MultiGasConstraintValue, NUM_RESOURCE_KINDS,
+};
 pub use offsets::{ArbosMetadataOffset, L1PricingOffset, L2PricingOffset, Subspace};
 pub use programs::{ArbosPrograms, ProgramDataPricer, pack_uint, stylus_param_layout, unpack_uint};
 pub use queue::StorageQueue;

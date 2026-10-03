@@ -20,29 +20,15 @@ pub(super) fn ok_result(gas_limit: u64, output: Vec<u8>) -> InterpreterResult {
     }
 }
 
-/// Build a revert `InterpreterResult` with an ABI-encoded error string.
+/// A method failure that Nitro reports as a plain Go error.
+///
+/// Nitro's precompile wrapper only ever produces two kinds of failure: a Solidity custom error,
+/// which reverts with its encoded data, and a plain Go error, which reverts with empty data (and
+/// before ArbOS 11 burns the remaining gas). It never produces `Error(string)`. `_reason` keeps
+/// Nitro's error text beside each check for readers; it is not observable on chain.
 #[inline]
-pub(super) fn revert_result(gas_limit: u64, msg: &str) -> InterpreterResult {
-    // Encode as `Error(string)` = selector 0x08c379a0 + abi_encode(msg)
-    let selector: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
-    let msg_bytes = msg.as_bytes();
-    let offset: u32 = 32;
-    let length = msg_bytes.len() as u32;
-    let padded_len = (msg_bytes.len() + 31) & !31;
-    let mut output = Vec::with_capacity(4 + 64 + padded_len);
-    output.extend_from_slice(&selector);
-    output.extend_from_slice(&[0u8; 28]);
-    output.extend_from_slice(&offset.to_be_bytes());
-    output.extend_from_slice(&[0u8; 28]);
-    output.extend_from_slice(&length.to_be_bytes());
-    output.extend_from_slice(msg_bytes);
-    output.resize(4 + 64 + padded_len, 0);
-
-    InterpreterResult {
-        result: InstructionResult::Revert,
-        gas: Gas::new(gas_limit),
-        output: Bytes::from(output),
-    }
+pub(super) fn plain_error(gas_limit: u64, _reason: &str) -> InterpreterResult {
+    ordinary_error_result(gas_limit)
 }
 
 /// Build an internal marker for an ordinary error returned by an ArbOS precompile method.

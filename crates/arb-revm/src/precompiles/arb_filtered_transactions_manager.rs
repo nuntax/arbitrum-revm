@@ -148,7 +148,7 @@ where
                 }
             };
             let is_filtered = value == PRESENT_VALUE;
-            ok_result(gas_limit, SolValue::abi_encode(&(is_filtered,)))
+            ok_result(gas_limit, SolValue::abi_encode_params(&(is_filtered,)))
         }
     };
 

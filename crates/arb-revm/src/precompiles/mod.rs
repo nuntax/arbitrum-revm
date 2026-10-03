@@ -8,6 +8,7 @@ use arbitrum_alloy_precompiles::addresses::{
     ARB_ADDRESS_TABLE, ARB_AGGREGATOR, ARB_BLS, ARB_DEBUG, ARB_FILTERED_TRANSACTIONS_MANAGER,
     ARB_FUNCTION_TABLE, ARB_GAS_INFO, ARB_INFO, ARB_NATIVE_TOKEN_MANAGER, ARB_OWNER,
     ARB_OWNER_PUBLIC, ARB_RETRYABLE_TX, ARB_STATISTICS, ARB_SYS, ARB_WASM, ARB_WASM_CACHE,
+    ARBOS_ACTS, ARBOS_TEST,
 };
 use revm::{
     context_interface::{ContextTr, JournalTr},
@@ -34,17 +35,25 @@ mod arb_statistics;
 mod arb_sys;
 mod arb_wasm;
 mod arb_wasm_cache;
+mod arbos_acts;
+mod arbos_test;
 mod common;
+mod go_abi;
+#[cfg(test)]
+mod nitro_methods;
+#[cfg(test)]
+mod parity_tests;
 
 use self::common::{
     empty_active_result, fatal_result, gated_revert_result, ok_result, ordinary_error_result,
-    revert_result,
+    plain_error,
 };
 pub(super) use crate::{ArbosState, storage::RETRYABLE_LIFETIME_SECONDS};
 pub(super) use alloy_core::sol_types::SolInterface;
 pub(super) use arbitrum_alloy_precompiles::{
     ArbAddressTable, ArbAggregator, ArbDebug, ArbFunctionTable, ArbGasInfo, ArbInfo, ArbOwner,
-    ArbOwnerPublic, ArbRetryableTx, ArbStatistics, ArbSys, ArbWasm, ArbWasmCache,
+    ArbOwnerPublic, ArbRetryableTx, ArbStatistics, ArbSys, ArbWasm, ArbWasmCache, ArbosActs,
+    ArbosTest,
 };
 pub(super) use revm::primitives::U256;
 
@@ -66,6 +75,8 @@ use arb_statistics::run_arb_statistics;
 use arb_sys::run_arb_sys;
 use arb_wasm::run_arb_wasm;
 use arb_wasm_cache::run_arb_wasm_cache;
+use arbos_acts::run_arbos_acts;
+use arbos_test::run_arbos_test;
 use common::input_bytes;
 
 // Stylus params are now read/written through the packed word helpers in
@@ -89,6 +100,12 @@ pub enum ArbPrecompilesEnum {
     ArbNativeTokenManager,
     ArbFilteredTransactionsManager,
     ArbDebug,
+    /// 0x69. Registered by Nitro at every ArbOS version; `burnArbGas` is callable by anyone.
+    ArbosTest,
+    /// 0xa4b05. ArbOS's internal start-block and batch-posting-report actions run as calls to
+    /// this address, but those are applied by the block executor, not through this dispatcher.
+    /// An ordinary call reaches Nitro's precompile, which answers `CallerNotArbOS()`.
+    ArbosActs,
 }
 
 impl ArbPrecompilesEnum {
@@ -111,6 +128,8 @@ impl ArbPrecompilesEnum {
             ARB_NATIVE_TOKEN_MANAGER => Some(Self::ArbNativeTokenManager),
             ARB_FILTERED_TRANSACTIONS_MANAGER => Some(Self::ArbFilteredTransactionsManager),
             ARB_DEBUG => Some(Self::ArbDebug),
+            ARBOS_TEST => Some(Self::ArbosTest),
+            ARBOS_ACTS => Some(Self::ArbosActs),
             _ => None,
         }
     }
@@ -159,6 +178,16 @@ impl ArbPrecompilesEnum {
         // folded through the wrapper exactly like successful public view calls.
         if arb == ArbPrecompilesEnum::ArbFilteredTransactionsManager {
             return self.run_filtered_manager_wrapper(ctx, call, arbos_version);
+        }
+
+        // Nitro registers ArbDebug behind `DebugPrecompile`, which runs the inner precompile only
+        // when the chain config enables debug precompiles. Otherwise it returns a plain error with
+        // no gas left, before any selector or mutability check: every call fails, consuming all
+        // of its gas. Measured on Robinhood Chain: `eventsView()` and an unknown selector alike
+        // fail with "debug precompiles are disabled" and the whole budget used.
+        if arb == ArbPrecompilesEnum::ArbDebug && !ArbosState::open().debug_mode(ctx.journal_mut())
+        {
+            return gated_revert_result(gas_limit);
         }
 
         // ArbOwner is wrapped by Nitro's `OwnerPrecompile`, whose ownership check likewise runs
@@ -217,6 +246,13 @@ impl ArbPrecompilesEnum {
         // Value is accepted only by Solidity `payable` methods. This particular ordering mirrors
         // Nitro: an invalid selector has already taken the all-gas method-gate path above.
         if call.value != U256::ZERO && purity != MethodPurity::Payable {
+            return gated_revert_result(gas_limit);
+        }
+        // Nitro unpacks the arguments with go-ethereum's decoder before the method runs; a word it
+        // rejects ends the call with nothing returned and no gas left.
+        if let Some(signature) = method_signature(arb, sel)
+            && !go_abi::args_ok(signature, &call.input[4..])
+        {
             return gated_revert_result(gas_limit);
         }
         let mut result = self.dispatch(ctx, call);
@@ -369,6 +405,13 @@ impl ArbPrecompilesEnum {
         if result.result == InstructionResult::FatalExternalError {
             return result;
         }
+        // Nitro logs a successful owner operation from the wrapper, after the inner call:
+        // `if !readOnly || version < ArbosVersion_11`. Before ArbOS 11 that includes a successful
+        // STATICCALL of a view method; the log is written straight to the state DB, so geth's
+        // read-only guard never sees it.
+        if result.result == InstructionResult::Return && (!call.is_static || arbos_version < 11) {
+            arb_owner::emit_owner_acts(ctx, call.input, call.caller, call.bytecode_address);
+        }
         // Owner reached the inner precompile: charge nothing, whatever it returned.
         result.gas = Gas::new(call.gas_limit);
         result
@@ -397,11 +440,13 @@ impl ArbPrecompilesEnum {
             Self::ArbOwner => run_arb_owner(ctx, raw, gas_limit, call),
             Self::ArbWasm => run_arb_wasm(ctx, raw, gas_limit, call),
             Self::ArbWasmCache => run_arb_wasm_cache(ctx, raw, gas_limit, call),
-            Self::ArbNativeTokenManager => run_arb_native_token_manager(ctx, raw, gas_limit),
+            Self::ArbNativeTokenManager => run_arb_native_token_manager(ctx, raw, gas_limit, call),
             Self::ArbFilteredTransactionsManager => {
                 run_arb_filtered_transactions_manager(ctx, raw, gas_limit, call)
             }
             Self::ArbDebug => run_arb_debug(ctx, raw, gas_limit),
+            Self::ArbosTest => run_arbos_test(ctx, raw, gas_limit),
+            Self::ArbosActs => run_arbos_acts(raw, gas_limit),
         }
     }
 
@@ -434,6 +479,8 @@ impl ArbPrecompilesEnum {
             ARB_NATIVE_TOKEN_MANAGER,
             ARB_FILTERED_TRANSACTIONS_MANAGER,
             ARB_DEBUG,
+            ARBOS_TEST,
+            ARBOS_ACTS,
         ]
         .into_iter()
     }
@@ -536,18 +583,15 @@ fn method_purity(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> MethodPurity {
         }
         ArbPrecompilesEnum::ArbDebug => {
             if sel == ArbDebug::customRevertCall::SELECTOR
-                || sel == ArbDebug::panicCall::SELECTOR
                 || sel == ArbDebug::legacyErrorCall::SELECTOR
             {
                 MethodPurity::Pure
             } else if sel == ArbDebug::eventsCall::SELECTOR {
                 MethodPurity::Payable
-            } else if sel == ArbDebug::becomeChainOwnerCall::SELECTOR
-                || sel == ArbDebug::overwriteContractCodeCall::SELECTOR
-            {
-                MethodPurity::Write
-            } else {
+            } else if sel == ArbDebug::eventsViewCall::SELECTOR {
                 MethodPurity::View
+            } else {
+                MethodPurity::Write
             }
         }
         ArbPrecompilesEnum::ArbFunctionTable => {
@@ -557,10 +601,25 @@ fn method_purity(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> MethodPurity {
                 MethodPurity::View
             }
         }
-        // The local ArbOwner binding currently exposes the administrative mutation selectors.
-        // Nitro's OwnerPrecompile subsequently makes those calls free for the chain owner, but it
-        // still performs the common mutability checks first.
-        ArbPrecompilesEnum::ArbOwner => MethodPurity::Write,
+        // Nitro's OwnerPrecompile makes every call free for a chain owner, but the inner
+        // precompile still applies the common mutability checks, so an owner may STATICCALL the
+        // getters and nothing else.
+        ArbPrecompilesEnum::ArbOwner => {
+            if sel == ArbOwner::getAllChainOwnersCall::SELECTOR
+                || sel == ArbOwner::isChainOwnerCall::SELECTOR
+                || sel == ArbOwner::getAllNativeTokenOwnersCall::SELECTOR
+                || sel == ArbOwner::isNativeTokenOwnerCall::SELECTOR
+                || sel == ArbOwner::getAllTransactionFilterersCall::SELECTOR
+                || sel == ArbOwner::isTransactionFiltererCall::SELECTOR
+                || sel == ArbOwner::getFilteredFundsRecipientCall::SELECTOR
+                || sel == ArbOwner::getNetworkFeeAccountCall::SELECTOR
+                || sel == ArbOwner::getInfraFeeAccountCall::SELECTOR
+            {
+                MethodPurity::View
+            } else {
+                MethodPurity::Write
+            }
+        }
         ArbPrecompilesEnum::ArbOwnerPublic => {
             if sel == ArbOwnerPublic::rectifyChainOwnerCall::SELECTOR {
                 MethodPurity::Write
@@ -592,6 +651,7 @@ fn method_purity(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> MethodPurity {
         }
         ArbPrecompilesEnum::ArbWasmCache => {
             if sel == ArbWasmCache::cacheProgramCall::SELECTOR
+                || sel == ArbWasmCache::cacheCodehashCall::SELECTOR
                 || sel == ArbWasmCache::evictCodehashCall::SELECTOR
             {
                 MethodPurity::Write
@@ -607,10 +667,57 @@ fn method_purity(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> MethodPurity {
                 MethodPurity::View
             }
         }
+        ArbPrecompilesEnum::ArbosTest => MethodPurity::Pure,
+        ArbPrecompilesEnum::ArbosActs => MethodPurity::Write,
         ArbPrecompilesEnum::ArbBls
         | ArbPrecompilesEnum::ArbInfo
         | ArbPrecompilesEnum::ArbGasInfo
         | ArbPrecompilesEnum::ArbStatistics => MethodPurity::View,
+    }
+}
+
+/// The canonical Solidity signature of a precompile method, from the generated interface.
+fn method_signature(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> Option<&'static str> {
+    use arbitrum_alloy_precompiles::{ArbFilteredTransactionsManager, ArbNativeTokenManager};
+    match arb {
+        ArbPrecompilesEnum::ArbSys => ArbSys::ArbSysCalls::signature_by_selector(sel),
+        ArbPrecompilesEnum::ArbInfo => ArbInfo::ArbInfoCalls::signature_by_selector(sel),
+        ArbPrecompilesEnum::ArbAddressTable => {
+            ArbAddressTable::ArbAddressTableCalls::signature_by_selector(sel)
+        }
+        ArbPrecompilesEnum::ArbBls => None,
+        ArbPrecompilesEnum::ArbFunctionTable => {
+            ArbFunctionTable::ArbFunctionTableCalls::signature_by_selector(sel)
+        }
+        ArbPrecompilesEnum::ArbOwnerPublic => {
+            ArbOwnerPublic::ArbOwnerPublicCalls::signature_by_selector(sel)
+        }
+        ArbPrecompilesEnum::ArbGasInfo => ArbGasInfo::ArbGasInfoCalls::signature_by_selector(sel),
+        ArbPrecompilesEnum::ArbAggregator => {
+            ArbAggregator::ArbAggregatorCalls::signature_by_selector(sel)
+        }
+        ArbPrecompilesEnum::ArbRetryableTx => {
+            ArbRetryableTx::ArbRetryableTxCalls::signature_by_selector(sel)
+        }
+        ArbPrecompilesEnum::ArbStatistics => {
+            ArbStatistics::ArbStatisticsCalls::signature_by_selector(sel)
+        }
+        ArbPrecompilesEnum::ArbOwner => ArbOwner::ArbOwnerCalls::signature_by_selector(sel),
+        ArbPrecompilesEnum::ArbWasm => ArbWasm::ArbWasmCalls::signature_by_selector(sel),
+        ArbPrecompilesEnum::ArbWasmCache => {
+            ArbWasmCache::ArbWasmCacheCalls::signature_by_selector(sel)
+        }
+        ArbPrecompilesEnum::ArbNativeTokenManager => {
+            ArbNativeTokenManager::ArbNativeTokenManagerCalls::signature_by_selector(sel)
+        }
+        ArbPrecompilesEnum::ArbFilteredTransactionsManager => {
+            ArbFilteredTransactionsManager::ArbFilteredTransactionsManagerCalls::signature_by_selector(
+                sel,
+            )
+        }
+        ArbPrecompilesEnum::ArbDebug => ArbDebug::ArbDebugCalls::signature_by_selector(sel),
+        ArbPrecompilesEnum::ArbosTest => ArbosTest::ArbosTestCalls::signature_by_selector(sel),
+        ArbPrecompilesEnum::ArbosActs => ArbosActs::ArbosActsCalls::signature_by_selector(sel),
     }
 }
 
@@ -624,16 +731,15 @@ fn method_is_pure(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> bool {
 }
 
 /// `(minArbosVersion, maxArbosVersion)` for a precompile method (max 0 = no upper bound). A call
-/// with `version < min` or `version > max>0` reverts (Nitro `precompile.go` Call, method gate).
-/// Only methods with a non-default bound that are ALSO decodable by our sol interfaces need an
-/// entry; methods absent from the interface already revert via `abi_decode` failure. Whole
-/// precompiles gated by version (ArbWasm/ArbWasmCache v30, ArbNativeTokenManager v41,
-/// ArbFilteredTransactionsManager v60) are handled by `precompile_min_arbos_version` (which
-/// returns no-code, not a revert) and their methods do not need an entry here.
+/// with `version < min` or `version > max>0` reverts consuming all gas (Nitro `precompile.go` Call,
+/// method gate), before any mutability check.
 ///
-/// Mirrors every method-level `arbosVersion` assignment in Nitro `precompiles/precompile.go`
-/// `Precompiles()` (v5 through v60). `maxArbosVersion` gates: the only one (`cacheCodehash`,
-/// max v30) was dropped from our interface entirely, so it already reverts.
+/// Mirrors every method-level `arbosVersion`/`maxArbosVersion` assignment in Nitro
+/// `precompiles/precompile.go` `Precompiles()`. Where Nitro also gates the whole precompile
+/// (ArbWasm/ArbWasmCache v30, ArbNativeTokenManager v41, ArbFilteredTransactionsManager v60) and
+/// the method gate is no higher, `precompile_min_arbos_version` already answers first (with a
+/// no-code result, not a revert), so those methods need no entry here. The
+/// `nitro_method_table` test checks this function against the table generated from Nitro.
 fn method_arbos_bounds(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> (u64, u64) {
     match arb {
         ArbPrecompilesEnum::ArbGasInfo => {
@@ -655,8 +761,14 @@ fn method_arbos_bounds(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> (u64, u64) {
             }
             if sel == ArbGasInfo::getMaxTxGasLimitCall::SELECTOR
                 || sel == ArbGasInfo::getMaxBlockGasLimitCall::SELECTOR
+                || sel == ArbGasInfo::getGasPricingConstraintsCall::SELECTOR
             {
                 return (50, 0);
+            }
+            if sel == ArbGasInfo::getMultiGasPricingConstraintsCall::SELECTOR
+                || sel == ArbGasInfo::getMultiGasBaseFeeCall::SELECTOR
+            {
+                return (60, 0);
             }
             (0, 0)
         }
@@ -690,13 +802,16 @@ fn method_arbos_bounds(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> (u64, u64) {
                 || sel == ArbOwnerPublic::isTransactionFiltererCall::SELECTOR
                 || sel == ArbOwnerPublic::getAllTransactionFilterersCall::SELECTOR
                 || sel == ArbOwnerPublic::getFilteredFundsRecipientCall::SELECTOR
+                || sel == ArbOwnerPublic::getCollectTipsCall::SELECTOR
             {
                 return (60, 0);
             }
             (0, 0)
         }
         ArbPrecompilesEnum::ArbOwner => {
-            if sel == ArbOwner::setInfraFeeAccountCall::SELECTOR {
+            if sel == ArbOwner::getInfraFeeAccountCall::SELECTOR
+                || sel == ArbOwner::setInfraFeeAccountCall::SELECTOR
+            {
                 return (5, 0);
             }
             if sel == ArbOwner::releaseL1PricerSurplusFundsCall::SELECTOR {
@@ -708,6 +823,22 @@ fn method_arbos_bounds(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> (u64, u64) {
             if sel == ArbOwner::setBrotliCompressionLevelCall::SELECTOR {
                 return (20, 0);
             }
+            // Nitro's `stylusMethods` list.
+            if sel == ArbOwner::setInkPriceCall::SELECTOR
+                || sel == ArbOwner::setWasmMaxStackDepthCall::SELECTOR
+                || sel == ArbOwner::setWasmFreePagesCall::SELECTOR
+                || sel == ArbOwner::setWasmPageGasCall::SELECTOR
+                || sel == ArbOwner::setWasmPageLimitCall::SELECTOR
+                || sel == ArbOwner::setWasmMinInitGasCall::SELECTOR
+                || sel == ArbOwner::setWasmInitCostScalarCall::SELECTOR
+                || sel == ArbOwner::setWasmExpiryDaysCall::SELECTOR
+                || sel == ArbOwner::setWasmKeepaliveDaysCall::SELECTOR
+                || sel == ArbOwner::setWasmBlockCacheSizeCall::SELECTOR
+                || sel == ArbOwner::addWasmCacheManagerCall::SELECTOR
+                || sel == ArbOwner::removeWasmCacheManagerCall::SELECTOR
+            {
+                return (30, 0);
+            }
             if sel == ArbOwner::setCalldataPriceIncreaseCall::SELECTOR
                 || sel == ArbOwner::setWasmMaxSizeCall::SELECTOR
             {
@@ -715,37 +846,54 @@ fn method_arbos_bounds(arb: ArbPrecompilesEnum, sel: [u8; 4]) -> (u64, u64) {
             }
             if sel == ArbOwner::addNativeTokenOwnerCall::SELECTOR
                 || sel == ArbOwner::removeNativeTokenOwnerCall::SELECTOR
+                || sel == ArbOwner::isNativeTokenOwnerCall::SELECTOR
+                || sel == ArbOwner::getAllNativeTokenOwnersCall::SELECTOR
                 || sel == ArbOwner::setNativeTokenManagementFromCall::SELECTOR
             {
                 return (41, 0);
             }
-            if sel == ArbOwner::setGasBacklogCall::SELECTOR
+            if sel == ArbOwner::setGasPricingConstraintsCall::SELECTOR
+                || sel == ArbOwner::setGasBacklogCall::SELECTOR
                 || sel == ArbOwner::setMaxBlockGasLimitCall::SELECTOR
                 || sel == ArbOwner::setParentGasFloorPerTokenCall::SELECTOR
             {
                 return (50, 0);
             }
-            if sel == ArbOwner::setMaxStylusContractFragmentsCall::SELECTOR
+            if sel == ArbOwner::setWasmActivationGasCall::SELECTOR {
+                return (59, 0);
+            }
+            if sel == ArbOwner::setMultiGasPricingConstraintsCall::SELECTOR
+                || sel == ArbOwner::setMaxStylusContractFragmentsCall::SELECTOR
+                || sel == ArbOwner::setCollectTipsCall::SELECTOR
                 || sel == ArbOwner::addTransactionFiltererCall::SELECTOR
                 || sel == ArbOwner::removeTransactionFiltererCall::SELECTOR
+                || sel == ArbOwner::isTransactionFiltererCall::SELECTOR
+                || sel == ArbOwner::getAllTransactionFilterersCall::SELECTOR
                 || sel == ArbOwner::setTransactionFilteringFromCall::SELECTOR
                 || sel == ArbOwner::setFilteredFundsRecipientCall::SELECTOR
+                || sel == ArbOwner::getFilteredFundsRecipientCall::SELECTOR
             {
                 return (60, 0);
             }
             (0, 0)
         }
+        ArbPrecompilesEnum::ArbWasm => {
+            if sel == ArbWasm::activationGasCall::SELECTOR {
+                return (59, 0);
+            }
+            (0, 0)
+        }
         ArbPrecompilesEnum::ArbWasmCache => {
-            // `cacheCodehash` (maxArbosVersion=30) was dropped from our interface entirely, so it
-            // already reverts via abi_decode failure. `cacheProgram` is v31 (StylusFixes).
+            // Deprecated in favour of `cacheProgram` and removed after ArbOS 30.
+            if sel == ArbWasmCache::cacheCodehashCall::SELECTOR {
+                return (30, 30);
+            }
             if sel == ArbWasmCache::cacheProgramCall::SELECTOR {
                 return (31, 0);
             }
             (0, 0)
         }
         ArbPrecompilesEnum::ArbDebug => {
-            // `panic` is v30 (Stylus). `customRevert`/`legacyError`/`becomeChainOwner`/
-            // `overwriteContractCode` are ungated (v0).
             if sel == ArbDebug::panicCall::SELECTOR {
                 return (30, 0);
             }
@@ -823,7 +971,12 @@ impl Default for ArbPrecompiles {
 
 impl<CTX> PrecompileProvider<CTX> for ArbPrecompiles
 where
-    CTX: ContextTr<Journal: JournalTr, Cfg: revm::context::Cfg<Spec = ArbSpecId>>,
+    CTX: ContextTr<
+            Journal: JournalTr,
+            Cfg: revm::context::Cfg<Spec = ArbSpecId>,
+            Tx: crate::transaction::ArbTxTr,
+            Chain = crate::ArbChainContext,
+        >,
 {
     type Output = InterpreterResult;
 
@@ -880,6 +1033,315 @@ where
 
     fn contains(&self, address: &Address) -> bool {
         ArbPrecompilesEnum::from_address(address).is_some() || self.inner.contains(address)
+    }
+}
+
+#[cfg(test)]
+mod nitro_method_table {
+    use super::{
+        ArbPrecompilesEnum as E, method_arbos_bounds, method_purity, method_signature,
+        nitro_methods::NITRO_METHODS, precompile_min_arbos_version,
+    };
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Outcome {
+        /// The address has no code yet: empty success, no gas.
+        NoCode,
+        /// The method is not active: revert consuming all gas.
+        Gated,
+        Active,
+    }
+
+    /// Nitro's `precompile.go` `Call` together with the bucketing in `gethhook`: below the
+    /// precompile's own version the address is an empty account; outside the method's
+    /// `[arbosVersion, maxArbosVersion]` the call reverts.
+    fn nitro(precompile_version: u64, min: u64, max: u64, version: u64) -> Outcome {
+        if version < precompile_version {
+            Outcome::NoCode
+        } else if version < min || (max > 0 && version > max) {
+            Outcome::Gated
+        } else {
+            Outcome::Active
+        }
+    }
+
+    fn ours(arb: E, selector: [u8; 4], version: u64) -> Outcome {
+        if version < precompile_min_arbos_version(arb) {
+            return Outcome::NoCode;
+        }
+        let (min, max) = method_arbos_bounds(arb, selector);
+        if version < min || (max > 0 && version > max) {
+            Outcome::Gated
+        } else {
+            Outcome::Active
+        }
+    }
+
+    /// Every Nitro method, at every ArbOS version through 70: the same activation outcome, the
+    /// same mutability, and a binding that decodes its selector.
+    #[test]
+    fn every_method_matches_nitro_at_every_version() {
+        let mut failures = Vec::new();
+        for &(arb, name, selector, precompile_version, min, max, purity) in NITRO_METHODS {
+            if method_signature(arb, selector).is_none() {
+                failures.push(format!(
+                    "{arb:?}.{name}: selector not in the interface binding"
+                ));
+            }
+            if method_purity(arb, selector) != purity {
+                failures.push(format!(
+                    "{arb:?}.{name}: mutability {:?}, Nitro {purity:?}",
+                    method_purity(arb, selector)
+                ));
+            }
+            for version in 0..=70 {
+                let expected = nitro(precompile_version, min, max, version);
+                let actual = ours(arb, selector, version);
+                if actual != expected {
+                    failures.push(format!(
+                        "{arb:?}.{name} at ArbOS {version}: {actual:?}, Nitro {expected:?}"
+                    ));
+                    break;
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// The bindings declare no method Nitro lacks, so no selector can reach a body that Nitro
+    /// would answer as unknown.
+    #[test]
+    fn bindings_declare_only_nitro_methods() {
+        use alloy_core::sol_types::SolInterface;
+        use arbitrum_alloy_precompiles::*;
+        let count = |arb: E| NITRO_METHODS.iter().filter(|m| m.0 == arb).count();
+        let bound = [
+            (E::ArbSys, ArbSys::ArbSysCalls::COUNT),
+            (E::ArbInfo, ArbInfo::ArbInfoCalls::COUNT),
+            (
+                E::ArbAddressTable,
+                ArbAddressTable::ArbAddressTableCalls::COUNT,
+            ),
+            (
+                E::ArbFunctionTable,
+                ArbFunctionTable::ArbFunctionTableCalls::COUNT,
+            ),
+            (E::ArbosTest, ArbosTest::ArbosTestCalls::COUNT),
+            (
+                E::ArbOwnerPublic,
+                ArbOwnerPublic::ArbOwnerPublicCalls::COUNT,
+            ),
+            (E::ArbGasInfo, ArbGasInfo::ArbGasInfoCalls::COUNT),
+            (E::ArbAggregator, ArbAggregator::ArbAggregatorCalls::COUNT),
+            (
+                E::ArbRetryableTx,
+                ArbRetryableTx::ArbRetryableTxCalls::COUNT,
+            ),
+            (E::ArbStatistics, ArbStatistics::ArbStatisticsCalls::COUNT),
+            (E::ArbOwner, ArbOwner::ArbOwnerCalls::COUNT),
+            (E::ArbWasm, ArbWasm::ArbWasmCalls::COUNT),
+            (E::ArbWasmCache, ArbWasmCache::ArbWasmCacheCalls::COUNT),
+            (
+                E::ArbNativeTokenManager,
+                ArbNativeTokenManager::ArbNativeTokenManagerCalls::COUNT,
+            ),
+            (
+                E::ArbFilteredTransactionsManager,
+                ArbFilteredTransactionsManager::ArbFilteredTransactionsManagerCalls::COUNT,
+            ),
+            (E::ArbDebug, ArbDebug::ArbDebugCalls::COUNT),
+            (E::ArbosActs, ArbosActs::ArbosActsCalls::COUNT),
+        ];
+        for (arb, n) in bound {
+            assert_eq!(n, count(arb), "{arb:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod version_semantics {
+    //! Version branches inside method bodies that the live-chain parity fixtures (one ArbOS
+    //! version) cannot reach. Each test pins Nitro's behaviour on both sides of its boundary.
+    use super::{ARB_OWNER, ARB_OWNER_PUBLIC, ARB_RETRYABLE_TX, ARB_SYS};
+    use super::{ArbOwner, ArbOwnerPublic, ArbPrecompilesEnum as E, ArbRetryableTx, ArbSys};
+    use crate::{
+        api::default_ctx::{ArbContext, DefaultArb},
+        arb_journal::ArbCall,
+        storage::ArbosState,
+    };
+    use alloy_core::sol_types::{SolCall, SolError};
+    use revm::{
+        context_interface::{ContextTr, JournalTr},
+        database_interface::EmptyDB,
+        interpreter::{InstructionResult, InterpreterResult},
+        primitives::{Address, B256, Bytes, U256, address},
+    };
+
+    const OWNER: Address = address!("0x00000000000000000000000000000000000c0ffe");
+    const NETWORK: Address = address!("0x00000000000000000000000000000000000000aa");
+    const INFRA: Address = address!("0x00000000000000000000000000000000000000bb");
+
+    fn ctx(version: u64) -> ArbContext<EmptyDB> {
+        let mut ctx = <ArbContext<EmptyDB> as DefaultArb>::arb();
+        let state = ArbosState::open();
+        state.arbos_version.set(version, ctx.journal_mut()).unwrap();
+        state.chain_owners.add(OWNER, ctx.journal_mut()).unwrap();
+        state
+            .network_fee_account
+            .set(NETWORK, ctx.journal_mut())
+            .unwrap();
+        state
+            .infra_fee_account
+            .set(INFRA, ctx.journal_mut())
+            .unwrap();
+        ctx
+    }
+
+    fn call(
+        ctx: &mut ArbContext<EmptyDB>,
+        arb: E,
+        address: Address,
+        input: &[u8],
+        is_static: bool,
+    ) -> InterpreterResult {
+        arb.run_dispatch(
+            ctx,
+            &ArbCall {
+                input,
+                gas_limit: 100_000,
+                caller: OWNER,
+                value: U256::ZERO,
+                bytecode_address: address,
+                acting_address: address,
+                is_static,
+            },
+        )
+    }
+
+    fn log_count(ctx: &mut ArbContext<EmptyDB>) -> usize {
+        ctx.journal_mut().logs().len()
+    }
+
+    /// Nitro's OwnerPrecompile logs `OwnerActs` when `!readOnly || version < 11`.
+    #[test]
+    fn owner_acts_logged_for_static_getter_only_before_arbos_11() {
+        let input = ArbOwner::getNetworkFeeAccountCall {}.abi_encode();
+        for (version, logged) in [(10, 1), (11, 0)] {
+            let mut ctx = ctx(version);
+            let result = call(&mut ctx, E::ArbOwner, ARB_OWNER, &input, true);
+            assert_eq!(result.result, InstructionResult::Return, "ArbOS {version}");
+            assert_eq!(log_count(&mut ctx), logged, "ArbOS {version}");
+        }
+        // A mutating call is logged at every version.
+        let input = ArbOwner::setNetworkFeeAccountCall {
+            newNetworkFeeAccount: INFRA,
+        }
+        .abi_encode();
+        let mut ctx = ctx(61);
+        assert_eq!(
+            call(&mut ctx, E::ArbOwner, ARB_OWNER, &input, false).result,
+            InstructionResult::Return
+        );
+        assert_eq!(log_count(&mut ctx), 1);
+    }
+
+    /// Only ArbOwnerPublic answers with the network fee account before ArbOS 6.
+    #[test]
+    fn public_infra_fee_account_falls_back_before_arbos_6() {
+        let decode = |r: InterpreterResult| Address::from_slice(&r.output[12..32]);
+        for (version, public) in [(5, NETWORK), (6, INFRA)] {
+            let mut ctx = ctx(version);
+            let input = ArbOwnerPublic::getInfraFeeAccountCall {}.abi_encode();
+            assert_eq!(
+                decode(call(
+                    &mut ctx,
+                    E::ArbOwnerPublic,
+                    ARB_OWNER_PUBLIC,
+                    &input,
+                    false
+                )),
+                public
+            );
+            let input = ArbOwner::getInfraFeeAccountCall {}.abi_encode();
+            assert_eq!(
+                decode(call(&mut ctx, E::ArbOwner, ARB_OWNER, &input, false)),
+                INFRA
+            );
+        }
+    }
+
+    /// `getBeneficiary` uses `oldNotFoundError` (plain error before ArbOS 3); `getTimeout`
+    /// always answers `NoTicketWithID()`.
+    #[test]
+    fn missing_ticket_errors_follow_nitro_by_version() {
+        let ticket = B256::repeat_byte(7);
+        let no_ticket = ArbRetryableTx::NoTicketWithID {}.abi_encode();
+        for (version, beneficiary_output) in
+            [(2, Bytes::new()), (3, Bytes::from(no_ticket.clone()))]
+        {
+            let mut ctx = ctx(version);
+            let input = ArbRetryableTx::getBeneficiaryCall { ticketId: ticket }.abi_encode();
+            let r = call(&mut ctx, E::ArbRetryableTx, ARB_RETRYABLE_TX, &input, false);
+            assert_eq!(r.result, InstructionResult::Revert, "ArbOS {version}");
+            assert_eq!(r.output, beneficiary_output, "ArbOS {version}");
+            let input = ArbRetryableTx::getTimeoutCall { ticketId: ticket }.abi_encode();
+            let r = call(&mut ctx, E::ArbRetryableTx, ARB_RETRYABLE_TX, &input, false);
+            assert_eq!(r.output, Bytes::from(no_ticket.clone()), "ArbOS {version}");
+        }
+    }
+
+    /// Go's decoder rejects an out-of-range `uint64` before the owner's setter can store it.
+    #[test]
+    fn owner_setter_rejects_out_of_range_word_like_go() {
+        let mut ctx = ctx(61);
+        let mut input = ArbOwner::setL2GasBacklogToleranceCall::SELECTOR.to_vec();
+        let mut word = [0u8; 32];
+        word[23] = 1; // 2^64
+        input.extend_from_slice(&word);
+        let r = call(&mut ctx, E::ArbOwner, ARB_OWNER, &input, false);
+        assert_eq!(r.result, InstructionResult::Revert);
+        assert_eq!(
+            ArbosState::open()
+                .l2_pricing
+                .backlog_tolerance
+                .get(ctx.journal_mut())
+                .unwrap(),
+            0
+        );
+    }
+
+    /// Before ArbOS 61 the single-dimensional (and any unset) fee is the stored `BaseFeeWei`, one
+    /// extra read; from 61 it is the block's base fee.
+    #[test]
+    fn multi_gas_base_fee_fallback_switches_at_arbos_61() {
+        use super::ArbGasInfo;
+        let input = ArbGasInfo::getMultiGasBaseFeeCall {}.abi_encode();
+        let mut gas = Vec::new();
+        for (version, expected) in [(60, 7_u64), (61, 0)] {
+            let mut ctx = ctx(version);
+            ArbosState::open()
+                .l2_pricing
+                .base_fee_wei
+                .set(U256::from(7), ctx.journal_mut())
+                .unwrap();
+            let r = call(&mut ctx, E::ArbGasInfo, super::ARB_GAS_INFO, &input, false);
+            assert_eq!(r.result, InstructionResult::Return, "ArbOS {version}");
+            // offset, length, then the nine fees; the block env's base fee is zero here.
+            assert_eq!(r.output.len(), 32 * 11);
+            let first = U256::from_be_slice(&r.output[64..96]);
+            assert_eq!(first, U256::from(expected), "ArbOS {version}");
+            gas.push(r.gas.total_gas_spent());
+        }
+        assert_eq!(gas[0], gas[1] + 800, "the pre-61 BaseFeeWei read");
+    }
+
+    /// A direct call has no calling frame: `myCallersAddressWithoutAliasing` is zero.
+    #[test]
+    fn direct_call_has_no_callers_caller() {
+        let mut ctx = ctx(61);
+        let input = ArbSys::myCallersAddressWithoutAliasingCall {}.abi_encode();
+        let r = call(&mut ctx, E::ArbSys, ARB_SYS, &input, false);
+        assert_eq!(r.output, Bytes::from(vec![0u8; 32]));
     }
 }
 
@@ -950,6 +1412,15 @@ mod gating_tests {
         assert_eq!(
             method_arbos_bounds(E::ArbOwner, ArbOwner::setGasBacklogCall::SELECTOR),
             (50, 0)
+        );
+        // v59 ArbOwner setter, declared outside the generated interface
+        assert_eq!(
+            ArbOwner::setWasmActivationGasCall::SELECTOR,
+            [0xa0, 0xa3, 0x24, 0x97]
+        );
+        assert_eq!(
+            method_arbos_bounds(E::ArbOwner, ArbOwner::setWasmActivationGasCall::SELECTOR),
+            (59, 0)
         );
         // not gated
         assert_eq!(
@@ -1147,7 +1618,10 @@ mod gating_tests {
                 "0x74 (v60) activity at ArbOS {version}"
             );
             // Ungated precompiles are present at every version.
-            assert!(active.contains(&ARB_SYS), "ArbSys missing at ArbOS {version}");
+            assert!(
+                active.contains(&ARB_SYS),
+                "ArbSys missing at ArbOS {version}"
+            );
             assert_eq!(
                 active.contains(&ARB_WASM),
                 version >= 30,

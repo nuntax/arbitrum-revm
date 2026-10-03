@@ -1,5 +1,5 @@
 use super::*;
-use crate::arb_journal::{ArbCall, ArbJournal, ArbPrecompileCtx};
+use crate::arb_journal::{ArbCall, ArbJournal, ArbPrecompileCtx, MeteredJournal};
 use alloy_core::sol_types::SolError;
 use arbitrum_alloy_consensus::transactions::TxRetry;
 use revm::{
@@ -10,6 +10,7 @@ use revm::{
 const REDEEM_SCHEDULED_EVENT_SIGNATURE: &[u8] =
     b"RedeemScheduled(bytes32,bytes32,uint64,uint64,address,uint256,uint256)";
 const LIFETIME_EXTENDED_EVENT_SIGNATURE: &[u8] = b"LifetimeExtended(bytes32,uint256)";
+const CANCELED_EVENT_SIGNATURE: &[u8] = b"Canceled(bytes32)";
 const RETRY_TX_GAS_MINIMUM: u64 = 21_000;
 // EVM log gas (go-ethereum params/protocol_params.go); version-independent.
 const LOG_GAS: u64 = 375; // params.LogGas
@@ -88,46 +89,66 @@ where
     match call {
         ArbRetryableTx::ArbRetryableTxCalls::getLifetime(_) => ok_result(
             gas_limit,
-            alloy_core::sol_types::SolValue::abi_encode(&(U256::from(RETRYABLE_LIFETIME_SECONDS),)),
+            alloy_core::sol_types::SolValue::abi_encode_params(&(U256::from(
+                RETRYABLE_LIFETIME_SECONDS,
+            ),)),
         ),
         ArbRetryableTx::ArbRetryableTxCalls::getTimeout(c) => {
-            let record = state.retryables.retryable(c.ticketId);
-            let timeout = match record.timeout_with_windows(ctx.journal_mut()) {
-                Ok(t) => t,
-                Err(e) => return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}")),
+            let now = ctx.block_timestamp();
+            let arbos_version = match state.arbos_version.get(ctx.journal_mut()) {
+                Ok(v) => v,
+                Err(e) => return fatal_result(gas_limit, &format!("ArbRetryableTx: {e}")),
             };
-            if timeout == 0 {
-                return revert_result(gas_limit, "ArbRetryableTx: ticket does not exist");
-            }
-            ok_result(
-                gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(U256::from(timeout),)),
-            )
+            let record = state.retryables.retryable(c.ticketId);
+            let mut j = MeteredJournal::new(ctx.journal_mut());
+            // Nitro: `OpenRetryable`, then `CalculateTimeout` reads the timeout and window count
+            // again. A missing ticket is always `NoTicketWithID()` here, at every version.
+            let result = match open_retryable(&record, now, arbos_version, &mut j) {
+                Ok(true) => match record.timeout.get(&mut j).and_then(|timeout| {
+                    record.timeout_windows_left.get(&mut j).map(|windows| {
+                        timeout.wrapping_add(windows.wrapping_mul(RETRYABLE_LIFETIME_SECONDS))
+                    })
+                }) {
+                    Ok(timeout) => ok_result(
+                        gas_limit,
+                        alloy_core::sol_types::SolValue::abi_encode_params(&(U256::from(timeout),)),
+                    ),
+                    Err(e) => return fatal_result(gas_limit, &format!("ArbRetryableTx: {e}")),
+                },
+                Ok(false) => no_ticket_result(gas_limit),
+                Err(e) => return fatal_result(gas_limit, &format!("ArbRetryableTx: {e}")),
+            };
+            charge(result, j.burned)
         }
         ArbRetryableTx::ArbRetryableTxCalls::getBeneficiary(c) => {
+            let now = ctx.block_timestamp();
+            let arbos_version = match state.arbos_version.get(ctx.journal_mut()) {
+                Ok(v) => v,
+                Err(e) => return fatal_result(gas_limit, &format!("ArbRetryableTx: {e}")),
+            };
             let record = state.retryables.retryable(c.ticketId);
-            let timeout = match record.timeout.get(ctx.journal_mut()) {
-                Ok(t) => t,
-                Err(e) => return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}")),
+            let mut j = MeteredJournal::new(ctx.journal_mut());
+            let result = match open_retryable(&record, now, arbos_version, &mut j) {
+                Ok(true) => match record.beneficiary.get(&mut j) {
+                    Ok(beneficiary) => ok_result(
+                        gas_limit,
+                        alloy_core::sol_types::SolValue::abi_encode_params(&(beneficiary,)),
+                    ),
+                    Err(e) => return fatal_result(gas_limit, &format!("ArbRetryableTx: {e}")),
+                },
+                Ok(false) => old_not_found_result(gas_limit, arbos_version),
+                Err(e) => return fatal_result(gas_limit, &format!("ArbRetryableTx: {e}")),
             };
-            if timeout == 0 {
-                return revert_result(gas_limit, "ArbRetryableTx: ticket does not exist");
-            }
-            let beneficiary = match record.beneficiary.get(ctx.journal_mut()) {
-                Ok(b) => b,
-                Err(e) => return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}")),
-            };
-            ok_result(
-                gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(beneficiary,)),
-            )
+            charge(result, j.burned)
         }
         ArbRetryableTx::ArbRetryableTxCalls::getCurrentRedeemer(_) => {
-            // Current redeemer is tracked in transient per-message state;
-            // return zero address when no redeem is in progress.
+            // Nitro: `txProcessor.CurrentRefundTo`, set for the whole of a retry transaction.
+            let redeemer = ctx
+                .current_retry()
+                .map_or(Address::ZERO, |retry| retry.refund_to);
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(Address::ZERO,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(redeemer,)),
             )
         }
         ArbRetryableTx::ArbRetryableTxCalls::submitRetryable(_) => InterpreterResult {
@@ -314,9 +335,9 @@ where
             ctx.journal_mut().emit_log(Log::new_unchecked(
                 call_inputs.bytecode_address,
                 vec![keccak256(LIFETIME_EXTENDED_EVENT_SIGNATURE), c.ticketId],
-                Bytes::from(alloy_core::sol_types::SolValue::abi_encode(&(U256::from(
-                    new_timeout,
-                ),))),
+                Bytes::from(alloy_core::sol_types::SolValue::abi_encode_params(&(
+                    U256::from(new_timeout),
+                ))),
             ));
 
             let mut gas = Gas::new(gas_limit);
@@ -324,40 +345,63 @@ where
             InterpreterResult {
                 result: InstructionResult::Return,
                 gas,
-                output: Bytes::from(alloy_core::sol_types::SolValue::abi_encode(&(U256::from(
-                    new_timeout,
-                ),))),
+                output: Bytes::from(alloy_core::sol_types::SolValue::abi_encode_params(&(
+                    U256::from(new_timeout),
+                ))),
             }
         }
         ArbRetryableTx::ArbRetryableTxCalls::cancel(c) => {
-            let record = state.retryables.retryable(c.ticketId);
-            let timeout = match record.timeout.get(ctx.journal_mut()) {
-                Ok(t) => t,
-                Err(e) => return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}")),
-            };
-            if timeout == 0 {
-                return revert_result(gas_limit, "ArbRetryableTx: ticket does not exist");
+            if ctx
+                .current_retry()
+                .is_some_and(|retry| retry.ticket_id == c.ticketId)
+            {
+                return plain_error(gas_limit, "retryable cannot modify itself");
             }
-            let beneficiary = match record.beneficiary.get(ctx.journal_mut()) {
+            let now = ctx.block_timestamp();
+            let arbos_version = match state.arbos_version.get(ctx.journal_mut()) {
+                Ok(v) => v,
+                Err(e) => return fatal_result(gas_limit, &format!("ArbRetryableTx: {e}")),
+            };
+            let record = state.retryables.retryable(c.ticketId);
+            let mut j = MeteredJournal::new(ctx.journal_mut());
+            match open_retryable(&record, now, arbos_version, &mut j) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return charge(old_not_found_result(gas_limit, arbos_version), j.burned);
+                }
+                Err(e) => return fatal_result(gas_limit, &format!("ArbRetryableTx: {e}")),
+            }
+            let beneficiary = match record.beneficiary.get(&mut j) {
                 Ok(b) => b,
-                Err(e) => return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}")),
+                Err(e) => return fatal_result(gas_limit, &format!("ArbRetryableTx: {e}")),
             };
             if call_inputs.caller != beneficiary {
-                return revert_result(
-                    gas_limit,
-                    "ArbRetryableTx: only the beneficiary may cancel a retryable",
+                return charge(
+                    plain_error(gas_limit, "only the beneficiary may cancel a retryable"),
+                    j.burned,
                 );
             }
-            match state
-                .retryables
-                .delete_retryable(c.ticketId, ctx.journal_mut())
-            {
-                Ok(true) => ok_result(gas_limit, vec![]),
-                Ok(false) => revert_result(gas_limit, "ArbRetryableTx: ticket does not exist"),
-                Err(e) => revert_result(gas_limit, &format!("ArbRetryableTx: cancel error: {e}")),
+            // `DeleteRetryable` re-reads the raw timeout and beneficiary, releases the escrow, and
+            // clears every field; the precompile then logs `Canceled(ticketId)`.
+            match state.retryables.delete_retryable(c.ticketId, &mut j) {
+                Ok(_) => {}
+                Err(e) => return fatal_result(gas_limit, &format!("ArbRetryableTx: cancel: {e}")),
             }
+            j.emit_log(Log::new_unchecked(
+                call_inputs.bytecode_address,
+                vec![keccak256(CANCELED_EVENT_SIGNATURE), c.ticketId],
+                Bytes::new(),
+            ));
+            charge(ok_result(gas_limit, vec![]), j.burned)
         }
         ArbRetryableTx::ArbRetryableTxCalls::redeem(c) => {
+            // Nitro checks this before touching any state.
+            if ctx
+                .current_retry()
+                .is_some_and(|retry| retry.ticket_id == c.ticketId)
+            {
+                return plain_error(gas_limit, "retryable cannot modify itself");
+            }
             let redeem_input_len = input.len();
             let call_input_extra = ARBOS_STATE_OPEN_GAS
                 + COPY_GAS * words_for_bytes(redeem_input_len.saturating_sub(4));
@@ -367,14 +411,14 @@ where
             let arbos_version = match state.arbos_version.get(ctx.journal_mut()) {
                 Ok(version) => version,
                 Err(e) => {
-                    return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}"));
+                    return plain_error(gas_limit, &format!("ArbRetryableTx: error: {e}"));
                 }
             };
 
             let exists = match retryable.exists(current_timestamp, arbos_version, ctx.journal_mut())
             {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbRetryableTx: error: {e}")),
             };
             if !exists {
                 if arbos_version >= 3 {
@@ -387,37 +431,37 @@ where
                     };
                 }
                 // Pre-v3: the legacy `Error("ticketId not found")` string, with the same read burns.
-                let mut result = revert_result(gas_limit, "ticketId not found");
+                let mut result = plain_error(gas_limit, "ticketId not found");
                 let _ = result.gas.record_regular_cost(REDEEM_NOT_FOUND_READ_BURNS);
                 return result;
             }
 
             let nonce = match retryable.num_tries.get(ctx.journal_mut()) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbRetryableTx: error: {e}")),
             };
             if let Err(e) = retryable
                 .num_tries
                 .set(nonce.saturating_add(1), ctx.journal_mut())
             {
-                return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}"));
+                return plain_error(gas_limit, &format!("ArbRetryableTx: error: {e}"));
             }
 
             let from = match retryable.from.get(ctx.journal_mut()) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbRetryableTx: error: {e}")),
             };
             let to = match retryable.to(ctx.journal_mut()) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbRetryableTx: error: {e}")),
             };
             let value = match retryable.callvalue.get(ctx.journal_mut()) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbRetryableTx: error: {e}")),
             };
             let input = match retryable.calldata.get(ctx.journal_mut()) {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbRetryableTx: error: {e}")),
             };
 
             // Donation, per Nitro ArbRetryableTx.Redeem: gasToDonate = GasLeft - futureGasCosts,
@@ -459,7 +503,7 @@ where
                 + backlog_cost_lookup_burn(arbos_version);
             let reserved = future_gas_costs.saturating_add(read_burns);
             if gas_limit < reserved {
-                return revert_result(gas_limit, "ArbRetryableTx: not enough gas for redeem");
+                return plain_error(gas_limit, "ArbRetryableTx: not enough gas for redeem");
             }
             let donated_gas = gas_limit - reserved;
             if donated_gas < RETRY_TX_GAS_MINIMUM {
@@ -482,7 +526,7 @@ where
                 None => match state.chain_id.get(ctx.journal_mut()) {
                     Ok(id) => id,
                     Err(e) => {
-                        return revert_result(gas_limit, &format!("ArbRetryableTx: error: {e}"));
+                        return plain_error(gas_limit, &format!("ArbRetryableTx: error: {e}"));
                     }
                 },
             };
@@ -514,7 +558,7 @@ where
                     retry_tx_hash,
                     u256_to_b256(U256::from(nonce)),
                 ],
-                Bytes::from(alloy_core::sol_types::SolValue::abi_encode(&(
+                Bytes::from(alloy_core::sol_types::SolValue::abi_encode_params(&(
                     donated_gas,
                     call_inputs.caller,
                     U256::MAX,
@@ -572,13 +616,66 @@ where
             let _ = gas.record_regular_cost(consumed);
             InterpreterResult {
                 result: InstructionResult::Return,
-                output: Bytes::from(alloy_core::sol_types::SolValue::abi_encode(&(
+                output: Bytes::from(alloy_core::sol_types::SolValue::abi_encode_params(&(
                     retry_tx_hash,
                 ))),
                 gas,
             }
         }
     }
+}
+
+/// Nitro `RetryableState.OpenRetryable`: whether a live ticket exists, making exactly Nitro's reads.
+/// A ticket past its timeout is gone unless, from ArbOS 60, its keepalive windows still cover now.
+/// Nitro's arithmetic is plain `uint64`, hence the wrapping operations.
+fn open_retryable<J: ArbJournal>(
+    record: &crate::storage::RetryableRecord,
+    now: u64,
+    arbos_version: u64,
+    journal: &mut J,
+) -> eyre::Result<bool> {
+    let timeout = record.timeout.get(journal)?;
+    if timeout == 0 {
+        return Ok(false);
+    }
+    if timeout < now {
+        let mut effective = timeout;
+        if arbos_version >= ARBOS_VERSION_MULTI_GAS_CONSTRAINTS {
+            let windows = record.timeout_windows_left.get(journal)?;
+            effective = timeout.wrapping_add(windows.wrapping_mul(RETRYABLE_LIFETIME_SECONDS));
+        }
+        if effective < now {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The Solidity error `NoTicketWithID()`.
+fn no_ticket_result(gas_limit: u64) -> InterpreterResult {
+    InterpreterResult {
+        result: InstructionResult::Revert,
+        gas: Gas::new(gas_limit),
+        output: Bytes::from_static(&NO_TICKET_WITH_ID_SELECTOR),
+    }
+}
+
+/// Nitro `oldNotFoundError`: `NoTicketWithID()` from ArbOS 3, a plain error before it.
+fn old_not_found_result(gas_limit: u64, arbos_version: u64) -> InterpreterResult {
+    if arbos_version >= 3 {
+        no_ticket_result(gas_limit)
+    } else {
+        plain_error(gas_limit, "ticketId not found")
+    }
+}
+
+/// Folds the gas a method burned through its `MeteredJournal` into its result.
+fn charge(mut result: InterpreterResult, burned: u64) -> InterpreterResult {
+    if !result.gas.record_regular_cost(burned) {
+        result.result = InstructionResult::OutOfGas;
+        result.output = Bytes::new();
+    }
+    result
 }
 
 fn keepalive_not_found_result(

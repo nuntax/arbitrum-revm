@@ -17,7 +17,7 @@ fn invalid_block_number_revert(
     current: U256,
 ) -> InterpreterResult {
     let mut data = vec![0xd5u8, 0xdc, 0x64, 0x2d];
-    data.extend_from_slice(&alloy_core::sol_types::SolValue::abi_encode(&(
+    data.extend_from_slice(&alloy_core::sol_types::SolValue::abi_encode_params(&(
         requested, current,
     )));
     InterpreterResult {
@@ -53,7 +53,7 @@ where
             let num: u64 = ctx.block_number();
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(U256::from(num),)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(U256::from(num),)),
             )
         }
         ArbSys::ArbSysCalls::arbBlockHash(call) => {
@@ -92,7 +92,7 @@ where
             let hash = ctx.block_hash(target).unwrap_or(B256::ZERO);
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(hash,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(hash,)),
             )
         }
         ArbSys::ArbSysCalls::arbChainID(_) => {
@@ -102,7 +102,7 @@ where
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(chain_id,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(chain_id,)),
             )
         }
         ArbSys::ArbSysCalls::arbOSVersion(_) => {
@@ -114,61 +114,67 @@ where
             let encoded_version = U256::from(55_u64.saturating_add(version));
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(encoded_version,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(encoded_version,)),
             )
         }
         ArbSys::ArbSysCalls::getStorageGasAvailable(_) => {
             // Nitro has no storage gas; return 0 for Classic compatibility.
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(U256::ZERO,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(U256::ZERO,)),
             )
         }
         ArbSys::ArbSysCalls::isTopLevelCall(_) => {
             let depth = ctx.call_depth();
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(depth <= 2,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(depth <= 2,)),
             )
         }
         ArbSys::ArbSysCalls::mapL1SenderContractAddressToL2Alias(call) => {
             match remap_l1_address(call.sender) {
                 Ok(aliased) => ok_result(
                     gas_limit,
-                    alloy_core::sol_types::SolValue::abi_encode(&(aliased,)),
+                    alloy_core::sol_types::SolValue::abi_encode_params(&(aliased,)),
                 ),
-                Err(e) => revert_result(gas_limit, &format!("ArbSys: alias error: {e}")),
+                Err(e) => plain_error(gas_limit, &format!("ArbSys: alias error: {e}")),
             }
         }
         ArbSys::ArbSysCalls::wasMyCallersAddressAliased(_) => {
-            let aliased = caller_was_aliased(ctx);
+            let aliased = match caller_was_aliased(ctx, state) {
+                Ok(v) => v,
+                Err(e) => return fatal_result(gas_limit, &format!("ArbSys: storage error: {e}")),
+            };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(aliased,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(aliased,)),
             )
         }
         ArbSys::ArbSysCalls::myCallersAddressWithoutAliasing(_) => {
-            // Nitro (ArbSys.go): address = Contracts[depth-2].Caller() (the caller of the frame
-            // that called ArbSys), inverse-remapped iff that caller was aliased. Aliasing only
-            // applies at the top level (depth <= 2), and there the grandparent caller IS the
-            // transaction origin, so `tx_caller` reconstructs the address on both the in-EVM and
-            // node paths (the latter carries no call stack). Deeper frames would need the real
-            // stack, but there `caller_was_aliased` is false and a `wasMyCallersAddressAliased`-
-            // gated contract never trusts the raw value, so origin is a safe stand-in.
-            let base = ctx.tx_caller();
-            let out = if caller_was_aliased(ctx) {
+            // Nitro: zero for a direct call, otherwise the caller of the frame that called ArbSys
+            // (`Contracts[depth-2].Caller()`), inverse-remapped when that caller was aliased.
+            let base = if ctx.call_depth() > 1 {
+                ctx.calling_frame_caller().unwrap_or_default()
+            } else {
+                Address::ZERO
+            };
+            let aliased = match caller_was_aliased(ctx, state) {
+                Ok(v) => v,
+                Err(e) => return fatal_result(gas_limit, &format!("ArbSys: storage error: {e}")),
+            };
+            let out = if aliased {
                 inverse_remap_l1_address(base).unwrap_or(base)
             } else {
                 base
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(out,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(out,)),
             )
         }
         ArbSys::ArbSysCalls::sendMerkleTreeState(_) => {
             if call_inputs.caller != Address::ZERO {
-                return revert_result(
+                return plain_error(
                     gas_limit,
                     "ArbSys: method can only be called by address zero",
                 );
@@ -176,11 +182,15 @@ where
             let journal = ctx.journal_mut();
             let (size, root, partials) = match state.send_merkle.state_for_export(journal) {
                 Ok(out) => out,
-                Err(e) => return revert_result(gas_limit, &format!("ArbSys: merkle error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbSys: merkle error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(U256::from(size), root, partials)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(
+                    U256::from(size),
+                    root,
+                    partials,
+                )),
             )
         }
         ArbSys::ArbSysCalls::sendTxToL1(call) => apply_send_tx_to_l1(
@@ -257,7 +267,7 @@ where
         };
         if owner_count > 0 {
             // Nitro reverts here after the metered read; charge the gas burned so far.
-            let mut result = revert_result(
+            let mut result = plain_error(
                 gas_limit,
                 "ArbSys: not allowed to send value when native token owners exist",
             );
@@ -285,11 +295,11 @@ where
 
     let update_events = match state.send_merkle.append(send_hash, &mut journal) {
         Ok(v) => v,
-        Err(e) => return revert_result(gas_limit, &format!("ArbSys: merkle error: {e}")),
+        Err(e) => return plain_error(gas_limit, &format!("ArbSys: merkle error: {e}")),
     };
     let size = match state.send_merkle.size(&mut journal) {
         Ok(v) => v,
-        Err(e) => return revert_result(gas_limit, &format!("ArbSys: merkle error: {e}")),
+        Err(e) => return plain_error(gas_limit, &format!("ArbSys: merkle error: {e}")),
     };
     let leaf_num = size.saturating_sub(1);
 
@@ -299,7 +309,7 @@ where
             Err(e) => return fatal_result(gas_limit, &format!("ArbSys: storage error: {e}")),
         };
         if !sufficient {
-            return revert_result(gas_limit, "ArbSys: insufficient balance for L2->L1 burn");
+            return plain_error(gas_limit, "ArbSys: insufficient balance for L2->L1 burn");
         }
     }
 
@@ -349,7 +359,7 @@ where
 
     let mut result = ok_result(
         gas_limit,
-        alloy_core::sol_types::SolValue::abi_encode(&(unique_id,)),
+        alloy_core::sol_types::SolValue::abi_encode_params(&(unique_id,)),
     );
     // Fold the burner total into the call's gas (Nitro bills these per-op through the burner).
     if !result.gas.record_regular_cost(burned) {
@@ -363,8 +373,20 @@ where
 /// (ArbSys.go): `isTopLevel && DoesTxTypeAlias(TopTxType)`. `isTopLevel` reduces to `depth <= 2`
 /// (the frame that called ArbSys was itself invoked directly by the tx), the same predicate
 /// `IsTopLevelCall` uses.
-fn caller_was_aliased<CTX: ArbPrecompileCtx>(ctx: &CTX) -> bool {
-    ctx.call_depth() <= 2 && does_tx_type_alias(ctx.top_tx_type())
+/// Nitro `ArbSys.WasMyCallersAddressAliased`. From ArbOS 6 the caller counts as top level when the
+/// call is direct or the calling frame was itself called by the transaction origin (so a
+/// DELEGATECALL from the origin's callee still qualifies); before 6, only at exactly depth 2.
+fn caller_was_aliased<CTX: ArbPrecompileCtx>(
+    ctx: &mut CTX,
+    state: &ArbosState,
+) -> eyre::Result<bool> {
+    let depth = ctx.call_depth();
+    let top_level = if state.arbos_version.get(ctx.journal_mut())? < 6 {
+        depth == 2
+    } else {
+        depth < 2 || ctx.calling_frame_caller() == Some(ctx.tx_caller())
+    };
+    Ok(top_level && does_tx_type_alias(ctx.top_tx_type()))
 }
 
 /// Nitro `util.DoesTxTypeAlias`: only L1-originated tx types alias their sender.

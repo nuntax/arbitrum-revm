@@ -20,7 +20,7 @@ where
             let num: u64 = ctx.block_number();
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(
+                alloy_core::sol_types::SolValue::abi_encode_params(&(
                     U256::from(num),
                     U256::ZERO,
                     U256::ZERO,

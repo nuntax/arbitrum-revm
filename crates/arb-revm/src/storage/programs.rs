@@ -162,6 +162,8 @@ impl ProgramInfo {
         Ok(())
     }
 
+    // Only Stylus activation asks this; the query methods go through `validate_active`.
+    #[cfg(any(test, feature = "stylus"))]
     pub(crate) fn is_expired(self, timestamp: u64, expiry_days: u16) -> bool {
         self.activated_at == 0
             || self.age_seconds(timestamp) > u64::from(expiry_days).saturating_mul(24 * 60 * 60)

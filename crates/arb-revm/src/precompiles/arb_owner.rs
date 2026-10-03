@@ -1,8 +1,7 @@
 use super::*;
 use crate::arb_journal::{ArbCall, ArbJournal, ArbPrecompileCtx};
 use crate::storage::{pack_uint, stylus_param_layout as layout};
-use revm::interpreter::InstructionResult;
-use revm::primitives::{B256, Bytes, Log, keccak256};
+use revm::primitives::{Address, B256, Bytes, Log, keccak256};
 
 const FEATURE_ENABLE_DELAY_SECONDS: u64 = 7 * 24 * 60 * 60;
 const ARBOS_VERSION_PER_TX_GAS_LIMIT: u64 = 50;
@@ -48,14 +47,14 @@ where
     // Needed to gate the per-method owner events the same way Nitro does (>= ArbosVersion_60).
     let arbos_version = match state.arbos_version.get(j) {
         Ok(v) => v,
-        Err(e) => return revert_result(gas_limit, &format!("ArbOwner: version read error: {e}")),
+        Err(e) => return plain_error(gas_limit, &format!("ArbOwner: version read error: {e}")),
     };
 
     macro_rules! set_or_revert {
         ($expr:expr, $label:literal) => {
             match $expr {
                 Ok(_) => ok_result(gas_limit, vec![]),
-                Err(e) => revert_result(gas_limit, &format!("ArbOwner: {} error: {}", $label, e)),
+                Err(e) => plain_error(gas_limit, &format!("ArbOwner: {} error: {}", $label, e)),
             }
         };
     }
@@ -80,12 +79,24 @@ where
                     }
                     ok_result(gas_limit, vec![])
                 }
-                Err(e) => revert_result(gas_limit, &format!("ArbOwner: {} error: {}", $label, e)),
+                Err(e) => plain_error(gas_limit, &format!("ArbOwner: {} error: {}", $label, e)),
             }
         };
     }
 
-    let result = match call {
+    macro_rules! get_or_error {
+        ($expr:expr) => {
+            match $expr {
+                Ok(v) => ok_result(
+                    gas_limit,
+                    alloy_core::sol_types::SolValue::abi_encode_params(&(v,)),
+                ),
+                Err(e) => plain_error(gas_limit, &format!("{e}")),
+            }
+        };
+    }
+
+    match call {
         ArbOwner::ArbOwnerCalls::addChainOwner(c) => {
             set_or_revert_event!(
                 state.chain_owners.add(c.newOwner, j),
@@ -95,32 +106,31 @@ where
                 c.newOwner
             )
         }
-        ArbOwner::ArbOwnerCalls::removeChainOwner(c) => match state
-            .chain_owners
-            .is_member(c.owner, j)
-        {
-            Ok(true) => set_or_revert_event!(
-                state.chain_owners.remove(c.owner, arbos_version, j),
-                "removeChainOwner",
-                arbos_version >= ARBOS_VERSION_OWNER_EVENTS,
-                "ChainOwnerRemoved(address)",
-                c.owner
-            ),
-            Ok(false) => revert_result(gas_limit, "ArbOwner: tried to remove non-owner"),
-            Err(e) => revert_result(gas_limit, &format!("ArbOwner: removeChainOwner error: {e}")),
-        },
+        ArbOwner::ArbOwnerCalls::removeChainOwner(c) => {
+            match state.chain_owners.is_member(c.ownerToRemove, j) {
+                Ok(true) => set_or_revert_event!(
+                    state.chain_owners.remove(c.ownerToRemove, arbos_version, j),
+                    "removeChainOwner",
+                    arbos_version >= ARBOS_VERSION_OWNER_EVENTS,
+                    "ChainOwnerRemoved(address)",
+                    c.ownerToRemove
+                ),
+                Ok(false) => plain_error(gas_limit, "ArbOwner: tried to remove non-owner"),
+                Err(e) => plain_error(gas_limit, &format!("ArbOwner: removeChainOwner error: {e}")),
+            }
+        }
         ArbOwner::ArbOwnerCalls::addNativeTokenOwner(c) => {
             let enabled_from = match state.native_token_enabled_from_timestamp.get(j) {
                 Ok(v) => v,
                 Err(e) => {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         &format!("ArbOwner: addNativeTokenOwner error: {e}"),
                     );
                 }
             };
             if enabled_from == 0 || enabled_from > block_timestamp {
-                return revert_result(
+                return plain_error(
                     gas_limit,
                     "ArbOwner: native token feature is not enabled yet",
                 );
@@ -134,19 +144,21 @@ where
             )
         }
         ArbOwner::ArbOwnerCalls::removeNativeTokenOwner(c) => {
-            match state.native_token_owners.is_member(c.owner, j) {
+            match state.native_token_owners.is_member(c.ownerToRemove, j) {
                 Ok(true) => set_or_revert_event!(
-                    state.native_token_owners.remove(c.owner, arbos_version, j),
+                    state
+                        .native_token_owners
+                        .remove(c.ownerToRemove, arbos_version, j),
                     "removeNativeTokenOwner",
                     arbos_version >= ARBOS_VERSION_OWNER_EVENTS,
                     "NativeTokenOwnerRemoved(address)",
-                    c.owner
+                    c.ownerToRemove
                 ),
-                Ok(false) => revert_result(
+                Ok(false) => plain_error(
                     gas_limit,
                     "ArbOwner: tried to remove non native token owner",
                 ),
-                Err(e) => revert_result(
+                Err(e) => plain_error(
                     gas_limit,
                     &format!("ArbOwner: removeNativeTokenOwner error: {e}"),
                 ),
@@ -156,7 +168,7 @@ where
             let current = match state.native_token_enabled_from_timestamp.get(j) {
                 Ok(v) => v,
                 Err(e) => {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         &format!("ArbOwner: setNativeTokenManagementFrom error: {e}"),
                     );
@@ -167,13 +179,13 @@ where
                 if (current == 0 && c.timestamp < min_time)
                     || (current > min_time && c.timestamp < min_time)
                 {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         "ArbOwner: feature must be enabled at least 7 days in the future",
                     );
                 }
                 if current > block_timestamp && current <= min_time && c.timestamp < current {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         "ArbOwner: feature cannot be moved earlier than current scheduled enable time",
                     );
@@ -190,7 +202,7 @@ where
             let current = match state.transaction_filtering_enabled_from_timestamp.get(j) {
                 Ok(v) => v,
                 Err(e) => {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         &format!("ArbOwner: setTransactionFilteringFrom error: {e}"),
                     );
@@ -201,13 +213,13 @@ where
                 if (current == 0 && c.timestamp < min_time)
                     || (current > min_time && c.timestamp < min_time)
                 {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         "ArbOwner: feature must be enabled at least 7 days in the future",
                     );
                 }
                 if current > block_timestamp && current <= min_time && c.timestamp < current {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         "ArbOwner: feature cannot be moved earlier than current scheduled enable time",
                     );
@@ -224,14 +236,14 @@ where
             let enabled_from = match state.transaction_filtering_enabled_from_timestamp.get(j) {
                 Ok(v) => v,
                 Err(e) => {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         &format!("ArbOwner: addTransactionFilterer error: {e}"),
                     );
                 }
             };
             if enabled_from == 0 || enabled_from > block_timestamp {
-                return revert_result(
+                return plain_error(
                     gas_limit,
                     "ArbOwner: transaction filtering feature is not enabled yet",
                 );
@@ -255,11 +267,11 @@ where
                     "TransactionFiltererRemoved(address)",
                     c.filterer
                 ),
-                Ok(false) => revert_result(
+                Ok(false) => plain_error(
                     gas_limit,
                     "ArbOwner: tried to remove non existing transaction filterer",
                 ),
-                Err(e) => revert_result(
+                Err(e) => plain_error(
                     gas_limit,
                     &format!("ArbOwner: removeTransactionFilterer error: {e}"),
                 ),
@@ -300,7 +312,7 @@ where
         }
         ArbOwner::ArbOwnerCalls::setSpeedLimit(c) => {
             if c.limit == 0 {
-                return revert_result(gas_limit, "ArbOwner: speed limit must be nonzero");
+                return plain_error(gas_limit, "ArbOwner: speed limit must be nonzero");
             }
             set_or_revert!(
                 state.l2_pricing.speed_limit_per_second.set(c.limit, j),
@@ -311,7 +323,7 @@ where
             let arbos_version = match state.arbos_version.get(j) {
                 Ok(v) => v,
                 Err(e) => {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         &format!("ArbOwner: setMaxTxGasLimit error: {e}"),
                     );
@@ -337,7 +349,7 @@ where
         }
         ArbOwner::ArbOwnerCalls::setL2GasPricingInertia(c) => {
             if c.sec == 0 {
-                return revert_result(gas_limit, "ArbOwner: price inertia must be nonzero");
+                return plain_error(gas_limit, "ArbOwner: price inertia must be nonzero");
             }
             set_or_revert!(
                 state.l2_pricing.pricing_inertia.set(c.sec, j),
@@ -397,10 +409,7 @@ where
         }
         ArbOwner::ArbOwnerCalls::setParentGasFloorPerToken(c) => {
             set_or_revert!(
-                state
-                    .l1_pricing
-                    .gas_floor_per_token
-                    .set(c.gasFloorPerToken, j),
+                state.l1_pricing.gas_floor_per_token.set(c.floorPerToken, j),
                 "setParentGasFloorPerToken"
             )
         }
@@ -432,7 +441,7 @@ where
             match state.upgrade_version.set(c.newVersion, j) {
                 Ok(_) => {}
                 Err(e) => {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         &format!("ArbOwner: scheduleArbOSUpgrade error: {e}"),
                     );
@@ -444,8 +453,14 @@ where
             )
         }
         ArbOwner::ArbOwnerCalls::setChainConfig(_) => {
-            // Chain config update requires JSON deserialization; stub out for now.
-            revert_result(gas_limit, "ArbOwner: setChainConfig not yet implemented")
+            // Nitro converts the ABI `string` to `[]byte` without touching it, while alloy's
+            // decoder replaces invalid UTF-8, so the stored blob is cut from the raw calldata.
+            // During block execution Nitro stores it unchecked; its JSON and compatibility checks
+            // apply only to non-mutating calls (`MsgIsNonMutating`), which cannot persist anyway.
+            let Some(raw) = super::go_abi::raw_bytes_arg(&input[4..], 0) else {
+                return plain_error(gas_limit, "abi: cannot unpack chain config");
+            };
+            set_or_revert!(state.chain_config.set(raw, j), "setChainConfig")
         }
         ArbOwner::ArbOwnerCalls::setGasPricingConstraints(c) => {
             // Nitro ArbOwner.SetGasPricingConstraints: clear the existing constraints, then install
@@ -454,14 +469,14 @@ where
             let arbos_version = match state.arbos_version.get(j) {
                 Ok(v) => v,
                 Err(e) => {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         &format!("ArbOwner: setGasPricingConstraints error: {e}"),
                     );
                 }
             };
             if let Err(e) = state.l2_pricing.clear_gas_constraints(j) {
-                return revert_result(
+                return plain_error(
                     gas_limit,
                     &format!("ArbOwner: setGasPricingConstraints error: {e}"),
                 );
@@ -472,7 +487,7 @@ where
                 .contains(&arbos_version)
                 && c.constraints.len() as u64 > GAS_CONSTRAINTS_MAX_NUM
             {
-                return revert_result(gas_limit, "ArbOwner: too many constraints");
+                return plain_error(gas_limit, "ArbOwner: too many constraints");
             }
             let mut failed: Option<String> = None;
             for constraint in &c.constraints {
@@ -496,43 +511,148 @@ where
             }
             match failed {
                 None => ok_result(gas_limit, vec![]),
-                Some(msg) => revert_result(
+                Some(msg) => plain_error(
                     gas_limit,
                     &format!("ArbOwner: setGasPricingConstraints {msg}"),
                 ),
             }
         }
-        ArbOwner::ArbOwnerCalls::releaseL1PricerSurplusFunds(_) => revert_result(
-            gas_limit,
-            "ArbOwner: releaseL1PricerSurplusFunds not yet implemented",
-        ),
+        ArbOwner::ArbOwnerCalls::releaseL1PricerSurplusFunds(c) => {
+            // Nitro: move whatever the L1 pricer pool holds beyond the fees it has recognised,
+            // capped at `maxWeiToRelease`, into `L1FeesAvailable`, and return the amount.
+            let balance = match j.account_balance(crate::constants::L1_PRICER_FUNDS_POOL_ADDRESS) {
+                Ok(b) => b,
+                Err(e) => {
+                    return fatal_result(
+                        gas_limit,
+                        &format!("ArbOwner: releaseL1PricerSurplusFunds balance: {e}"),
+                    );
+                }
+            };
+            let recognized = match state.l1_pricing.l1_fees_available.get(j) {
+                Ok(v) => v,
+                Err(e) => return plain_error(gas_limit, &format!("{e}")),
+            };
+            let released = balance
+                .checked_sub(recognized)
+                .map_or(U256::ZERO, |surplus| surplus.min(c.maxWeiToRelease));
+            if !released.is_zero()
+                && let Err(e) = state.l1_pricing.add_to_l1_fees_available(released, j)
+            {
+                return plain_error(gas_limit, &format!("{e}"));
+            }
+            ok_result(
+                gas_limit,
+                alloy_core::sol_types::SolValue::abi_encode_params(&(released,)),
+            )
+        }
+        ArbOwner::ArbOwnerCalls::setWasmActivationGas(c) => {
+            // Nitro: `c.State.Programs().SetActivationGas(gas)`, the constant `ArbWasm` charges
+            // before each activation from ArbOS 60.
+            set_or_revert!(
+                state.programs.activation_gas.set(c.gas, j),
+                "setWasmActivationGas"
+            )
+        }
+        ArbOwner::ArbOwnerCalls::setCollectTips(c) => {
+            set_or_revert!(
+                state.collect_tips.set(u64::from(c.collectTips), j),
+                "setCollectTips"
+            )
+        }
+        ArbOwner::ArbOwnerCalls::setMultiGasPricingConstraints(c) => {
+            // Nitro ArbOwner.SetMultiGasPricingConstraints: clear, add each constraint (target and
+            // window must be nonzero; every resource must be a real kind, `CheckResourceKind`
+            // rejecting `Unknown` too; repeated resources keep the last weight), then reject the
+            // whole update if any resulting exponent exceeds `MaxPricingExponentBips`.
+            if let Err(e) = state.l2_pricing.clear_multi_gas_constraints(j) {
+                return plain_error(gas_limit, &format!("{e}"));
+            }
+            for constraint in &c.constraints {
+                if constraint.targetPerSec == 0 || constraint.adjustmentWindowSecs == 0 {
+                    return plain_error(gas_limit, "invalid constraint");
+                }
+                let mut weights = [0_u64; crate::storage::NUM_RESOURCE_KINDS];
+                for resource in &constraint.resources {
+                    let kind = usize::from(u8::from(resource.resource));
+                    if kind == 0 || kind >= weights.len() {
+                        return plain_error(gas_limit, "invalid resource id");
+                    }
+                    weights[kind] = resource.weight;
+                }
+                if let Err(e) = state.l2_pricing.add_multi_gas_constraint(
+                    constraint.targetPerSec,
+                    constraint.adjustmentWindowSecs,
+                    constraint.backlog,
+                    weights,
+                    j,
+                ) {
+                    return plain_error(gas_limit, &format!("{e}"));
+                }
+            }
+            match state.l2_pricing.multi_gas_constraint_exponents(j) {
+                Ok(exponents)
+                    if exponents
+                        .iter()
+                        .all(|e| *e <= crate::storage::MAX_PRICING_EXPONENT_BIPS) =>
+                {
+                    ok_result(gas_limit, vec![])
+                }
+                Ok(_) => plain_error(gas_limit, "calculated exponent exceeds maximum allowed"),
+                Err(e) => plain_error(gas_limit, &format!("{e}")),
+            }
+        }
+        // Getters. Owners call these for free like everything else behind the owner wrapper.
+        ArbOwner::ArbOwnerCalls::isChainOwner(c) => {
+            get_or_error!(state.chain_owners.is_member(c.addr, j))
+        }
+        ArbOwner::ArbOwnerCalls::getAllChainOwners(_) => {
+            get_or_error!(state.chain_owners.all_members(j))
+        }
+        ArbOwner::ArbOwnerCalls::isNativeTokenOwner(c) => {
+            get_or_error!(state.native_token_owners.is_member(c.addr, j))
+        }
+        ArbOwner::ArbOwnerCalls::getAllNativeTokenOwners(_) => {
+            get_or_error!(state.native_token_owners.all_members(j))
+        }
+        ArbOwner::ArbOwnerCalls::isTransactionFilterer(c) => {
+            get_or_error!(state.transaction_filterers.is_member(c.filterer, j))
+        }
+        ArbOwner::ArbOwnerCalls::getAllTransactionFilterers(_) => {
+            get_or_error!(state.transaction_filterers.all_members(j))
+        }
+        ArbOwner::ArbOwnerCalls::getFilteredFundsRecipient(_) => {
+            get_or_error!(state.filtered_funds_recipient.get(j))
+        }
+        ArbOwner::ArbOwnerCalls::getNetworkFeeAccount(_) => {
+            get_or_error!(state.network_fee_account.get(j))
+        }
+        // Unlike ArbOwnerPublic's, this one has no pre-ArbOS-6 fallback to the network account.
+        ArbOwner::ArbOwnerCalls::getInfraFeeAccount(_) => {
+            get_or_error!(state.infra_fee_account.get(j))
+        }
         // Stylus / WASM settings, stored as packed bytes in a single 32-byte
         // storage word at index 0 of the programs.params subspace.
         // Each setter performs a read-modify-write on the packed word.
         // Nitro reference: arbos/programs/params.go Save() / Params().
         ArbOwner::ArbOwnerCalls::setInkPrice(c) => {
-            if c.inkPrice == 0 || c.inkPrice > MAX_UINT24 {
-                return revert_result(gas_limit, "ArbOwner: ink price must be a positive uint24");
+            if c.price == 0 || c.price > MAX_UINT24 {
+                return plain_error(gas_limit, "ArbOwner: ink price must be a positive uint24");
             }
             let mut word = match state.programs.read_params_word(j) {
                 Ok(w) => w,
                 Err(e) => {
-                    return revert_result(gas_limit, &format!("ArbOwner: setInkPrice read: {e}"));
+                    return plain_error(gas_limit, &format!("ArbOwner: setInkPrice read: {e}"));
                 }
             };
-            pack_uint(
-                &mut word,
-                layout::INK_PRICE.0,
-                layout::INK_PRICE.1,
-                c.inkPrice,
-            );
+            pack_uint(&mut word, layout::INK_PRICE.0, layout::INK_PRICE.1, c.price);
             set_or_revert!(state.programs.write_params_word(word, j), "setInkPrice")
         }
         ArbOwner::ArbOwnerCalls::setWasmMaxStackDepth(c) => {
             let mut word = match state.programs.read_params_word(j) {
                 Ok(w) => w,
                 Err(e) => {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         &format!("ArbOwner: setWasmMaxStackDepth read: {e}"),
                     );
@@ -553,7 +673,7 @@ where
             let mut word = match state.programs.read_params_word(j) {
                 Ok(w) => w,
                 Err(e) => {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         &format!("ArbOwner: setWasmFreePages read: {e}"),
                     );
@@ -574,10 +694,7 @@ where
             let mut word = match state.programs.read_params_word(j) {
                 Ok(w) => w,
                 Err(e) => {
-                    return revert_result(
-                        gas_limit,
-                        &format!("ArbOwner: setWasmPageGas read: {e}"),
-                    );
+                    return plain_error(gas_limit, &format!("ArbOwner: setWasmPageGas read: {e}"));
                 }
             };
             pack_uint(
@@ -592,7 +709,7 @@ where
             let mut word = match state.programs.read_params_word(j) {
                 Ok(w) => w,
                 Err(e) => {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         &format!("ArbOwner: setWasmPageLimit read: {e}"),
                     );
@@ -610,16 +727,17 @@ where
             )
         }
         ArbOwner::ArbOwnerCalls::setWasmMinInitGas(c) => {
+            // Nitro's ABI takes (uint8, uint16) and converts both to the uint64 its Go method
+            // declares, so the arithmetic below is unchanged from the uint64 form.
+            let (gas, cached) = (u64::from(c.gas), u64::from(c.cached));
             let gas_units =
-                c.gas.saturating_add(MIN_INIT_GAS_UNITS.saturating_sub(1)) / MIN_INIT_GAS_UNITS;
-            let cached_units = c
-                .cached
-                .saturating_add(MIN_CACHED_INIT_GAS_UNITS.saturating_sub(1))
+                gas.saturating_add(MIN_INIT_GAS_UNITS.saturating_sub(1)) / MIN_INIT_GAS_UNITS;
+            let cached_units = cached.saturating_add(MIN_CACHED_INIT_GAS_UNITS.saturating_sub(1))
                 / MIN_CACHED_INIT_GAS_UNITS;
             let mut word = match state.programs.read_params_word(j) {
                 Ok(w) => w,
                 Err(e) => {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         &format!("ArbOwner: setWasmMinInitGas read: {e}"),
                     );
@@ -650,7 +768,7 @@ where
             let mut word = match state.programs.read_params_word(j) {
                 Ok(w) => w,
                 Err(e) => {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         &format!("ArbOwner: setWasmInitCostScalar read: {e}"),
                     );
@@ -671,7 +789,7 @@ where
             let mut word = match state.programs.read_params_word(j) {
                 Ok(w) => w,
                 Err(e) => {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         &format!("ArbOwner: setWasmExpiryDays read: {e}"),
                     );
@@ -681,7 +799,7 @@ where
                 &mut word,
                 layout::EXPIRY_DAYS.0,
                 layout::EXPIRY_DAYS.1,
-                c.days.into(),
+                c._days.into(),
             );
             set_or_revert!(
                 state.programs.write_params_word(word, j),
@@ -692,7 +810,7 @@ where
             let mut word = match state.programs.read_params_word(j) {
                 Ok(w) => w,
                 Err(e) => {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         &format!("ArbOwner: setWasmKeepaliveDays read: {e}"),
                     );
@@ -702,7 +820,7 @@ where
                 &mut word,
                 layout::KEEPALIVE_DAYS.0,
                 layout::KEEPALIVE_DAYS.1,
-                c.keepaliveDays.into(),
+                c._days.into(),
             );
             set_or_revert!(
                 state.programs.write_params_word(word, j),
@@ -713,7 +831,7 @@ where
             let mut word = match state.programs.read_params_word(j) {
                 Ok(w) => w,
                 Err(e) => {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         &format!("ArbOwner: setWasmBlockCacheSize read: {e}"),
                     );
@@ -734,17 +852,14 @@ where
             let mut word = match state.programs.read_params_word(j) {
                 Ok(w) => w,
                 Err(e) => {
-                    return revert_result(
-                        gas_limit,
-                        &format!("ArbOwner: setWasmMaxSize read: {e}"),
-                    );
+                    return plain_error(gas_limit, &format!("ArbOwner: setWasmMaxSize read: {e}"));
                 }
             };
             pack_uint(
                 &mut word,
                 layout::MAX_WASM_SIZE.0,
                 layout::MAX_WASM_SIZE.1,
-                c.maxWasmSize,
+                c.size,
             );
             set_or_revert!(state.programs.write_params_word(word, j), "setWasmMaxSize")
         }
@@ -761,8 +876,8 @@ where
                         .remove(c.manager, arbos_version, j),
                     "removeWasmCacheManager"
                 ),
-                Ok(false) => revert_result(gas_limit, "ArbOwner: tried to remove non-manager"),
-                Err(e) => revert_result(
+                Ok(false) => plain_error(gas_limit, "ArbOwner: tried to remove non-manager"),
+                Err(e) => plain_error(
                     gas_limit,
                     &format!("ArbOwner: removeWasmCacheManager error: {e}"),
                 ),
@@ -772,7 +887,7 @@ where
             let mut word = match state.programs.read_params_word(j) {
                 Ok(w) => w,
                 Err(e) => {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         &format!("ArbOwner: setMaxStylusContractFragments read: {e}"),
                     );
@@ -789,37 +904,41 @@ where
                 "setMaxStylusContractFragments"
             )
         }
-    };
-
-    // Nitro wraps every successful, state-mutating ArbOwner method with an `OwnerActs` event
-    // (precompiles/precompile.go `emitOwnerActs` via `OwnerPrecompile.Call`): the event records the
-    // 4-byte method selector, the owner, and the full calldata. The owner is NOT charged gas for it
-    // (Nitro returns `ZeroGas`; our `ok_result` already records zero precompile gas). Without it the
-    // produced block's receipts/logs-bloom (and thus the block hash) diverge from Nitro on any
-    // owner action. `event OwnerActs(bytes4 indexed method, address indexed owner, bytes data)`.
-    if result.result == InstructionResult::Return && !call_inputs.is_static && input.len() >= 4 {
-        let mut method_topic = [0u8; 32];
-        method_topic[..4].copy_from_slice(&input[..4]);
-        let mut owner_topic = [0u8; 32];
-        owner_topic[12..].copy_from_slice(call_inputs.caller.as_slice());
-
-        // ABI-encode the single `bytes data` argument: offset (0x20) | length | content (32-padded).
-        let mut data = Vec::with_capacity(64 + input.len().next_multiple_of(32));
-        data.extend_from_slice(&U256::from(32u64).to_be_bytes::<32>());
-        data.extend_from_slice(&U256::from(input.len()).to_be_bytes::<32>());
-        data.extend_from_slice(input);
-        data.resize(64 + input.len().next_multiple_of(32), 0);
-
-        ctx.journal_mut().emit_log(Log::new_unchecked(
-            call_inputs.bytecode_address,
-            vec![
-                keccak256("OwnerActs(bytes4,address,bytes)"),
-                B256::from(method_topic),
-                B256::from(owner_topic),
-            ],
-            Bytes::from(data),
-        ));
     }
+}
 
-    result
+// Nitro's `OwnerPrecompile` logs every successful owner call it lets through with `OwnerActs`
+// (`precompiles/wrapper.go`, `emitSuccess`): the 4-byte selector, the owner, and the full calldata.
+// The owner is not charged for it. Without it the block's receipts and logs bloom (and so its
+// hash) diverge from Nitro on any owner action. The wrapper decides when to call this; see
+// `precompiles/mod.rs::run_owner_wrapper`.
+// `event OwnerActs(bytes4 indexed method, address indexed owner, bytes data)`.
+pub(super) fn emit_owner_acts<CTX>(ctx: &mut CTX, input: &[u8], owner: Address, precompile: Address)
+where
+    CTX: ArbPrecompileCtx,
+{
+    if input.len() < 4 {
+        return;
+    }
+    let mut method_topic = [0u8; 32];
+    method_topic[..4].copy_from_slice(&input[..4]);
+    let mut owner_topic = [0u8; 32];
+    owner_topic[12..].copy_from_slice(owner.as_slice());
+
+    // ABI-encode the single `bytes data` argument: offset (0x20) | length | content (32-padded).
+    let mut data = Vec::with_capacity(64 + input.len().next_multiple_of(32));
+    data.extend_from_slice(&U256::from(32u64).to_be_bytes::<32>());
+    data.extend_from_slice(&U256::from(input.len()).to_be_bytes::<32>());
+    data.extend_from_slice(input);
+    data.resize(64 + input.len().next_multiple_of(32), 0);
+
+    ctx.journal_mut().emit_log(Log::new_unchecked(
+        precompile,
+        vec![
+            keccak256("OwnerActs(bytes4,address,bytes)"),
+            B256::from(method_topic),
+            B256::from(owner_topic),
+        ],
+        Bytes::from(data),
+    ));
 }

@@ -201,6 +201,11 @@ where
         // `TxProcessor.PushContract`). Only count when a frame is actually pushed (`Item`);
         // fast-path results (precompiles, failed pre-checks) never open a geth contract frame.
         let span = span_address(&frame_input.frame_input);
+        let caller = match &frame_input.frame_input {
+            FrameInput::Call(call) => Some(call.caller),
+            FrameInput::Create(create) => Some(create.caller()),
+            FrameInput::Empty => None,
+        };
         match self.0.frame_init(frame_input)? {
             ItemOrResult::Item(_) => {}
             ItemOrResult::Result(result) => return Ok(ItemOrResult::Result(result)),
@@ -213,6 +218,9 @@ where
                 .stylus_program_spans
                 .entry(address)
                 .or_insert(0) += 1;
+        }
+        if let Some(caller) = caller {
+            self.0.ctx.chain_mut().frame_callers.push(caller);
         }
         // The pushed frame is the top of the stack, which is exactly what the inner
         // `frame_init` returned for the `Item` case.
@@ -254,14 +262,17 @@ where
         // The inner call pops the top frame iff it is finished (Nitro `PopContract`);
         // close its span first. Fast-path results arriving here belong to inits that never
         // pushed a frame - then the top frame is the still-running parent (not finished).
-        let span = {
+        let (finished, span) = {
             let frame = self.0.frame_stack.get();
             if frame.is_finished() {
-                span_address(&frame.input)
+                (true, span_address(&frame.input))
             } else {
-                None
+                (false, None)
             }
         };
+        if finished {
+            self.0.ctx.chain_mut().frame_callers.pop();
+        }
         if let Some(address) = span
             && let Some(count) = self
                 .0

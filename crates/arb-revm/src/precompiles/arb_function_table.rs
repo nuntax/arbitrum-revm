@@ -18,14 +18,14 @@ where
     match call {
         ArbFunctionTable::ArbFunctionTableCalls::size(_) => ok_result(
             gas_limit,
-            alloy_core::sol_types::SolValue::abi_encode(&(U256::ZERO,)),
+            alloy_core::sol_types::SolValue::abi_encode_params(&(U256::ZERO,)),
         ),
         ArbFunctionTable::ArbFunctionTableCalls::upload(_) => {
             // No-op upload.
             ok_result(gas_limit, vec![])
         }
         ArbFunctionTable::ArbFunctionTableCalls::get(_) => {
-            revert_result(gas_limit, "ArbFunctionTable: table is empty")
+            plain_error(gas_limit, "ArbFunctionTable: table is empty")
         }
     }
 }

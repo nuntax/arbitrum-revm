@@ -3188,17 +3188,12 @@ mod tests {
             "sendTxToL1 should revert when native token owners exist and value is non-zero"
         );
 
-        let revert_data = out
-            .result
-            .output()
-            .expect("revert should include encoded error data");
-        let expected = b"not allowed to send value when native token owners exist";
-        assert!(
-            revert_data
-                .as_ref()
-                .windows(expected.len())
-                .any(|window| window == expected),
-            "revert payload should include Nitro-compatible restriction message"
+        // Nitro returns this as a plain Go error ("not allowed to send value when native token
+        // owners exist"): the call reverts with empty data.
+        assert_eq!(
+            out.result.output().map(|data| data.len()),
+            Some(0),
+            "Nitro's plain error carries no revert data"
         );
     }
 
