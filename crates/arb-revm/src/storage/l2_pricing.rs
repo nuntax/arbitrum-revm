@@ -19,6 +19,20 @@ const RESOURCE_KIND_SINGLE_DIM: u8 = 6;
 const ARBOS_SINGLE_GAS_CONSTRAINTS_VERSION: u64 = 50;
 const ARBOS_MULTI_CONSTRAINT_FIX_VERSION: u64 = 51;
 const ARBOS_MULTI_GAS_CONSTRAINTS_VERSION: u64 = 60;
+/// Nitro `ArbosVersion_MultiGasRefundFix`: from here the single-dimensional fee is the block's own
+/// base fee rather than the stored `BaseFeeWei`.
+const ARBOS_MULTI_GAS_REFUND_FIX_VERSION: u64 = 61;
+/// Nitro `l2pricing.MaxPricingExponentBips`.
+pub const MAX_PRICING_EXPONENT_BIPS: i64 = 85_000;
+
+/// One Nitro multi-dimensional gas constraint as stored, weights indexed by resource kind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultiGasConstraintValue {
+    pub target: u64,
+    pub adjustment_window: u32,
+    pub backlog: u64,
+    pub weights: [u64; NUM_RESOURCE_KINDS],
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GasModel {
@@ -178,7 +192,7 @@ impl L2Pricing {
         Ok(())
     }
 
-    fn multi_gas_constraint_exponents<J: ArbJournal>(
+    pub fn multi_gas_constraint_exponents<J: ArbJournal>(
         &self,
         journal: &mut J,
     ) -> Result<[i64; NUM_RESOURCE_KINDS]> {
@@ -452,6 +466,95 @@ impl L2Pricing {
             return Ok(GasModel::SingleGasConstraints);
         }
         Ok(GasModel::Legacy)
+    }
+
+    /// Nitro `ArbGasInfo.GetGasPricingConstraints`: the length, then target, adjustment window and
+    /// backlog of each constraint, read in that order.
+    pub fn gas_constraints<J: ArbJournal>(&self, journal: &mut J) -> Result<Vec<[u64; 3]>> {
+        let len = self.gas_constraints_len(journal)?;
+        let mut out = Vec::new();
+        for i in 0..len {
+            let constraint = self.open_gas_constraint(i);
+            out.push([
+                constraint.target.get(journal)?,
+                constraint.adjustment_window.get(journal)?,
+                constraint.backlog.get(journal)?,
+            ]);
+        }
+        Ok(out)
+    }
+
+    /// Nitro `ArbGasInfo.GetMultiGasPricingConstraints`: the length, then per constraint its
+    /// target, adjustment window, backlog and every resource weight (`GetResourceWeights`).
+    pub fn multi_gas_constraints<J: ArbJournal>(
+        &self,
+        journal: &mut J,
+    ) -> Result<Vec<MultiGasConstraintValue>> {
+        let len = self.multi_gas_constraints_len(journal)?;
+        let mut out = Vec::new();
+        for i in 0..len {
+            let constraint = self.open_multi_gas_constraint(i);
+            let target = constraint.target.get(journal)?;
+            let adjustment_window = constraint.adjustment_window.get(journal)?;
+            let backlog = constraint.backlog.get(journal)?;
+            let mut weights = [0; NUM_RESOURCE_KINDS];
+            for (weight, slot) in weights.iter_mut().zip(&constraint.weighted_resources) {
+                *weight = slot.get(journal)?;
+            }
+            out.push(MultiGasConstraintValue {
+                target,
+                adjustment_window,
+                backlog,
+                weights,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Nitro `L2PricingState.GetMultiGasBaseFeePerResource`. Before ArbOS 61 the single-dimensional
+    /// (and any unset) fee is the stored `BaseFeeWei`, read first; from 61 it is `block_base_fee`.
+    pub fn multi_gas_base_fees<J: ArbJournal>(
+        &self,
+        block_base_fee: U256,
+        arbos_version: u64,
+        journal: &mut J,
+    ) -> Result<[U256; NUM_RESOURCE_KINDS]> {
+        let fallback = if arbos_version < ARBOS_MULTI_GAS_REFUND_FIX_VERSION {
+            self.base_fee_wei.get(journal)?
+        } else {
+            block_base_fee
+        };
+        let mut fees = [U256::ZERO; NUM_RESOURCE_KINDS];
+        for (kind, fee) in fees.iter_mut().enumerate() {
+            let current = self.multi_gas_fees.current[kind].get(journal)?;
+            *fee = if kind == usize::from(RESOURCE_KIND_SINGLE_DIM) || current.is_zero() {
+                fallback
+            } else {
+                current
+            };
+        }
+        Ok(fees)
+    }
+
+    /// Nitro `L2PricingState.ClearMultiGasConstraints`: pop every element from the tail and
+    /// clear all of its fields, resource weights included.
+    pub fn clear_multi_gas_constraints<J: ArbJournal>(&self, journal: &mut J) -> Result<()> {
+        let length = self.multi_gas_constraints_len(journal)?;
+        for _ in 0..length {
+            let current = self.multi_gas_constraints_len(journal)?;
+            let constraint = self.open_multi_gas_constraint(current - 1);
+            self.multi_gas_constraints
+                .storage_backed::<u64>(SUB_STORAGE_VECTOR_LENGTH_OFFSET)
+                .set(current - 1, journal)?;
+            constraint.target.set(0, journal)?;
+            constraint.adjustment_window.set(0, journal)?;
+            constraint.backlog.set(0, journal)?;
+            constraint.max_weight.set(0, journal)?;
+            for slot in &constraint.weighted_resources {
+                slot.set(0, journal)?;
+            }
+        }
+        Ok(())
     }
 
     fn gas_constraints_len<J: ArbJournal>(&self, journal: &mut J) -> Result<u64> {

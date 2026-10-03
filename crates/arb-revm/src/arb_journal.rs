@@ -83,6 +83,10 @@ pub trait ArbJournal {
     /// (mirrors revm `Account::decr_balance`). Used by `ArbSys` for L2->L1 value burn.
     fn debit_balance(&mut self, account: Address, amount: U256) -> Result<bool, Self::Error>;
 
+    /// Add `amount` to `account`'s balance, returning `false` on overflow (mirrors revm
+    /// `Account::incr_balance`). Used by `ArbNativeTokenManager.mintNativeToken`.
+    fn credit_balance(&mut self, account: Address, amount: U256) -> Result<bool, Self::Error>;
+
     /// Move `amount` from `from` to `to`, returning a [`TransferError`] (e.g. out-of-funds) rather
     /// than erroring. Used by L1-pricing settlement.
     fn transfer(
@@ -226,6 +230,10 @@ impl<J: ArbJournal> ArbJournal for MeteredJournal<'_, J> {
         self.inner.debit_balance(account, amount)
     }
 
+    fn credit_balance(&mut self, account: Address, amount: U256) -> Result<bool, Self::Error> {
+        self.inner.credit_balance(account, amount)
+    }
+
     fn transfer(
         &mut self,
         from: Address,
@@ -309,12 +317,30 @@ where
         Ok(result)
     }
 
+    // ArbOS reads balances and code through Nitro's StateDB, which never touches the EIP-2929
+    // access list, so a cold account must stay cold for the user EVM (see `read_slot`).
     fn account_balance(&mut self, account: Address) -> Result<U256, Self::Error> {
-        Ok(self.load_account(account)?.data.info.balance)
+        let loaded = self.load_account(account)?;
+        let (balance, was_cold) = (loaded.data.info.balance, loaded.is_cold);
+        if was_cold {
+            self.load_account_mut_skip_cold_load(account, false)
+                .map_err(|e| e.unwrap_db_error())?
+                .data
+                .unsafe_mark_cold();
+        }
+        Ok(balance)
     }
 
     fn account_code(&mut self, account: Address) -> Result<Bytes, Self::Error> {
-        Ok(self.code(account)?.data)
+        let loaded = self.code(account)?;
+        let (code, was_cold) = (loaded.data, loaded.is_cold);
+        if was_cold {
+            self.load_account_mut_skip_cold_load(account, false)
+                .map_err(|e| e.unwrap_db_error())?
+                .data
+                .unsafe_mark_cold();
+        }
+        Ok(code)
     }
 
     fn account_code_hash_and_code(
@@ -352,6 +378,13 @@ where
             .load_account_mut_skip_cold_load(account, false)
             .map_err(|e| e.unwrap_db_error())?;
         Ok(acct.data.decr_balance(amount))
+    }
+
+    fn credit_balance(&mut self, account: Address, amount: U256) -> Result<bool, Self::Error> {
+        let mut acct = self
+            .load_account_mut_skip_cold_load(account, false)
+            .map_err(|e| e.unwrap_db_error())?;
+        Ok(acct.data.incr_balance(amount))
     }
 
     fn transfer(
@@ -470,6 +503,14 @@ impl ArbJournal for ArbInternals<'_, '_> {
         Ok(acct.data.decr_balance(amount))
     }
 
+    fn credit_balance(&mut self, account: Address, amount: U256) -> Result<bool, Self::Error> {
+        let mut acct = self
+            .0
+            .load_account_mut_skip_cold_load(account, false)
+            .map_err(|e| e.unwrap_db_error())?;
+        Ok(acct.data.incr_balance(amount))
+    }
+
     fn transfer(
         &mut self,
         from: Address,
@@ -499,6 +540,14 @@ pub trait ArbPrecompileCtx {
     /// `block.basefee`, the current L2 base fee (wei).
     fn block_basefee(&self) -> u64;
 
+    /// Nitro `BlockContext.BaseFeeInBlock`: the block's real base fee, even for a simulated call
+    /// whose block env had it lowered to zero (see [`crate::ArbChainContext::base_fee_in_block`]).
+    /// `ArbGasInfo`'s pricing getters read this, not `BaseFee`. Equal to `block_basefee` on the
+    /// consensus path.
+    fn block_basefee_in_block(&self) -> u64 {
+        self.block_basefee()
+    }
+
     /// `block.number`.
     fn block_number(&self) -> u64;
 
@@ -524,6 +573,15 @@ pub trait ArbPrecompileCtx {
     /// Current EVM call depth (for `ArbSys.isTopLevelCall`).
     fn call_depth(&self) -> usize;
 
+    /// The retryable being redeemed when the top-level transaction is an `ArbitrumRetryTx`: Nitro's
+    /// `txProcessor.CurrentRetryable` / `CurrentRefundTo`, set for the whole retry transaction.
+    fn current_retry(&self) -> Option<crate::transaction::RetryTxMeta>;
+
+    /// `Caller()` of the innermost open EVM frame, the one that called the precompile (Nitro
+    /// `txProcessor.Contracts[evm.Depth()-2].Caller()`). `None` when the transaction calls the
+    /// precompile directly and no frame is open.
+    fn calling_frame_caller(&self) -> Option<Address>;
+
     /// Maximum deployed code size used to reserve enough gas before reading a new fragment.
     fn max_code_size(&self) -> usize {
         24_576
@@ -534,7 +592,11 @@ pub trait ArbPrecompileCtx {
 /// every `<CTX: ContextTr>`-bounded precompile working after migration to the `Arb*` bound.
 impl<CTX> ArbPrecompileCtx for CTX
 where
-    CTX: ContextTr<Journal: JournalTr> + Host,
+    CTX: ContextTr<
+            Journal: JournalTr,
+            Tx: crate::transaction::ArbTxTr,
+            Chain = crate::ArbChainContext,
+        > + Host,
 {
     type Journal = CTX::Journal;
 
@@ -544,6 +606,15 @@ where
 
     fn block_basefee(&self) -> u64 {
         self.block().basefee()
+    }
+
+    fn block_basefee_in_block(&self) -> u64 {
+        // Same rule as the gas-charging handler: only a zeroed block base fee defers to the
+        // recorded real one, so a stale value can never reach the consensus path.
+        match self.block().basefee() {
+            0 => self.chain().base_fee_in_block.unwrap_or(0),
+            basefee => basefee,
+        }
     }
 
     fn block_number(&self) -> u64 {
@@ -572,6 +643,14 @@ where
 
     fn call_depth(&self) -> usize {
         ContextTr::journal_ref(self).depth()
+    }
+
+    fn current_retry(&self) -> Option<crate::transaction::RetryTxMeta> {
+        crate::transaction::ArbTxTr::retry_meta(self.tx()).copied()
+    }
+
+    fn calling_frame_caller(&self) -> Option<Address> {
+        self.chain().frame_callers.last().copied()
     }
 
     fn max_code_size(&self) -> usize {
@@ -660,5 +739,16 @@ impl<'a, 'b> ArbPrecompileCtx for ArbNodeCtx<'a, 'b> {
 
     fn call_depth(&self) -> usize {
         self.call_depth
+    }
+
+    /// `EvmInternals` exposes the transaction only as a plain `Transaction`, without the retry
+    /// fields. Production executes through the full context above, never this path.
+    fn current_retry(&self) -> Option<crate::transaction::RetryTxMeta> {
+        None
+    }
+
+    /// The node path has no frame stack; production executes through the full context above.
+    fn calling_frame_caller(&self) -> Option<Address> {
+        None
     }
 }

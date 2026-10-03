@@ -69,6 +69,11 @@ pub struct ArbChainContext {
     /// not counted either (EIP-3541 makes a created address never a Stylus program mid-tx and
     /// address collisions with live code fail before a frame opens).
     pub stylus_program_spans: HashMap<Address, u32>,
+    /// `Caller()` of every open EVM frame, outermost first: Nitro's `TxProcessor.Contracts`,
+    /// pushed for each frame the interpreter runs (calls of every scheme and creates, never
+    /// precompiles). A DELEGATECALL frame's caller is the delegating frame's own caller. `ArbSys`
+    /// reads the innermost entry, the caller of the frame that called it.
+    pub frame_callers: Vec<Address>,
     /// A normal transaction registered in ArbOS's transaction filter. It skips EVM execution
     /// after gas charging and consumes its full gas limit.
     pub filtered_tx: bool,
@@ -100,6 +105,7 @@ impl ArbChainContext {
             recent_wasms: VecDeque::new(),
             stylus_refund: 0,
             stylus_program_spans: HashMap::default(),
+            frame_callers: Vec::new(),
             filtered_tx: false,
             pending_zombie_escrow_tickets: Vec::new(),
         }
@@ -146,6 +152,7 @@ impl ArbChainContext {
         self.stylus_pages_ever = 0;
         self.stylus_refund = 0;
         self.stylus_program_spans.clear();
+        self.frame_callers.clear();
         self.filtered_tx = false;
     }
 

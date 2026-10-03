@@ -527,7 +527,7 @@ fn redeem_scheduled_log(
             retry_tx_hash,
             B256::from(U256::ZERO.to_be_bytes::<32>()),
         ],
-        Bytes::from(alloy_core::sol_types::SolValue::abi_encode(&(
+        Bytes::from(alloy_core::sol_types::SolValue::abi_encode_params(&(
             donated_gas,
             gas_donor,
             max_refund,

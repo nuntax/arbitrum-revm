@@ -18,168 +18,83 @@ where
     };
 
     let state = ArbosState::open();
+    // The ArbOS version is a field Nitro caches when it opens the state, so reading it is free.
+    // Every other read below goes through Nitro's burner at 800 gas (`StorageReadCost`), which
+    // `MeteredJournal` reproduces; the state-open read itself is added by the dispatcher.
+    let arbos_version = match state.arbos_version.get(ctx.journal_mut()) {
+        Ok(v) => v,
+        Err(e) => return fatal_result(gas_limit, &format!("ArbOwnerPublic: storage error: {e}")),
+    };
+    let mut journal = MeteredJournal::new(ctx.journal_mut());
+    let j = &mut journal;
 
-    match call {
+    macro_rules! get {
+        ($expr:expr) => {
+            match $expr {
+                Ok(v) => ok_result(
+                    gas_limit,
+                    alloy_core::sol_types::SolValue::abi_encode_params(&(v,)),
+                ),
+                Err(e) => {
+                    return fatal_result(gas_limit, &format!("ArbOwnerPublic: storage error: {e}"));
+                }
+            }
+        };
+    }
+
+    let mut result = match call {
+        ArbOwnerPublic::ArbOwnerPublicCalls::getCollectTips(_) => {
+            get!(state.collect_tips.get(j).map(|v| v != 0))
+        }
         ArbOwnerPublic::ArbOwnerPublicCalls::getAllChainOwners(_) => {
-            let owners = match state.chain_owners.all_members(ctx.journal_mut()) {
-                Ok(o) => o,
-                Err(e) => return revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}")),
-            };
-            ok_result(
-                gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(owners,)),
-            )
+            get!(state.chain_owners.all_members(j))
         }
         ArbOwnerPublic::ArbOwnerPublicCalls::isChainOwner(c) => {
-            let is_owner = match state.chain_owners.is_member(c.account, ctx.journal_mut()) {
-                Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}")),
-            };
-            ok_result(
-                gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(is_owner,)),
-            )
+            get!(state.chain_owners.is_member(c.addr, j))
         }
         ArbOwnerPublic::ArbOwnerPublicCalls::isNativeTokenOwner(c) => {
-            let is_owner = match state
-                .native_token_owners
-                .is_member(c.account, ctx.journal_mut())
-            {
-                Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}")),
-            };
-            ok_result(
-                gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(is_owner,)),
-            )
+            get!(state.native_token_owners.is_member(c.addr, j))
         }
         ArbOwnerPublic::ArbOwnerPublicCalls::getAllNativeTokenOwners(_) => {
-            let owners = match state.native_token_owners.all_members(ctx.journal_mut()) {
-                Ok(o) => o,
-                Err(e) => return revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}")),
-            };
-            ok_result(
-                gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(owners,)),
-            )
+            get!(state.native_token_owners.all_members(j))
         }
         ArbOwnerPublic::ArbOwnerPublicCalls::getNativeTokenManagementFrom(_) => {
-            let ts = match state
-                .native_token_enabled_from_timestamp
-                .get(ctx.journal_mut())
-            {
-                Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}")),
-            };
-            ok_result(
-                gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(ts,)),
-            )
+            get!(state.native_token_enabled_from_timestamp.get(j))
         }
         ArbOwnerPublic::ArbOwnerPublicCalls::getTransactionFilteringFrom(_) => {
-            let ts = match state
-                .transaction_filtering_enabled_from_timestamp
-                .get(ctx.journal_mut())
-            {
-                Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}")),
-            };
-            ok_result(
-                gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(ts,)),
-            )
+            get!(state.transaction_filtering_enabled_from_timestamp.get(j))
         }
         ArbOwnerPublic::ArbOwnerPublicCalls::isTransactionFilterer(c) => {
-            let is_filterer = match state
-                .transaction_filterers
-                .is_member(c.filterer, ctx.journal_mut())
-            {
-                Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}")),
-            };
-            ok_result(
-                gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(is_filterer,)),
-            )
+            get!(state.transaction_filterers.is_member(c.filterer, j))
         }
         ArbOwnerPublic::ArbOwnerPublicCalls::getAllTransactionFilterers(_) => {
-            let filterers = match state.transaction_filterers.all_members(ctx.journal_mut()) {
-                Ok(f) => f,
-                Err(e) => return revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}")),
-            };
-            ok_result(
-                gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(filterers,)),
-            )
+            get!(state.transaction_filterers.all_members(j))
         }
         ArbOwnerPublic::ArbOwnerPublicCalls::getFilteredFundsRecipient(_) => {
-            let recipient = match state.filtered_funds_recipient.get(ctx.journal_mut()) {
-                Ok(a) => a,
-                Err(e) => return revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}")),
-            };
-            ok_result(
-                gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(recipient,)),
-            )
+            get!(state.filtered_funds_recipient.get(j))
         }
         ArbOwnerPublic::ArbOwnerPublicCalls::getNetworkFeeAccount(_) => {
-            let account = match state.network_fee_account.get(ctx.journal_mut()) {
-                Ok(a) => a,
-                Err(e) => return revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}")),
-            };
-            ok_result(
-                gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(account,)),
-            )
+            get!(state.network_fee_account.get(j))
         }
         ArbOwnerPublic::ArbOwnerPublicCalls::getInfraFeeAccount(_) => {
-            let arbos_version = match state.arbos_version.get(ctx.journal_mut()) {
-                Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}")),
-            };
-            let account = if arbos_version < 6 {
-                match state.network_fee_account.get(ctx.journal_mut()) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        return revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}"));
-                    }
-                }
+            // Nitro: before ArbOS 6 the public getter answers with the network fee account.
+            if arbos_version < 6 {
+                get!(state.network_fee_account.get(j))
             } else {
-                match state.infra_fee_account.get(ctx.journal_mut()) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        return revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}"));
-                    }
-                }
-            };
-            ok_result(
-                gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(account,)),
-            )
+                get!(state.infra_fee_account.get(j))
+            }
         }
         ArbOwnerPublic::ArbOwnerPublicCalls::getBrotliCompressionLevel(_) => {
-            let level = match state.brotli_compression_level.get(ctx.journal_mut()) {
-                Ok(a) => a,
-                Err(e) => return revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}")),
-            };
-            ok_result(
-                gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(level,)),
-            )
+            get!(state.brotli_compression_level.get(j))
         }
         ArbOwnerPublic::ArbOwnerPublicCalls::getScheduledUpgrade(_) => {
-            let arbos_version = match state.arbos_version.get(ctx.journal_mut()) {
-                Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}")),
-            };
-            let mut journal = MeteredJournal::new(ctx.journal_mut());
-            let scheduled = state.upgrade_version.get(&mut journal).and_then(|version| {
+            let scheduled = state.upgrade_version.get(j).and_then(|version| {
                 state
                     .upgrade_timestamp
-                    .get(&mut journal)
+                    .get(j)
                     .map(|timestamp| (version, timestamp))
             });
-            let mut result = match scheduled {
+            match scheduled {
                 Ok((version, timestamp)) => {
                     let (version, timestamp) = if arbos_version >= version {
                         (0_u64, 0_u64)
@@ -188,50 +103,30 @@ where
                     };
                     ok_result(
                         gas_limit,
-                        alloy_core::sol_types::SolValue::abi_encode(&(version, timestamp)),
+                        alloy_core::sol_types::SolValue::abi_encode_params(&(version, timestamp)),
                     )
                 }
-                Err(e) => revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}")),
-            };
-            if !result.gas.record_regular_cost(journal.burned) {
-                result.result = InstructionResult::OutOfGas;
-                result.output = Bytes::new();
+                Err(e) => {
+                    return fatal_result(gas_limit, &format!("ArbOwnerPublic: storage error: {e}"));
+                }
             }
-            result
         }
         ArbOwnerPublic::ArbOwnerPublicCalls::isCalldataPriceIncreaseEnabled(_) => {
-            let enabled = match state
-                .features
-                .is_calldata_price_increase_enabled(ctx.journal_mut())
-            {
-                Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}")),
-            };
-            ok_result(
-                gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(enabled,)),
-            )
+            get!(state.features.is_calldata_price_increase_enabled(j))
         }
         ArbOwnerPublic::ArbOwnerPublicCalls::getParentGasFloorPerToken(_) => {
-            let floor = match state.l1_pricing.gas_floor_per_token.get(ctx.journal_mut()) {
-                Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbOwnerPublic: error: {e}")),
-            };
-            ok_result(
-                gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(floor,)),
-            )
+            get!(state.l1_pricing.gas_floor_per_token.get(j))
         }
         ArbOwnerPublic::ArbOwnerPublicCalls::getMaxStylusContractFragments(_) => {
-            let word = match state.programs.read_params_word(ctx.journal_mut()) {
+            // Nitro reads this through `Programs().Params()`, which bills its physical reads as a
+            // single warm access (100 gas) rather than 800 per slot.
+            let word = match state.programs.read_params_word(j.inner_mut()) {
                 Ok(w) => w,
                 Err(e) => {
-                    return revert_result(
-                        gas_limit,
-                        &format!("ArbOwnerPublic: getMaxStylusContractFragments error: {e}"),
-                    );
+                    return fatal_result(gas_limit, &format!("ArbOwnerPublic: storage error: {e}"));
                 }
             };
+            j.charge(100);
             let max_fragments = unpack_uint(
                 &word,
                 layout::MAX_FRAGMENT_COUNT.0,
@@ -239,41 +134,32 @@ where
             ) as u8;
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(u16::from(max_fragments),)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(u16::from(max_fragments),)),
             )
         }
         ArbOwnerPublic::ArbOwnerPublicCalls::rectifyChainOwner(c) => {
-            let mut journal = MeteredJournal::new(ctx.journal_mut());
-            match state.chain_owners.rectify_mapping(c.account, &mut journal) {
+            match state.chain_owners.rectify_mapping(c.ownerToRectify, j) {
                 Ok(()) => {
                     let mut account_topic = [0_u8; 32];
-                    account_topic[12..].copy_from_slice(c.account.as_slice());
-                    journal.emit_log(Log::new_unchecked(
+                    account_topic[12..].copy_from_slice(c.ownerToRectify.as_slice());
+                    j.emit_log(Log::new_unchecked(
                         ARB_OWNER_PUBLIC,
                         vec![keccak256("ChainOwnerRectified(address)")],
                         Bytes::copy_from_slice(B256::from(account_topic).as_slice()),
                     ));
-                    let mut result = ok_result(gas_limit, vec![]);
-                    if !result.gas.record_regular_cost(journal.burned) {
-                        result.result = InstructionResult::OutOfGas;
-                        result.output = Bytes::new();
-                    }
-                    result
+                    ok_result(gas_limit, vec![])
                 }
-                Err(e) => {
-                    let mut result = revert_result(
-                        gas_limit,
-                        &format!("ArbOwnerPublic: rectifyChainOwner error: {e}"),
-                    );
-                    if !result.gas.record_regular_cost(journal.burned) {
-                        result.result = InstructionResult::OutOfGas;
-                        result.output = Bytes::new();
-                    }
-                    result
-                }
+                // Nitro's `RectifyMapping` reports a plain Go error ("not an owner", "already
+                // correctly mapped"): an empty revert.
+                Err(_) => ordinary_error_result(gas_limit),
             }
         }
+    };
+    if !result.gas.record_regular_cost(journal.burned) {
+        result.result = InstructionResult::OutOfGas;
+        result.output = Bytes::new();
     }
+    result
 }
 
 #[cfg(test)]
@@ -342,7 +228,10 @@ mod tests {
         owners.remove(OWNER_2, 10, ctx.journal_mut()).unwrap();
         owners.clear_list(ctx.journal_mut()).unwrap();
 
-        let input = ArbOwnerPublic::rectifyChainOwnerCall { account: OWNER_3 }.abi_encode();
+        let input = ArbOwnerPublic::rectifyChainOwnerCall {
+            ownerToRectify: OWNER_3,
+        }
+        .abi_encode();
         let result = run_arb_owner_public(&mut ctx, &input, 100_000);
 
         assert_eq!(result.result, InstructionResult::Return);

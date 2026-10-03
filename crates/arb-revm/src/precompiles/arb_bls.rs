@@ -1,16 +1,15 @@
-use super::revert_result;
+use super::gated_revert_result;
 use crate::arb_journal::ArbPrecompileCtx;
 use revm::interpreter::InterpreterResult;
 
-/// ArbBLS, legacy BLS public key registry from Classic-era Arbitrum.
+/// ArbBLS (0x67), the Classic-era BLS key registry.
 ///
-/// In Nitro this precompile has no active methods; the struct exists solely to
-/// occupy address 0x67 in the registry.  Any call is treated as a call to a
-/// contract that exists but has no matching selector: return empty bytes with
-/// gas refunded, matching Nitro's "no method found" revert path.
+/// Nitro still registers the address, but its interface declares no methods, so every call takes
+/// the unknown-selector path in `precompile.go` Call: `ErrExecutionReverted` with no gas left.
+/// Measured on Robinhood Chain: any selector, and empty calldata, revert using the whole budget.
 pub(super) fn run_arb_bls<CTX>(_ctx: &mut CTX, _input: &[u8], gas_limit: u64) -> InterpreterResult
 where
     CTX: ArbPrecompileCtx,
 {
-    revert_result(gas_limit, "ArbBLS: no active methods")
+    gated_revert_result(gas_limit)
 }

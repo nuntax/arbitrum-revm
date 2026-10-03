@@ -53,11 +53,11 @@ fn dispatch_arb_aggregator<J: ArbJournal>(
                 .all_members(journal)
             {
                 Ok(p) => p,
-                Err(e) => return revert_result(gas_limit, &format!("ArbAggregator: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbAggregator: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(posters,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(posters,)),
             )
         }
         ArbAggregator::ArbAggregatorCalls::getFeeCollector(c) => {
@@ -68,42 +68,42 @@ fn dispatch_arb_aggregator<J: ArbJournal>(
             ) {
                 Ok(s) => s,
                 Err(e) => {
-                    return revert_result(gas_limit, &format!("ArbAggregator: error: {e}"));
+                    return plain_error(gas_limit, &format!("ArbAggregator: error: {e}"));
                 }
             };
             let pay_to = match poster_state.pay_to(journal) {
                 Ok(a) => a,
-                Err(e) => return revert_result(gas_limit, &format!("ArbAggregator: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbAggregator: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(pay_to,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(pay_to,)),
             )
         }
         ArbAggregator::ArbAggregatorCalls::getPreferredAggregator(_) => {
             // Deprecated in Nitro: always the sequencer batch poster and "default=true".
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(BATCH_POSTER_ADDRESS, true)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(BATCH_POSTER_ADDRESS, true)),
             )
         }
         ArbAggregator::ArbAggregatorCalls::getDefaultAggregator(_) => ok_result(
             gas_limit,
-            alloy_core::sol_types::SolValue::abi_encode(&(BATCH_POSTER_ADDRESS,)),
+            alloy_core::sol_types::SolValue::abi_encode_params(&(BATCH_POSTER_ADDRESS,)),
         ),
         ArbAggregator::ArbAggregatorCalls::getTxBaseFee(_) => ok_result(
             gas_limit,
-            alloy_core::sol_types::SolValue::abi_encode(&(U256::ZERO,)),
+            alloy_core::sol_types::SolValue::abi_encode_params(&(U256::ZERO,)),
         ),
         ArbAggregator::ArbAggregatorCalls::addBatchPoster(c) => {
             let caller_is_owner = match state.chain_owners.is_member(caller, journal) {
                 Ok(v) => v,
                 Err(e) => {
-                    return revert_result(gas_limit, &format!("ArbAggregator: error: {e}"));
+                    return plain_error(gas_limit, &format!("ArbAggregator: error: {e}"));
                 }
             };
             if !caller_is_owner {
-                return revert_result(gas_limit, "ArbAggregator: must be called by chain owner");
+                return plain_error(gas_limit, "ArbAggregator: must be called by chain owner");
             }
             let already_registered = match state
                 .l1_pricing
@@ -113,7 +113,7 @@ fn dispatch_arb_aggregator<J: ArbJournal>(
             {
                 Ok(v) => v,
                 Err(e) => {
-                    return revert_result(gas_limit, &format!("ArbAggregator: error: {e}"));
+                    return plain_error(gas_limit, &format!("ArbAggregator: error: {e}"));
                 }
             };
             if already_registered {
@@ -125,7 +125,7 @@ fn dispatch_arb_aggregator<J: ArbJournal>(
                 journal,
             ) {
                 Ok(_) => ok_result(gas_limit, vec![]),
-                Err(e) => revert_result(
+                Err(e) => plain_error(
                     gas_limit,
                     &format!("ArbAggregator: addBatchPoster error: {e}"),
                 ),
@@ -139,7 +139,7 @@ fn dispatch_arb_aggregator<J: ArbJournal>(
             ) {
                 Ok(s) => s,
                 Err(e) => {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         &format!("ArbAggregator: setFeeCollector error: {e}"),
                     );
@@ -147,17 +147,17 @@ fn dispatch_arb_aggregator<J: ArbJournal>(
             };
             let old_fee_collector = match poster_state.pay_to(journal) {
                 Ok(a) => a,
-                Err(e) => return revert_result(gas_limit, &format!("ArbAggregator: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbAggregator: error: {e}")),
             };
             if caller != c.batchPoster && caller != old_fee_collector {
                 let caller_is_owner = match state.chain_owners.is_member(caller, journal) {
                     Ok(v) => v,
                     Err(e) => {
-                        return revert_result(gas_limit, &format!("ArbAggregator: error: {e}"));
+                        return plain_error(gas_limit, &format!("ArbAggregator: error: {e}"));
                     }
                 };
                 if !caller_is_owner {
-                    return revert_result(
+                    return plain_error(
                         gas_limit,
                         "ArbAggregator: only poster, fee collector, or chain owner may set fee collector",
                     );
@@ -165,7 +165,7 @@ fn dispatch_arb_aggregator<J: ArbJournal>(
             }
             match poster_state.set_pay_to(c.newFeeCollector, journal) {
                 Ok(_) => ok_result(gas_limit, vec![]),
-                Err(e) => revert_result(
+                Err(e) => plain_error(
                     gas_limit,
                     &format!("ArbAggregator: setFeeCollector error: {e}"),
                 ),

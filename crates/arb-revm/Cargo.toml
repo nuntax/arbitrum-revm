@@ -36,7 +36,7 @@ alloy-network-primitives = "2.0"
 url = "2.5"
 arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "83593650bf6d07d2255e8627c417a9236cd5d02b", features = ["k256"] }
 arbitrum-alloy-sequencer = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "83593650bf6d07d2255e8627c417a9236cd5d02b" }
-arbitrum-alloy-precompiles = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "fd8fc3522da466f7df7100d385ff9a7c40d39c01" }
+arbitrum-alloy-precompiles = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "6c82e65dddb1c5d35570adcd8e6fb0165c90669c" }
 arbitrum-alloy-rpc-types = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "83593650bf6d07d2255e8627c417a9236cd5d02b" }
 arbitrum-alloy-network = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "83593650bf6d07d2255e8627c417a9236cd5d02b" }
 # Brotli and every Stylus runtime crate come from one generated Nitro runtime revision. Keeping the

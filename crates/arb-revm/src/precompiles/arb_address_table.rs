@@ -26,19 +26,19 @@ where
 
     let mut result = match call {
         ArbAddressTable::ArbAddressTableCalls::addressExists(c) => {
-            match state.address_table.lookup(c.account, &mut journal) {
+            match state.address_table.lookup(c.addr, &mut journal) {
                 Ok(opt) => ok_result(
                     gas_limit,
-                    alloy_core::sol_types::SolValue::abi_encode(&(opt.is_some(),)),
+                    alloy_core::sol_types::SolValue::abi_encode_params(&(opt.is_some(),)),
                 ),
                 Err(_) => ordinary_error_result(gas_limit),
             }
         }
         ArbAddressTable::ArbAddressTableCalls::lookup(c) => {
-            match state.address_table.lookup(c.account, &mut journal) {
+            match state.address_table.lookup(c.addr, &mut journal) {
                 Ok(Some(idx)) => ok_result(
                     gas_limit,
-                    alloy_core::sol_types::SolValue::abi_encode(&(U256::from(idx),)),
+                    alloy_core::sol_types::SolValue::abi_encode_params(&(U256::from(idx),)),
                 ),
                 Ok(None) | Err(_) => ordinary_error_result(gas_limit),
             }
@@ -50,7 +50,7 @@ where
             match state.address_table.lookup_index(idx, &mut journal) {
                 Ok(Some(addr)) => ok_result(
                     gas_limit,
-                    alloy_core::sol_types::SolValue::abi_encode(&(addr,)),
+                    alloy_core::sol_types::SolValue::abi_encode_params(&(addr,)),
                 ),
                 Ok(None) | Err(_) => ordinary_error_result(gas_limit),
             }
@@ -59,27 +59,27 @@ where
             match state.address_table.len(&mut journal) {
                 Ok(num_items) => ok_result(
                     gas_limit,
-                    alloy_core::sol_types::SolValue::abi_encode(&(U256::from(num_items),)),
+                    alloy_core::sol_types::SolValue::abi_encode_params(&(U256::from(num_items),)),
                 ),
                 Err(_) => ordinary_error_result(gas_limit),
             }
         }
         ArbAddressTable::ArbAddressTableCalls::register(c) => {
-            match state.address_table.register(c.account, &mut journal) {
+            match state.address_table.register(c.addr, &mut journal) {
                 Ok(idx) => ok_result(
                     gas_limit,
-                    alloy_core::sol_types::SolValue::abi_encode(&(U256::from(idx),)),
+                    alloy_core::sol_types::SolValue::abi_encode_params(&(U256::from(idx),)),
                 ),
                 Err(_) => ordinary_error_result(gas_limit),
             }
         }
         ArbAddressTable::ArbAddressTableCalls::compress(c) => {
-            match state.address_table.compress(c.account, &mut journal) {
+            match state.address_table.compress(c.addr, &mut journal) {
                 Ok(encoded) => ok_result(
                     gas_limit,
-                    alloy_core::sol_types::SolValue::abi_encode(&(revm::primitives::Bytes::from(
-                        encoded,
-                    ),)),
+                    alloy_core::sol_types::SolValue::abi_encode_params(&(
+                        revm::primitives::Bytes::from(encoded),
+                    )),
                 ),
                 Err(_) => ordinary_error_result(gas_limit),
             }
@@ -89,7 +89,7 @@ where
                 Some(encoded) => match state.address_table.decompress(encoded, &mut journal) {
                     Ok((address, consumed)) => ok_result(
                         gas_limit,
-                        alloy_core::sol_types::SolValue::abi_encode(&(
+                        alloy_core::sol_types::SolValue::abi_encode_params(&(
                             address,
                             U256::from(consumed),
                         )),
@@ -140,14 +140,14 @@ mod tests {
 
         let missing = run(
             &mut ctx,
-            ArbAddressTable::lookupCall { account: ACCOUNT }.abi_encode(),
+            ArbAddressTable::lookupCall { addr: ACCOUNT }.abi_encode(),
         );
         assert_eq!(missing.result, InstructionResult::PrecompileError);
         assert_eq!(missing.gas.total_gas_spent(), 800);
 
         let registered = run(
             &mut ctx,
-            ArbAddressTable::registerCall { account: ACCOUNT }.abi_encode(),
+            ArbAddressTable::registerCall { addr: ACCOUNT }.abi_encode(),
         );
         assert_eq!(registered.result, InstructionResult::Return);
         assert_eq!(
@@ -158,7 +158,7 @@ mod tests {
 
         let exists = run(
             &mut ctx,
-            ArbAddressTable::addressExistsCall { account: ACCOUNT }.abi_encode(),
+            ArbAddressTable::addressExistsCall { addr: ACCOUNT }.abi_encode(),
         );
         assert!(<(bool,)>::abi_decode(&exists.output).unwrap().0);
         let by_index = run(
@@ -181,9 +181,9 @@ mod tests {
         let mut ctx = <ArbContext<EmptyDB> as DefaultArb>::arb();
         let literal = run(
             &mut ctx,
-            ArbAddressTable::compressCall { account: ACCOUNT }.abi_encode(),
+            ArbAddressTable::compressCall { addr: ACCOUNT }.abi_encode(),
         );
-        let literal = <(Bytes,)>::abi_decode(&literal.output).unwrap().0;
+        let literal = <(Bytes,)>::abi_decode_params(&literal.output).unwrap().0;
         assert_eq!(literal.len(), 21);
 
         let decoded = run(
@@ -201,13 +201,13 @@ mod tests {
 
         run(
             &mut ctx,
-            ArbAddressTable::registerCall { account: ACCOUNT }.abi_encode(),
+            ArbAddressTable::registerCall { addr: ACCOUNT }.abi_encode(),
         );
         let compressed = run(
             &mut ctx,
-            ArbAddressTable::compressCall { account: ACCOUNT }.abi_encode(),
+            ArbAddressTable::compressCall { addr: ACCOUNT }.abi_encode(),
         );
-        let compressed = <(Bytes,)>::abi_decode(&compressed.output).unwrap().0;
+        let compressed = <(Bytes,)>::abi_decode_params(&compressed.output).unwrap().0;
         assert_eq!(compressed.as_ref(), &[0x80]);
 
         let mut padded = vec![99];

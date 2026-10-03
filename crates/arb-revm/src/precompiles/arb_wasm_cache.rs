@@ -28,7 +28,7 @@ where
         Err(e) => return fatal_result(gas_limit, &format!("ArbWasmCache: storage error: {e}")),
     };
     if arbos_version < ARBOS_VERSION_STYLUS {
-        return revert_result(
+        return plain_error(
             gas_limit,
             "ArbWasmCache: unavailable before ArbOS Stylus activation",
         );
@@ -45,39 +45,39 @@ where
             let is_manager = match state
                 .programs
                 .cache_managers
-                .is_member(c.account, &mut journal)
+                .is_member(c.manager, &mut journal)
             {
                 Ok(v) => v,
-                Err(e) => return revert_result(gas_limit, &format!("ArbWasmCache: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbWasmCache: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(is_manager,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(is_manager,)),
             )
         }
         ArbWasmCache::ArbWasmCacheCalls::allCacheManagers(_) => {
             let managers = match state.programs.cache_managers.all_members(&mut journal) {
                 Ok(m) => m,
-                Err(e) => return revert_result(gas_limit, &format!("ArbWasmCache: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbWasmCache: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(managers,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(managers,)),
             )
         }
         ArbWasmCache::ArbWasmCacheCalls::codehashIsCached(c) => {
             let cached = match state.programs.read_program(c.codehash, &mut journal) {
                 Ok(program) => program.cached,
-                Err(e) => return revert_result(gas_limit, &format!("ArbWasmCache: error: {e}")),
+                Err(e) => return plain_error(gas_limit, &format!("ArbWasmCache: error: {e}")),
             };
             ok_result(
                 gas_limit,
-                alloy_core::sol_types::SolValue::abi_encode(&(cached,)),
+                alloy_core::sol_types::SolValue::abi_encode_params(&(cached,)),
             )
         }
         ArbWasmCache::ArbWasmCacheCalls::cacheProgram(c) => {
             if arbos_version < ARBOS_VERSION_STYLUS_FIXES {
-                return revert_result(
+                return plain_error(
                     gas_limit,
                     "ArbWasmCache: cacheProgram unavailable before ArbOS Stylus fixes",
                 );
@@ -85,7 +85,7 @@ where
             // Nitro's precompile context performs a separate `Storage.GetCodeHash` here. Its
             // burner charge is 2,600 gas, not the 800-gas flat cost of an ArbOS slot read.
             journal.charge(STORAGE_CODE_HASH_COST);
-            let (code_hash, code) = match journal.account_code_hash_and_code(c.program) {
+            let (code_hash, code) = match journal.account_code_hash_and_code(c.addr) {
                 Ok(code) => code,
                 Err(error) => {
                     return fatal_result(
@@ -96,12 +96,12 @@ where
             };
             // `CacheProgram` resolves the code hash before delegating to `setProgramCached`,
             // whose first action is this access check.
-            if !caller_has_access(&state, &mut journal, call_inputs.caller) {
+            if !caller_has_access(state, &mut journal, call_inputs.caller) {
                 // Nitro's `setProgramCached` calls `BurnOut` for an unauthorized manager.
                 return gated_revert_result(gas_limit);
             }
             set_program_cached(
-                &state,
+                state,
                 &mut journal,
                 gas_limit,
                 code_hash,
@@ -112,12 +112,32 @@ where
                 timestamp,
             )
         }
-        ArbWasmCache::ArbWasmCacheCalls::evictCodehash(c) => {
-            if !caller_has_access(&state, &mut journal, call_inputs.caller) {
+        ArbWasmCache::ArbWasmCacheCalls::cacheCodehash(c) => {
+            // Deprecated form of `cacheProgram`, callable only at ArbOS 30 (`method_arbos_bounds`).
+            // Nitro passes the zero address and the given hash straight to `setProgramCached`.
+            // Its "code not found" check cannot fail on this path: an unactivated program stops
+            // at the version check first, and an activated one's code is always in the store.
+            if !caller_has_access(state, &mut journal, call_inputs.caller) {
                 return gated_revert_result(gas_limit);
             }
             set_program_cached(
-                &state,
+                state,
+                &mut journal,
+                gas_limit,
+                c.codehash,
+                true,
+                true,
+                call_inputs.caller,
+                call_inputs.bytecode_address,
+                timestamp,
+            )
+        }
+        ArbWasmCache::ArbWasmCacheCalls::evictCodehash(c) => {
+            if !caller_has_access(state, &mut journal, call_inputs.caller) {
+                return gated_revert_result(gas_limit);
+            }
+            set_program_cached(
+                state,
                 &mut journal,
                 gas_limit,
                 c.codehash,
@@ -200,7 +220,8 @@ fn set_program_cached<J: ArbJournal>(
     let expired = age > expiry_days.saturating_mul(24 * 60 * 60);
 
     if cached && program.version != params_version {
-        let args = alloy_core::sol_types::SolValue::abi_encode(&(program.version, params_version));
+        let args =
+            alloy_core::sol_types::SolValue::abi_encode_params(&(program.version, params_version));
         return super::arb_wasm::custom_error_result(
             gas_limit,
             b"ProgramNeedsUpgrade(uint16,uint16)",
@@ -208,7 +229,7 @@ fn set_program_cached<J: ArbJournal>(
         );
     }
     if cached && expired {
-        let args = alloy_core::sol_types::SolValue::abi_encode(&(age,));
+        let args = alloy_core::sol_types::SolValue::abi_encode_params(&(age,));
         return super::arb_wasm::custom_error_result(gas_limit, b"ProgramExpired(uint64)", &args);
     }
     if program.cached == cached {
@@ -224,7 +245,9 @@ fn set_program_cached<J: ArbJournal>(
             B256::from(manager_topic),
             code_hash,
         ],
-        Bytes::from(alloy_core::sol_types::SolValue::abi_encode(&(cached,))),
+        Bytes::from(alloy_core::sol_types::SolValue::abi_encode_params(&(
+            cached,
+        ))),
     ));
 
     // Nitro burns the program's dynamic init cost through its storage-access burner before
@@ -361,7 +384,7 @@ mod tests {
             )
             .expect("write active program");
 
-        let input = ArbWasmCache::cacheProgramCall { program }.abi_encode();
+        let input = ArbWasmCache::cacheProgramCall { addr: program }.abi_encode();
         let call = ArbCall {
             input: &input,
             gas_limit: 100_000,
@@ -412,7 +435,7 @@ mod tests {
             )
             .expect("write active program");
 
-        let input = ArbWasmCache::cacheProgramCall { program }.abi_encode();
+        let input = ArbWasmCache::cacheProgramCall { addr: program }.abi_encode();
         let call = ArbCall {
             input: &input,
             gas_limit: 100_000,
@@ -463,7 +486,7 @@ mod tests {
             )
             .expect("write stale program");
 
-        let input = ArbWasmCache::cacheProgramCall { program }.abi_encode();
+        let input = ArbWasmCache::cacheProgramCall { addr: program }.abi_encode();
         let call = ArbCall {
             input: &input,
             gas_limit: 100_000,
@@ -516,7 +539,7 @@ mod tests {
             )
             .expect("write expired program");
 
-        let input = ArbWasmCache::cacheProgramCall { program }.abi_encode();
+        let input = ArbWasmCache::cacheProgramCall { addr: program }.abi_encode();
         let call = ArbCall {
             input: &input,
             gas_limit: 100_000,
