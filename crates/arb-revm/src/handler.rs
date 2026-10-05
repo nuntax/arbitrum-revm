@@ -310,6 +310,25 @@ where
     is_tx_hash_filtered(tx_hash, arbos_version, journal).unwrap_or(false)
 }
 
+/// Nitro's `RevertedTxHook` increments the sender nonce of every filtered transaction, whatever
+/// its kind (`SetNonce(From, GetNonce(From)+1)`). A call already has that increment by the time
+/// the filter is consulted: from `validate_against_state_and_deduct_caller`, or from
+/// `apply_retry_tx_pre_execution` for a retry. A contract creation normally gets it from the
+/// CREATE frame, which a filtered transaction never opens, so it is applied here.
+fn bump_filtered_create_nonce<EVM, ERROR>(evm: &mut EVM) -> Result<(), ERROR>
+where
+    EVM: EvmTr<Context: ArbContextTr>,
+    ERROR: EvmTrError<EVM>,
+{
+    let ctx = evm.ctx();
+    let (caller, is_create) = (ctx.tx().caller(), ctx.tx().kind().is_create());
+    if is_create {
+        let journal = evm.ctx_mut().journal_mut();
+        journal.load_account_mut(caller)?.data.bump_nonce();
+    }
+    Ok(())
+}
+
 fn filtered_tx_frame_result(gas_limit: u64) -> FrameResult {
     let mut gas = Gas::new(gas_limit);
     gas.spend_all();
@@ -604,6 +623,7 @@ where
         // Nitro's RevertedTxHook runs after gas charging but before EIP-7702 authorization.
         // A filtered transaction consumes all gas without executing or mutating its authorities.
         if is_filtered_post_start_tx(evm) {
+            bump_filtered_create_nonce::<_, ERROR>(evm)?;
             evm.ctx_mut().chain_mut().filtered_tx = true;
             return Ok(Some(PreExecutionOutput {
                 eip7702_refund: 0,
@@ -678,6 +698,7 @@ where
             // checks the retry envelope hash, consumes the remaining gas, and lets EndTxHook
             // restore the escrow because the retry failed.
             if is_filtered_post_start_tx(evm) {
+                bump_filtered_create_nonce::<_, ERROR>(evm)?;
                 evm.ctx_mut().journal_mut().checkpoint_commit();
                 return Ok(Some(filtered_tx_frame_result(evm.ctx().tx().gas_limit())));
             }
@@ -1433,6 +1454,7 @@ where
             retry_tx::apply_retry_tx_pre_execution(evm.ctx_mut())
                 .map_err(|msg| ERROR::from_string(msg))?;
             if is_filtered_post_start_tx(evm) {
+                bump_filtered_create_nonce::<_, ERROR>(evm)?;
                 evm.ctx_mut().journal_mut().checkpoint_commit();
                 return Ok(Some(filtered_tx_frame_result(evm.ctx().tx().gas_limit())));
             }
@@ -1567,6 +1589,12 @@ mod tests {
         tx.nonce = 0;
         tx.chain_id = Some(42161);
         ArbTransaction::new(tx)
+    }
+
+    fn make_create_tx(caller: Address) -> ArbTransaction<TxEnv> {
+        let mut tx = make_call_tx(0x02, caller, Address::ZERO);
+        tx.base.kind = TxKind::Create;
+        tx
     }
 
     fn manager_add_tx(caller: Address, tx_hash: B256, gas_limit: u64) -> ArbTransaction<TxEnv> {
@@ -2207,6 +2235,96 @@ mod tests {
                 .nonce,
             1,
             "Nitro's RevertedTxHook increments the sender nonce"
+        );
+    }
+
+    #[test]
+    fn filtered_contract_creation_increments_the_sender_nonce() {
+        let caller = Address::with_last_byte(0x3c);
+        let encoded = revm::primitives::bytes!("02c1");
+        let mut db = InMemoryDB::default();
+        seed_transaction_filter(
+            &mut db,
+            keccak256(encoded.as_ref()),
+            Address::with_last_byte(0x3d),
+            Address::with_last_byte(0x3e),
+        );
+        db.insert_account_info(
+            caller,
+            AccountInfo {
+                balance: U256::from(1_000_000_u64),
+                ..Default::default()
+            },
+        );
+        let cfg = CfgEnv::new_with_spec(ArbSpecId::NITRO)
+            .with_chain_id(42161)
+            .with_disable_priority_fee_check(true);
+        let ctx = Context::mainnet()
+            .with_tx(ArbTransaction::<TxEnv>::default())
+            .with_cfg(cfg)
+            .with_chain(ArbChainContext::default())
+            .with_db(db);
+        let mut evm = ctx.build_arb();
+
+        let out = evm
+            .transact(make_create_tx(caller).with_encoded_2718(encoded))
+            .expect("filtered contract creation must be included as a failed receipt");
+
+        assert!(!out.result.is_success(), "filtered receipt must fail");
+        assert_eq!(out.result.tx_gas_used(), 100_000);
+        assert_eq!(
+            out.state
+                .get(&caller)
+                .expect("caller nonce update is retained")
+                .info
+                .nonce,
+            1,
+            "Nitro's RevertedTxHook increments the sender nonce of a filtered creation too"
+        );
+        assert!(
+            !out.state.contains_key(&caller.create(0)),
+            "a filtered creation must not deploy"
+        );
+    }
+
+    #[test]
+    fn unfiltered_contract_creation_increments_the_sender_nonce_once() {
+        let caller = Address::with_last_byte(0x3c);
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            caller,
+            AccountInfo {
+                balance: U256::from(1_000_000_u64),
+                ..Default::default()
+            },
+        );
+        let cfg = CfgEnv::new_with_spec(ArbSpecId::NITRO)
+            .with_chain_id(42161)
+            .with_disable_priority_fee_check(true);
+        let ctx = Context::mainnet()
+            .with_tx(ArbTransaction::<TxEnv>::default())
+            .with_cfg(cfg)
+            .with_chain(ArbChainContext::default())
+            .with_db(db);
+        let mut evm = ctx.build_arb();
+
+        let out = evm
+            .transact(make_create_tx(caller).with_encoded_2718(revm::primitives::bytes!("02c1")))
+            .expect("contract creation should execute");
+
+        assert!(out.result.is_success(), "unfiltered creation must run");
+        assert_eq!(
+            out.state
+                .get(&caller)
+                .expect("caller is touched")
+                .info
+                .nonce,
+            1,
+            "only the CREATE frame increments the nonce"
+        );
+        assert!(
+            out.state.contains_key(&caller.create(0)),
+            "the contract is created at the pre-increment nonce address"
         );
     }
 
@@ -3011,6 +3129,87 @@ mod tests {
                 .info
                 .nonce,
             1
+        );
+    }
+
+    #[test]
+    fn filtered_contract_creation_retry_increments_the_sender_nonce() {
+        let caller = Address::with_last_byte(0xb1);
+        let ticket_id = B256::with_last_byte(0xb2);
+        let callvalue = U256::from(7_u64);
+        let encoded = revm::primitives::bytes!("68c1");
+        let mut db = InMemoryDB::default();
+        seed_transaction_filter(
+            &mut db,
+            keccak256(encoded.as_ref()),
+            Address::with_last_byte(0xb3),
+            Address::with_last_byte(0xb4),
+        );
+
+        let state = ArbosState::open();
+        let retryable = state.retryables.retryable(ticket_id);
+        let (_, timeout_slot) = retryable.timeout.account_and_key();
+        let (_, callvalue_slot) = retryable.callvalue.account_and_key();
+        db.insert_account_storage(
+            ARBOS_STATE_ADDRESS,
+            U256::from_be_bytes(timeout_slot.0),
+            U256::from(1_u64),
+        )
+        .expect("should seed retryable timeout");
+        db.insert_account_storage(
+            ARBOS_STATE_ADDRESS,
+            U256::from_be_bytes(callvalue_slot.0),
+            callvalue,
+        )
+        .expect("should seed retryable callvalue");
+        let escrow = retryable_escrow_address(ticket_id);
+        db.insert_account_info(
+            escrow,
+            AccountInfo {
+                balance: callvalue,
+                ..Default::default()
+            },
+        );
+        let cfg = CfgEnv::new_with_spec(ArbSpecId::NITRO)
+            .with_chain_id(42161)
+            .with_disable_priority_fee_check(true);
+        let ctx = Context::mainnet()
+            .with_tx(ArbTransaction::<TxEnv>::default())
+            .with_cfg(cfg)
+            .with_chain(ArbChainContext::default())
+            .with_db(db);
+        let mut evm = ctx.build_arb();
+
+        // A retry with `to = nil` is a contract creation.
+        let mut retry_tx = make_retry_tx(caller, Address::ZERO, ticket_id, callvalue, 100_000);
+        retry_tx.base.kind = TxKind::Create;
+
+        let out = evm
+            .transact(retry_tx.with_encoded_2718(encoded))
+            .expect("filtered retry must be included as a failed receipt");
+
+        assert!(!out.result.is_success(), "filtered retry receipt must fail");
+        assert_eq!(out.result.tx_gas_used(), 100_000);
+        assert_eq!(
+            out.state
+                .get(&escrow)
+                .expect("failed retry must restore the escrow")
+                .info
+                .balance,
+            callvalue
+        );
+        assert_eq!(
+            out.state
+                .get(&caller)
+                .expect("retry sender nonce update is retained")
+                .info
+                .nonce,
+            1,
+            "Nitro's RevertedTxHook increments the sender nonce of a filtered creation too"
+        );
+        assert!(
+            !out.state.contains_key(&caller.create(0)),
+            "a filtered creation must not deploy"
         );
     }
 
