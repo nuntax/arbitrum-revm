@@ -111,6 +111,16 @@ impl ArbChainContext {
         }
     }
 
+    /// Nitro GasPriceOp before ArbOS 3 used the envelope price. Later versions
+    /// use GetPaidGasPrice, shared with caller charging and refunds.
+    pub fn gas_price(&self, envelope_price: u128) -> u128 {
+        if self.arbos_version.is_some_and(|version| version < 3) {
+            envelope_price
+        } else {
+            self.paid_gas_price
+        }
+    }
+
     /// Sets the L1 block number returned by the `NUMBER` opcode.
     pub fn with_l1_block_number(mut self, l1_block_number: u64) -> Self {
         self.l1_block_number = l1_block_number;
@@ -168,6 +178,18 @@ mod tests {
     use revm::primitives::B256;
 
     use super::ArbChainContext;
+
+    #[test]
+    fn gas_price_uses_the_paid_snapshot_even_when_zero() {
+        let mut ctx = ArbChainContext::default();
+        ctx.arbos_version = Some(61);
+        for paid in [21_100_220, 20_000_000, 0] {
+            ctx.paid_gas_price = paid;
+            assert_eq!(ctx.gas_price(41_108_220), paid);
+        }
+        ctx.arbos_version = Some(2);
+        assert_eq!(ctx.gas_price(41_108_220), 41_108_220);
+    }
 
     #[test]
     fn builds_chain_context_from_non_block_inputs() {

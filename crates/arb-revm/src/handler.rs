@@ -348,6 +348,8 @@ where
 
     fn validate(&self, evm: &mut Self::Evm) -> Result<InitialAndFloorGas, Self::Error> {
         evm.ctx_mut().chain_mut().arbos_version = None;
+        let basefee = charged_basefee(evm.ctx());
+        evm.ctx_mut().chain_mut().paid_gas_price = basefee;
         if is_protocol_short_circuit_tx(evm) {
             self.validate_env(evm)?;
             evm.ctx_mut().chain_mut().intrinsic_gas = 0;
@@ -468,7 +470,9 @@ where
             // before returning; we still skip caller-deduction + GasChargingHook (protocol txs are
             // gas-prepaid and poster-cost-free).
             self.load_accounts(evm)?;
+            let paid = evm.ctx().chain().paid_gas_price;
             evm.ctx_mut().chain_mut().reset_poster_state();
+            evm.ctx_mut().chain_mut().paid_gas_price = paid;
             // Protocol txs carry no L1 poster fee; publish 0 so a getCurrentTxL1GasFees call within
             // this tx reads 0 rather than a value leaked from a prior tx (belt-and-braces: revm also
             // clears transient storage per tx).
@@ -493,9 +497,8 @@ where
         {
             // Phase 1: snapshot values from the immutable context.
             let coinbase = evm.ctx().block().beneficiary();
-            // Use effective_gas_price (= min(max_fee, basefee + priority_fee)) for the poster
-            // cost, consistent with what validate_against_state_and_deduct_caller and
-            // reimburse_caller use. For legacy txs gas_price() == effective_gas_price().
+            // Validation already selected the paid price from the envelope and ArbOS.
+            // Keep that snapshot for poster gas, refunds, and compute-tip settlement.
             //
             // Nitro's BaseFeeInBlock: a simulated call that names no fee runs with the block base
             // fee lowered to zero, but ArbOS still prices L1 calldata at the real fee, so poster
@@ -516,6 +519,9 @@ where
             let intrinsic_gas = ctx.chain().intrinsic_gas;
             let mut paid_gas_price = U256::from(ctx.chain().paid_gas_price);
             ctx.chain_mut().reset_poster_state();
+            // Keep the validation snapshot through GasChargingHook and settlement.
+            // Zero is a valid paid price for NoBaseFee simulations.
+            ctx.chain_mut().paid_gas_price = paid_gas_price.to::<u128>();
 
             let arbos_state = ArbosState::open();
             let cached_arbos_version = ctx.chain().arbos_version;
@@ -1540,6 +1546,203 @@ mod tests {
         primitives::{Address, B256, Bytes, TxKind, U256, keccak256},
         state::AccountInfo,
     };
+
+    /// Calibrated gas-accounting regression for Arb1 block 515862246, tx 0x2206ba93b5...
+    /// This is not a historical state replay: the code below consumes the observed
+    /// 62,159 compute gas and returns GASPRICE, while synthetic envelope bytes exercise
+    /// the real Brotli/poster path. Nitro floors posterCost / paidGasPrice. Both observed
+    /// quotients constrain posterCost to [2,911,830,360, 2,920,000,000) wei; select the
+    /// first multiple of the compressed calldata units in that interval as pricePerUnit.
+    fn assert_tip_accounting(version: u64, flag: bool, delayed: bool, collects: bool) {
+        use crate::l1_cost::compute_poster_info;
+        use revm::bytecode::Bytecode;
+
+        const BASE: u64 = 20_000_000;
+        const PAID: u128 = 21_100_220;
+        const COMPUTE: u64 = 62_159;
+        const INITIAL: u128 = 1_000_000_000_000_000_000;
+        let caller = Address::with_last_byte(0xf0);
+        let target = Address::with_last_byte(0xf1);
+        let network = Address::with_last_byte(0xf2);
+        let infra = Address::with_last_byte(0xf3);
+        let beneficiary = if delayed {
+            Address::ZERO
+        } else {
+            BATCH_POSTER_ADDRESS
+        };
+        let encoded = Bytes::from(vec![0x02; 200]);
+        let units = compute_poster_info(
+            &encoded,
+            BATCH_POSTER_ADDRESS,
+            U256::from(1),
+            U256::from(BASE),
+            0,
+        )
+        .calldata_units;
+        let price_per_unit = 2_911_830_360_u64.div_ceil(units);
+        let cost = price_per_unit * units;
+        assert!((2_911_830_360..2_920_000_000).contains(&cost));
+
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(ARBOS_STATE_ADDRESS, AccountInfo::default());
+        let state = ArbosState::open();
+        for (slot, value) in [
+            (state.arbos_version.account_and_key(), U256::from(version)),
+            (
+                state.collect_tips.account_and_key(),
+                U256::from(u64::from(flag)),
+            ),
+            (
+                state.l1_pricing.price_per_unit.account_and_key(),
+                U256::from(price_per_unit),
+            ),
+            (
+                state.l2_pricing.min_base_fee_wei.account_and_key(),
+                U256::from(5_000_000),
+            ),
+            (
+                state.network_fee_account.account_and_key(),
+                U256::from_be_slice(network.as_slice()),
+            ),
+            (
+                state.infra_fee_account.account_and_key(),
+                U256::from_be_slice(infra.as_slice()),
+            ),
+        ] {
+            db.insert_account_storage(slot.0, U256::from_be_bytes(slot.1.0), value)
+                .unwrap();
+        }
+        db.insert_account_info(
+            caller,
+            AccountInfo {
+                balance: U256::from(INITIAL),
+                ..Default::default()
+            },
+        );
+        // JUMPDEST costs 1; GASPRICE/PUSH/MSTORE/RETURN costs 17 including memory.
+        let mut code = vec![0x5b; (COMPUTE - 21_000 - 17) as usize];
+        code.extend_from_slice(&[0x3a, 0x60, 0, 0x52, 0x60, 32, 0x60, 0, 0xf3]);
+        db.insert_account_info(
+            target,
+            AccountInfo {
+                code: Some(Bytecode::new_raw(Bytes::from(code))),
+                ..Default::default()
+            },
+        );
+        let cfg =
+            CfgEnv::new_with_spec(ArbSpecId::from_arbos_version(version)).with_chain_id(42161);
+        let mut evm = Context::mainnet()
+            .with_tx(ArbTransaction::<TxEnv>::default())
+            .with_cfg(cfg)
+            .with_block(BlockEnv {
+                basefee: BASE,
+                beneficiary,
+                ..Default::default()
+            })
+            .with_chain(ArbChainContext::default())
+            .with_db(db)
+            .build_arb();
+        let mut tx = make_call_tx(0x02, caller, target).with_encoded_2718(encoded);
+        tx.base.gas_price = 41_108_220;
+        tx.base.gas_priority_fee = Some(1_100_220);
+        let mut next_tx = tx.clone();
+        next_tx.base.nonce = 1;
+        let result = evm.transact(tx).expect("calibrated transaction executes");
+        assert!(result.result.is_success());
+        let paid = if collects { PAID } else { u128::from(BASE) };
+        let poster = if delayed {
+            0
+        } else if collects {
+            138
+        } else {
+            145
+        };
+        assert_eq!(evm.0.ctx.chain().paid_gas_price, paid);
+        assert_eq!(evm.0.ctx.chain().poster_gas, poster);
+        assert_eq!(result.result.tx_gas_used(), COMPUTE + poster);
+        assert_eq!(
+            U256::from_be_slice(result.result.output().unwrap()),
+            U256::from(paid)
+        );
+        let balance = |address| {
+            result
+                .state
+                .get(&address)
+                .map(|a| a.info.balance)
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            balance(caller),
+            U256::from(INITIAL - paid * u128::from(COMPUTE + poster))
+        );
+        assert_eq!(balance(infra), U256::from(5_000_000_u64 * COMPUTE));
+        assert_eq!(
+            balance(network),
+            U256::from((paid - 5_000_000) * u128::from(COMPUTE))
+        );
+        assert_eq!(
+            balance(crate::constants::L1_PRICER_FUNDS_POOL_ADDRESS),
+            U256::from(paid * u128::from(poster))
+        );
+        assert_eq!(balance(beneficiary), U256::ZERO);
+
+        if version >= 60 && !delayed {
+            // A successful owner change takes effect on the very next transaction,
+            // including one executed in this same EVM/block context.
+            evm.commit(result.state);
+            state
+                .collect_tips
+                .set(u64::from(!flag), evm.0.ctx.journal_mut())
+                .unwrap();
+            let next = evm
+                .transact(next_tx)
+                .expect("transaction after flag change executes");
+            let next_paid = if flag { u128::from(BASE) } else { PAID };
+            let next_poster = if flag { 145 } else { 138 };
+            assert_eq!(evm.0.ctx.chain().paid_gas_price, next_paid);
+            assert_eq!(evm.0.ctx.chain().poster_gas, next_poster);
+            assert_eq!(next.result.tx_gas_used(), COMPUTE + next_poster);
+            assert_eq!(
+                U256::from_be_slice(next.result.output().unwrap()),
+                U256::from(next_paid)
+            );
+        }
+    }
+
+    #[test]
+    fn arb1_collect_tips_real_gas_numbers() {
+        assert_tip_accounting(61, true, false, true);
+    }
+
+    #[test]
+    fn rh_no_tips_preserves_real_gas_numbers() {
+        assert_tip_accounting(61, false, false, false);
+    }
+
+    #[test]
+    fn v9_collects_without_flag() {
+        assert_tip_accounting(9, false, false, true);
+    }
+
+    #[test]
+    fn v59_ignores_collect_tips_flag() {
+        assert_tip_accounting(59, true, false, false);
+    }
+
+    #[test]
+    fn v60_collect_tips_disabled() {
+        assert_tip_accounting(60, false, false, false);
+    }
+
+    #[test]
+    fn v60_collect_tips_enabled() {
+        assert_tip_accounting(60, true, false, true);
+    }
+
+    #[test]
+    fn delayed_inbox_never_collects_tips() {
+        assert_tip_accounting(61, true, true, false);
+    }
 
     fn make_evm(
         db: InMemoryDB,
