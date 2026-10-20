@@ -57,7 +57,9 @@ where
     let timestamp = block.timestamp().saturating_to::<u64>();
     let tx = ctx.tx();
     let tx_origin = tx.caller();
-    let tx_gas_price = tx.effective_gas_price(basefee as u128);
+    let tx_gas_price = ctx
+        .chain()
+        .gas_price(tx.effective_gas_price(basefee as u128));
 
     EvmData {
         arbos_version,

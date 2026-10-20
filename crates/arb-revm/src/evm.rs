@@ -6,7 +6,7 @@ use revm::{
     Database, Inspector,
     bytecode::opcode,
     context::{Cfg, ContextError, ContextSetters, Evm, FrameStack},
-    context_interface::ContextTr,
+    context_interface::{Block, ContextTr, Transaction},
     handler::{
         EthFrame, EvmTr, FrameInitOrResult, ItemOrResult, PrecompileProvider,
         evm::FrameTr,
@@ -19,6 +19,22 @@ use revm::{
     },
     primitives::{Address, B256, U256},
 };
+
+/// Nitro GasPriceOp: ArbOS >= 3 exposes the price selected for this transaction.
+fn arb_gas_price<CTX>(ctx: InstructionContext<'_, CTX, EthInterpreter>) -> InstructionExecResult
+where
+    CTX: ContextTr<Chain = ArbChainContext> + Host,
+{
+    let price = ctx.host.chain().gas_price(
+        ctx.host
+            .tx()
+            .effective_gas_price(ctx.host.block().basefee() as u128),
+    );
+    if !ctx.interpreter.stack.push(U256::from(price)) {
+        return Err(InstructionResult::StackOverflow);
+    }
+    Ok(())
+}
 
 /// Arbitrum `NUMBER` opcode: returns the L1 block number, not the L2 block number.
 ///
@@ -79,6 +95,7 @@ where
     pub fn new(ctx: CTX, inspector: INSP) -> Self {
         let spec: ArbSpecId = ctx.cfg().spec().into();
         let mut instruction = EthInstructions::new_mainnet_with_spec(spec.into());
+        instruction.insert_instruction(opcode::GASPRICE, Instruction::new(arb_gas_price::<CTX>), 2);
         // Arbitrum overrides NUMBER (returns the L1 block number) and BLOCKHASH (returns the
         // ArbOS-stored L1 block hash).
         instruction.insert_instruction(
