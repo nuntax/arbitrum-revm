@@ -3281,6 +3281,80 @@ mod tests {
     }
 
     #[test]
+    fn arb_retryable_redeem_without_gas_for_future_costs_burns_all_gas() {
+        // Nitro `ArbRetryableTx.Redeem`: when the gas left after the storage reads cannot cover
+        // `futureGasCosts`, `c.Burn` fails via BurnOut and the call consumes all of its gas. Only
+        // a donation below TxGas is an ordinary error that keeps the remainder (ArbOS >= 11).
+        // Arbitrum One block 517,991,568 hit the first case through a contract that calls redeem.
+        let run = |gas_limit: u64| {
+            let mut db = InMemoryDB::default();
+            db.insert_account_info(ARBOS_STATE_ADDRESS, AccountInfo::default());
+            let (_, version_slot) = ArbosState::open().arbos_version.account_and_key();
+            db.insert_account_storage(
+                ARBOS_STATE_ADDRESS,
+                U256::from_be_bytes(version_slot.0),
+                U256::from(61_u64),
+            )
+            .expect("should seed ArbOS version");
+            let cfg = CfgEnv::new_with_spec(ArbSpecId::from_arbos_version(61))
+                .with_chain_id(42161)
+                .with_disable_priority_fee_check(true);
+            let mut evm = Context::mainnet()
+                .with_tx(ArbTransaction::<TxEnv>::default())
+                .with_cfg(cfg)
+                .with_chain(ArbChainContext::default())
+                .with_db(db)
+                .build_arb();
+
+            let submitter = Address::with_last_byte(0x91);
+            let call = SubmitRetryableCall {
+                request_id: B256::with_last_byte(0x94),
+                l1_base_fee: U256::from(1_u64),
+                deposit_value: U256::from(4_000_u64),
+                retry_value: U256::from(9_u64),
+                gas_fee_cap: U256::from(1_u64),
+                gas_limit: 250_000,
+                max_submission_fee: U256::from(2_000_u64),
+                fee_refund_address: Address::with_last_byte(0x95),
+                beneficiary: Address::with_last_byte(0x96),
+                retry_to: Some(Address::with_last_byte(0x93)),
+                retry_data: revm::primitives::bytes!("c0ffee"),
+            };
+            evm.transact_commit(make_submit_retryable_tx(submitter, call.clone()))
+                .expect("submit retryable should commit");
+
+            let ticket_id = compute_submit_retryable_ticket_id(42161, submitter, &call);
+            let mut redeem_tx = make_regular_call_tx(
+                Address::with_last_byte(0x92),
+                ARB_RETRYABLE_TX_ADDRESS,
+                U256::ZERO,
+                encode_redeem_calldata(ticket_id),
+            );
+            redeem_tx.base.gas_limit = gas_limit;
+            evm.transact(redeem_tx)
+                .expect("redeem call should execute")
+                .result
+        };
+
+        // ~40k reaches the precompile: past the storage-read burns, short of futureGasCosts.
+        let underfunded = run(61_500);
+        assert!(!underfunded.is_success(), "underfunded redeem must fail");
+        assert_eq!(
+            underfunded.tx_gas_used(),
+            61_500,
+            "Nitro burns all gas when the redeem cannot cover its future costs"
+        );
+
+        // ~62k reaches the precompile: future costs are covered, the donation is below TxGas.
+        let small_donation = run(83_500);
+        assert!(!small_donation.is_success(), "redeem below TxGas must fail");
+        assert!(
+            small_donation.tx_gas_used() < 83_500,
+            "a donation below TxGas is an ordinary error and keeps the remaining gas"
+        );
+    }
+
+    #[test]
     fn arb_sys_send_tx_to_l1_emits_l2_to_l1_event_and_burns_value() {
         let cfg = CfgEnv::new_with_spec(ArbSpecId::NITRO)
             .with_chain_id(42161)

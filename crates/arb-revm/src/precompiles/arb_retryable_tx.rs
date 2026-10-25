@@ -503,7 +503,14 @@ where
                 + backlog_cost_lookup_burn(arbos_version);
             let reserved = future_gas_costs.saturating_add(read_burns);
             if gas_limit < reserved {
-                return plain_error(gas_limit, "ArbRetryableTx: not enough gas for redeem");
+                // Nitro meters the reads, then `c.Burn(futureGasCosts)` (or an earlier read burn)
+                // fails via BurnOut, so the redeem consumes all forwarded gas. Only the
+                // donation-below-TxGas case below is an ordinary error that keeps the remainder.
+                return InterpreterResult {
+                    result: InstructionResult::OutOfGas,
+                    gas: Gas::new_spent_with_reservoir(gas_limit, 0),
+                    output: Bytes::new(),
+                };
             }
             let donated_gas = gas_limit - reserved;
             if donated_gas < RETRY_TX_GAS_MINIMUM {
