@@ -519,6 +519,9 @@ where
 
             let arbos_state = ArbosState::open();
             let cached_arbos_version = ctx.chain().arbos_version;
+            // eth_call / eth_estimateGas set this. Nitro skips the ArbOS compute-gas hold
+            // for those simulations; consensus blocks leave the flag unset.
+            let skip_compute_gas_cap = ctx.cfg().is_block_gas_limit_disabled();
             let journal = ctx.journal_mut();
 
             let arbos_version = cached_arbos_version
@@ -582,7 +585,10 @@ where
             // positive limit, so treat 0 as "no cap" to avoid holding the entire
             // gas budget and starving the compute frame.
             let limit_or_unlimited = |limit: u64| if limit == 0 { u64::MAX } else { limit };
-            let max_compute = if !spec.is_enabled_in(ArbSpecId::ARBOS_50) {
+            let max_compute = if skip_compute_gas_cap {
+                // RPC simulation: do not withhold gas down to the ArbOS per-block/per-tx limit.
+                u64::MAX
+            } else if !spec.is_enabled_in(ArbSpecId::ARBOS_50) {
                 limit_or_unlimited(
                     arbos_state
                         .l2_pricing
