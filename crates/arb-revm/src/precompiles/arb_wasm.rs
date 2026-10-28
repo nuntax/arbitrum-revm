@@ -473,10 +473,10 @@ where
         return fatal_result(gas_limit, &format!("ArbWasm: program write error: {e}"));
     }
     let burned = j.burned;
-    match pay_activation_data_fee(ctx, call_inputs, gas_limit, data_fee) {
-        Ok(()) => {}
+    let burned = match pay_activation_data_fee(ctx, call_inputs, gas_limit, data_fee) {
+        Ok(fee_burned) => burned.saturating_add(fee_burned),
         Err(result) => return charge_result(result, burned),
-    }
+    };
     let mut j = MeteredJournal::new(ctx.journal_mut());
     j.emit_log(Log::new_unchecked(
         call_inputs.bytecode_address,
@@ -496,13 +496,14 @@ where
 
 /// Nitro `ArbWasm.payActivationDataFee`: the call's value must cover the fee
 /// (`ProgramInsufficientValue(have, want)` otherwise); the fee goes to the network fee account and
-/// the rest back to the caller.
+/// the rest back to the caller. On success returns the gas burned reading the network fee account,
+/// which the caller must charge: Nitro burns that read whether or not the transfers follow.
 fn pay_activation_data_fee<CTX>(
     ctx: &mut CTX,
     call_inputs: &ArbCall,
     gas_limit: u64,
     data_fee: U256,
-) -> Result<(), InterpreterResult>
+) -> Result<u64, InterpreterResult>
 where
     CTX: ArbPrecompileCtx,
 {
@@ -535,7 +536,7 @@ where
             Err(e) => return Err(fatal_result(gas_limit, &format!("ArbWasm: transfer: {e}"))),
         }
     }
-    Ok(())
+    Ok(burned)
 }
 
 /// `ArbWasm.codehashAsmSize(bytes32)`: return the active program's estimated assembly size in
