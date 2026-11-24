@@ -61,6 +61,21 @@ where
     Ok(())
 }
 
+/// Arbitrum `BLOBBASEFEE` opcode: always an exceptional halt.
+///
+/// Nitro's `opBlobBaseFee` (`go-ethereum/core/vm/eips.go`) returns "BLOBBASEFEE is not supported
+/// on Arbitrum" on every Arbitrum chain. geth treats that as a non-revert error, so the frame
+/// fails and burns all of its remaining gas. The stock revm instruction instead pushes the block
+/// blob base fee and succeeds, which forks gasUsed/stateRoot the first time a tx executes it.
+fn arb_blob_base_fee<CTX>(
+    _ctx: InstructionContext<'_, CTX, EthInterpreter>,
+) -> InstructionExecResult
+where
+    CTX: ContextTr<Chain = ArbChainContext> + Host,
+{
+    Err(InstructionResult::NotActivated)
+}
+
 /// Arbitrum EVM wrapper over revm's generic [`Evm`] type.
 #[derive(Debug, Clone)]
 pub struct ArbEvm<
@@ -79,8 +94,8 @@ where
     pub fn new(ctx: CTX, inspector: INSP) -> Self {
         let spec: ArbSpecId = ctx.cfg().spec().into();
         let mut instruction = EthInstructions::new_mainnet_with_spec(spec.into());
-        // Arbitrum overrides NUMBER (returns the L1 block number) and BLOCKHASH (returns the
-        // ArbOS-stored L1 block hash).
+        // Arbitrum overrides NUMBER (returns the L1 block number), BLOCKHASH (returns the
+        // ArbOS-stored L1 block hash) and BLOBBASEFEE (always halts, as in Nitro).
         instruction.insert_instruction(
             opcode::NUMBER,
             Instruction::new(arb_block_number::<CTX>),
@@ -90,6 +105,11 @@ where
             opcode::BLOCKHASH,
             Instruction::new(arb_block_hash::<CTX>),
             20,
+        );
+        instruction.insert_instruction(
+            opcode::BLOBBASEFEE,
+            Instruction::new(arb_blob_base_fee::<CTX>),
+            2,
         );
         Self(Evm {
             ctx,
